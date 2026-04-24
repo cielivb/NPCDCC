@@ -1,3 +1,7 @@
+# Large data files
+*.feather
+*.npy
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
