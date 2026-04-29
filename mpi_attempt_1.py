@@ -1,7 +1,10 @@
+""" Simulating the top-level MPI workflow used for the big analysis """
+
 import pandas as pd
 import dask.dataframe as dd
 import os
 
+from time import sleep
 from queue import PriorityQueue
 from dask import delayed
 from mpi4py import MPI
@@ -10,6 +13,7 @@ COMM = MPI.COMM_WORLD
 RANK = COMM.Get_rank()
 FILE_DIR = os.path.dirname(__file__)
 
+ALL_TASKS_COMPLETE = False
 
 
 @delayed
@@ -26,7 +30,6 @@ if RANK == 0: # main rank
     # Get neuropil priorities via number of edges (lower number = higher priority)
     neuropils_counts_series = ddf['neuropil'].value_counts().compute()
     neuropil_priorities = list(neuropils_counts_series.map(lambda x: -x).items())
-    print(neuropil_priorities)
     
     # Allocate neuropils to worker processes on demand.
     # Use priority queue object to reduce chance of one worker process working
@@ -43,31 +46,39 @@ if RANK == 0: # main rank
     status = MPI.Status()
     while not neuropil_queue.empty:
         # Get ranks of workers that are currently idle
-        # For each idle worker:
-        #    Pop item from priority queue
-        #    Send to worker for processing
-        # Sleep for an appropriate timeframe
-        # Check to see if busy workers are still busy and update if necessary
-        # while iprobe(any incoming message):
-        #    receive message
-        #    update worker_state of rank that sent message
+        idle = [rank for rank, state in enumerate(worker_state) if state == 0]
+        
+        # Allocate tasks to idle workers
+        for rank in idle:
+            COMM.send(neuropil_queue.pop(), rank)
+            worker_state[rank] == 1
+        
+        sleep(5)
+        
+        # Receive worker task complete messages and update worker states
+        while COMM.Iprobe(source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG, status=status):
+            msg = COMM.recv(source=status.Get_source(), tag=status.Get_tag())
+            idle_rank = status.Get_source()
+            worker_state[idle_rank] == 0
     
-    # Send termination signal 
+    # Send termination signal
+    ALL_TASKS_COMPLETE = True
+    COMM.Ibcast(ALL_TASKS_COMPLETE, root=0)
     
 else: # Worker rank
-    all_tasks_complete = False
-    while not all_tasks_complete:
+    ALL_TASKS_COMPLETE = COMM.Ibcast(ALL_TASKS_COMPLETE, root=0)
+    while not ALL_TASKS_COMPLETE:
+        
         # Receive incoming message
+        msg = None
+        if COMM.Iprobe(source=0, tag=MPI.ANY_TAG, status=None):
+            msg = COMM.recv(source=0, tag=MPI.ANY_TAG)
         
-        # If message exists and is task:
-            # Sleep (mimic doing task)
-            # Send finished message
-        
-        # Else if message exists and is all tasks complete
-        #    all_tasks_complete = True
-        
-        # Else
-        #    Sleep for appropriate time-span
-        pass
-    
+        if msg:
+            print(msg)
+            sleep(2)
+            COMM.send("Task complete", 0)
+        else:
+            sleep(5)
 
+COMM.Barrier()
