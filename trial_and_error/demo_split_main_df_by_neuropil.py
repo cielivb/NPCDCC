@@ -6,12 +6,13 @@ import dask.dataframe as dd
 import os
 
 FILE_DIR = os.path.dirname(__file__)
+ROOT_DIR = os.path.dirname(FILE_DIR)
 
 @delayed
 def read_feather(path):
     return pd.read_feather(path, use_threads=True)
 
-feather_path = os.path.join(FILE_DIR, "data", "proofread_connections_783.feather")
+feather_path = os.path.join(ROOT_DIR, "data", "proofread_connections_783.feather")
 ddf = dd.from_delayed(read_feather(feather_path))
 
 
