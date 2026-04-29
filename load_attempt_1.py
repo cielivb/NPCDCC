@@ -13,5 +13,11 @@ feather_path = os.path.join(FILE_DIR, "data", "proofread_connections_783.feather
 ddf = dd.from_delayed(read_feather(feather_path))
 ddf.info(verbose=True, memory_usage=True)
 
-# First attempt ~16 seconds on local machine
+# First attempt ~16 seconds on local machine to get to this point
 # Second attempt onwards ~5 seconds
+
+# Get neuropil list
+neuropils = sorted(ddf['neuropil'].unique().compute().tolist())
+print(neuropils)
+print(len(neuropils))
+
