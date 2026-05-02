@@ -33,4 +33,38 @@ TODO
 
 """
 
+import dask
+from dask import dataframe as ddf
+from queue import Queue
 
+
+### CLUSTER IDENTIFICATION SUPPORT FUNCTIONS ------------------------------
+
+def prune(df: ddf.Dataframe) -> ddf.Dataframe:
+    """ Iteratively remove degree 1 edges from a dask dataframe 
+    
+    A degree 1 edge is defined here as an edge associated with at least one
+    degree 1 node, where a degree 1 node is a node connected by any number of 
+    edges to one and only one other node. No nodes in the dataset will have 
+    edges to themselves. Synapse count and directionality are not considered.
+    
+    """
+    # Extract the edges as a set (in a bag)
+    
+    # Add (b,a) for every (a,b) in set to the set (makes it undirected)
+    
+    # Create dict where key is node id, and val is set of neighbour nodes
+    
+    # Queue all degree 1 nodes (nodes with only one neighbour)
+    
+    # While queue not empty:
+    #    Pop the degree 1 node from queue
+    #    Identify neighbour
+    #    Remove deg1 node from neighbour's connections
+    #    If neighbour is now deg1, add neighbour to queue
+    #    Remove deg1 node key from dict
+    
+    # Intersect remaining edges with original dataframe to get pruned df
+    # Return pruned df
+    
+    pass
