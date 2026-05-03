@@ -54,50 +54,50 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
     edge_bag = edge_bag.map(lambda edge: [edge, (edge[1], edge[0])])
     edge_bag = edge_bag.flatten().distinct()
     
-    # Create dict where key is node id, and val is list of neighbour nodes.
-    # This makes it easy to track retained edges and degree simultaneously.
+    # Create 'list' of tuples where tup[0] is node id, and tup[1] is list of 
+    # neighbour nodes. This makes it easy to track retained edges and degree 
+    # simultaneously.
     edge_bag_tuple_groups = edge_bag.foldby(key = lambda edge: edge[0],
                                             binop = lambda accum, edge: accum + [edge[1]],
                                             initial = [],
                                             combine = lambda accum1, accum2: accum1 + accum2,
                                             combine_initial = [])
-    edge_bag_dict = edge_bag_tuple_groups.map(lambda tup: {tup[0]: tup[1]})    
-    
+        
     # Find initial degree 1 nodes
-    deg1_queue = Queue()    
-    deg1_nodes = edge_bag_dict.map(
-        lambda edge_data: next(iter(edge_data)) # Map single dicts to keys (nodes)
-    ).filter(
-        lambda node: len(edge_bag_dict[node]) == 1 # Keep degree 1 nodes
-    )
+    deg1_nodes = edge_bag_tuple_groups.filter(lambda tup: len(tup[1]) == 1)
     
     # Queue all degree 1 nodes
     # This is a bit hacky (using private vars) but avoids a for loop
     # Idea from https://www.py4u.org/blog/python-putting-list-items-in-a-queue/#3-better-code-practices-for-optimization
+    deg1_queue = Queue()        
     with deg1_queue.mutex: # with queue lock
         deg1_queue.queue.extend(deg1_nodes.compute()) # Add all at once
     
     # Iteratively prune away degree 1 nodes from edge_bag_dict   
     while not deg1_queue.empty:
-        # Neighbour is None if deg1_node already pruned away, else [neighbour_id]
-        neighbour = edge_bag_dict.get(deg1_queue.pop(), None)
+        deg1_node = deg1_queue.pop()        
+        # Neighbour is None if deg1_node already pruned away, else neighbour_id
+        neighbour = edge_bag_tuple_groups.filter(
+            lambda tup: tup[0] == deg1_node).map(lambda tup: tup[1][0])
         if neighbour:
-            neighbour = neighbour[0] # Neighbour ID is the only item in list
             # Remove deg1 node from neighbour's connections 
             # (i.e.,remove neighbour -> deg1 edge)
-            edge_bag_dict[neighbour].remove(deg1_node)
+            neighbour_neighbours = edge_bag_tuple_groups.filter(
+                lambda tup: tup[0] == neighbour).map(lambda tup: tup[1])
+            neighbour_neighbours.remove(deg1_node) # Not sure if this modifies the same list via dask!
             # If neighbour is now deg1, add neighbour to deg1 queue
-            if len(edge_bag_dict[neighbour]) == 1:
+            if len(neighbour_neighbours) == 1:
                 deg1_queue.put(neighbour)
             # Remove deg1 node key from dict (remove deg1 -> neighbour edge)
-            del edge_bag_dict[deg1_node]
+            edge_bag_tuple_groups = edge_bag_tuple_groups.filter(
+                lambda tup: tup[0] != deg1_node)
             
     # Get expanded list of tuples of all edges post-pruning
-    def expand(edge_data):
-        """ e.g., edge_data = {0: [1, 5]} -> [(0,1), (0,5)] """
-        key, target_list = edge_data.popitem()
+    def expand(tup):
+        """ e.g., edge_data = (0, [1, 5]) -> [(0,1), (0,5)] """
+        key, target_list = tup[0], tup[1]
         return list(map(lambda target: (key, target), target_list))
-    new_edge_bag = edge_bag_dict.map(lambda edge_data: expand(edge_data)).flatten()    
+    new_edge_bag = edge_bag_tuple_groups.map(lambda tup: expand(tup)).flatten()    
     
     # Intersect remaining edges with original dataframe to get pruned df    
     new_edge_df = new_edge_bag.to_dataframe(meta={"pre": int, "post": int})
