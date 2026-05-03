@@ -38,8 +38,28 @@ from dask import bag as db
 from dask import dataframe as ddf
 from queue import Queue
 
+### CLUSTER IDENTIFICATION - HELPER FUNCTIONS -----------------------------
 
-### CLUSTER IDENTIFICATION SUPPORT FUNCTIONS ------------------------------
+def edge_df_to_tuple(df: ddf.DataFrame, undirect=True) -> list[tuple[int,list[int]]]:
+    edge_bag = df[["pre","post"]].to_bag()
+    if undirect:
+        # Add (b,a) for every (a,b) in set to the set (makes it undirected)
+        edge_bag = edge_bag.map(lambda edge: [edge, (edge[1], edge[0])])
+        edge_bag = edge_bag.flatten().distinct()
+    
+    # Create list of tuples where tup[0] is node id, and tup[1] is list of 
+    # neighbour nodes. This makes it easy to track retained edges and/or degree. 
+    # Computing here saves many repeated computations during the iterative while 
+    # in the prune function, but sacrifices some RAM.
+    grouped_edges = edge_bag.foldby(key = lambda edge: edge[0],
+                                    binop = lambda accum, edge: accum + [edge[1]],
+                                    initial = [],
+                                    combine = lambda accum1, accum2: accum1 + accum2,
+                                    combine_initial = []).compute()
+    return grouped_edges
+
+
+### CLUSTER IDENTIFICATION - PRUNE ----------------------------------------
 
 def prune(df: ddf.DataFrame) -> ddf.DataFrame:
     """ Iteratively remove degree 1 edges from a dask dataframe 
@@ -50,21 +70,7 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
     edges to themselves. Synapse count and directionality are not considered.
     
     """
-    edge_bag = df[["pre","post"]].to_bag()
-    # Add (b,a) for every (a,b) in set to the set (makes it undirected)
-    edge_bag = edge_bag.map(lambda edge: [edge, (edge[1], edge[0])])
-    edge_bag = edge_bag.flatten().distinct()
-    
-    # Create list of tuples where tup[0] is node id, and tup[1] is list of 
-    # neighbour nodes. This makes it easy to track retained edges and degree 
-    # simultaneously. Computing here saves many repeated computations during
-    # the iterative while loop, but sacrifices some RAM.
-    grouped_edges = edge_bag.foldby(key = lambda edge: edge[0],
-                                    binop = lambda accum, edge: accum + [edge[1]],
-                                    initial = [],
-                                    combine = lambda accum1, accum2: accum1 + accum2,
-                                    combine_initial = []).compute()
-    # Find initial degree 1 nodes
+    grouped_edges = edge_df_to_tuple(df)
     deg1_nodes = list(map(lambda tup: tup[0], 
                           filter(lambda tup: len(tup[1]) == 1, grouped_edges)))
     
