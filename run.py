@@ -64,9 +64,9 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
                                     initial = [],
                                     combine = lambda accum1, accum2: accum1 + accum2,
                                     combine_initial = []).compute()
-        
     # Find initial degree 1 nodes
-    deg1_nodes = list(filter(lambda tup: len(tup[1]) == 1, grouped_edges))
+    deg1_nodes = list(map(lambda tup: tup[0], 
+                          filter(lambda tup: len(tup[1]) == 1, grouped_edges)))
     
     # Queue all degree 1 nodes
     # This is a bit hacky (using private vars) but avoids a for loop
@@ -75,22 +75,29 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
     with deg1_queue.mutex: # with queue lock
         deg1_queue.queue.extend(deg1_nodes) # Add all at once
     
+    #print(f"Before: {grouped_edges}")
+    
     # Iteratively prune away degree 1 nodes from edge_bag_dict   
     while not deg1_queue.empty():
-        deg1_node = deg1_queue.get()        
+        deg1_node = deg1_queue.get()
         # Neighbour is None if deg1_node already pruned away, else neighbour_id
-        neighbour = list(filter(lambda tup: tup[0] == deg1_node, grouped_edges))
-        neighbour = neighbour[0] if neighbour else None
+        neighbour = list(map(lambda tup: tup[1], 
+                             filter(lambda tup: tup[0] == deg1_node, grouped_edges)))[0][0]
         if neighbour:
             # Remove deg1 node from neighbour's connections 
             # (i.e.,remove neighbour -> deg1 edge)
-            neighbour_neighbours = list(filter(lambda tup: tup[0] == neighbour, grouped_edges))
-            neighbour_neighbours.remove(deg1_node) # Not sure if this will modify correct list
+            neighbour_neighbours = list(map(lambda tup: tup[1], 
+                                            filter(lambda tup: tup[0] == neighbour, grouped_edges)))[0]
+            neighbour_neighbours.remove(deg1_node)
             # If neighbour is now deg1, add neighbour to deg1 queue
             if len(neighbour_neighbours) == 1:
                 deg1_queue.put(neighbour)
             # Remove deg1 node key from dict (remove deg1 -> neighbour edge)
-            grouped_edges = list(filter(lambda tup: tup[0] != deg1_node, grouped_edges))
+            deg1_tuple = filter(lambda tup: tup[0] == deg1_node, grouped_edges)
+            grouped_edges.remove(deg1_tuple)
+            print(f"After processing {deg1_node}: grouped_edges")
+    
+    #print(f"After: {grouped_edges}")
             
     # Get expanded list of tuples of all edges post-pruning
     def expand(tup):
