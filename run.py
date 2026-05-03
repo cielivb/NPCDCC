@@ -38,9 +38,11 @@ from dask import bag as db
 from dask import dataframe as ddf
 from queue import Queue
 
+
 ### CLUSTER IDENTIFICATION - HELPER FUNCTIONS -----------------------------
 
 def edge_df_to_tuple(df: ddf.DataFrame, undirect=True) -> list[tuple[int,list[int]]]:
+    """ Used in prune() and bfs_components() """
     edge_bag = df[["pre","post"]].to_bag()
     if undirect:
         # Add (b,a) for every (a,b) in set to the set (makes it undirected)
@@ -113,3 +115,12 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
     new_edge_df = new_edge_bag.to_dataframe(meta={"pre": int, "post": int})
     pruned_df = new_edge_df.merge(df, on=["pre","post"], how="inner")
     return pruned_df
+
+
+### CLUSTER IDENTIFICATION - BFS COMPONENT SEARCH ------------------------=
+
+def bfs_components(df: ddf.DataFrame, min_size=30) -> db.Bag:
+    """ Use BFS to return components of df as DataFrames in a Bag """
+    grouped_edges = edge_df_to_tuple(df)
+    n = len(grouped_edges)
+    
