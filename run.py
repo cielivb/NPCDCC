@@ -86,8 +86,9 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
         
     # Get expanded list of tuples of all edges post-pruning
     def expand(edge_data):
-        key, target_list = edge_data[0], edge_data[1]
-        return target_list.map(lambda target: (key, target))
+        """ e.g., edge_data = {0: [1, 5]} -> [(0,1), (0,5)] """
+        key, target_list = edge_data.popitem()
+        return list(map(lambda target: (key, target), target_list))
     new_edge_bag = edge_bag_dict.map(lambda edge_data: expand(edge_data)).flatten()    
     
     # Intersect remaining edges with original dataframe to get pruned df    

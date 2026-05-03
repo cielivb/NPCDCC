@@ -17,9 +17,11 @@ class TestPrune(unittest.TestCase):
         """ A graph with no degree 1 edges returns itself """
         d = {"pre": [0,1,3,3,5,0], "post": [1,2,2,4,4,5]}
         df_before = ddf.from_pandas(pd.DataFrame(data=d))
-        df_after = ddf.from_pandas(pd.DataFrame(data=d))
+        df_after = pd.DataFrame(data=d).sort_values(by=["pre","post"])
+        df_after = df_after.reset_index(drop=True)
         result = run.prune(df_before).compute()
-        assert_frame_equal(result, df_after.compute())
+        result = result.sort_values(by=["pre","post"]).reset_index(drop=True)
+        assert_frame_equal(result, df_after)
         
     def test_single_incoming_deg1_edge(self):
         d_b = {"pre": [0,1,3,3,5,0,6], "post": [1,2,2,4,4,5,0]}
