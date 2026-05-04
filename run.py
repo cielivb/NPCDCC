@@ -177,5 +177,25 @@ def bfs_components(df: ddf.DataFrame, min_size=30) -> db.Bag:
                 components = db.concat([components, db.from_sequence([component_df])])
                 
     return components
-        
-    
+
+
+### CLUSTER IDENTIFICATION - GIRVAN NEWMAN --------------------------------
+
+def convert_to_multigraph(component):
+    """ Convert component to unweighted graph in compact tuple list format.
+    The number of edges from pre to post represents the number of synaptic
+    connections between pre and post. """
+    # Create a dask bag containing the edge the same number of times as the
+    # number of synapses for each row in component
+    pass
+
+
+def girvan_newman(start_node, component):
+    """ Return dict of Girvan Newman edge scores starting at start_node """
+    grouped_edges = convert_to_multigraph(component)
+    parent = bfs_search() # numpy array; Get parent array using BFS search
+    num_shortest_paths = get_num_shortest_paths() # numpy array; label each node with number of shortest paths to it from start_node
+    edge_sums = calculate_raw_edge_sums()
+    edge_sums = merge_sums_of_duplicate_edges()
+    # Transform edge sums to get final edge scores
+    pass
