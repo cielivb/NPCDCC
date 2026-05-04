@@ -34,6 +34,7 @@ TODO
 """
 
 import dask
+import numpy as np
 from dask import bag as db
 from dask import dataframe as ddf
 from queue import Queue
@@ -123,4 +124,24 @@ def bfs_components(df: ddf.DataFrame, min_size=30) -> db.Bag:
     """ Use BFS to return components of df as DataFrames in a Bag """
     grouped_edges = edge_df_to_tuple(df)
     n = len(grouped_edges)
+    state = np.full(n, "U", dtype="<U1")
+    parent = np.full(n, -1, dtype=int) # -1 represents None
+    queue = Queue()
+    components = None # Will later be a dask bag of dask dataframes
+    
+    # Iterate through each node in grouped_edges to get components via BFS
+    nodes = np.fromiter(map(lambda tup: tup[0], grouped_edges), dtype=int)
+    for node_index in range(n):
+        
+        if state[node_index] == "U":
+            prev_state = state.copy()
+            state[node_index] == "D"
+            queue.put(node_index)
+            bfs_loop(grouped_edges, queue, state, parent)
+            
+            # Add new component
+            new_component = set()
+            diff_indices = np.where(state != prev_state)[0]
+            
+        
     
