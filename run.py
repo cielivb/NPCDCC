@@ -181,27 +181,45 @@ def bfs_components(df: ddf.DataFrame, min_size=30) -> db.Bag:
 
 ### CLUSTER IDENTIFICATION - GIRVAN NEWMAN --------------------------------
 
-def convert_to_multigraph(component: ddf.DataFrame) -> db.Bag:
-    """ Convert component to unweighted graph in compact tuple list format.
-    The number of edges from pre to post represents the number of synaptic
-    connections between pre and post. """
-    weighted_edge_bag = component[["pre","post","syn_count"]].to_bag()
-    edge_bag = weighted_edge_bag.map(
-        lambda edge: [(edge[0], edge[1]) for _ in range(edge[2] + 1)]).flatten()
-    grouped_edges = edge_bag.foldby(key = lambda edge: edge[0],
-                                    binop = lambda accum, edge: accum + [edge],
-                                    initial = [],
-                                    combine = lambda accum1, accum2: accum1+accum2,
-                                    combine_initial = []).compute()
-    return grouped_edges
+def bfs_search(start_node, grouped_edges) -> list:
+    """ Create parent array via BFS starting at start node """
+    n = len(grouped_edges)
+    parent = np.full(n, -1, dtype=int)
+    parent = [set() for _ in range(n)]
+    state = np.full(n, "U", dtype="<U1")
+    queue = Queue()
+    nodes = np.fromiter(map(lambda tup: tup[0], grouped_edges), dtype=int)
+    start_node_index = np.where(nodes == start_node)[0][0]
+    state[start_node_index] = "D"
+    queue.put(start_node)
+    
+    while not queue.empty():
+        node = queue.get()
+        node_index = np.where(nodes == node)[0][0]
+        node_neighbours = grouped_edges[node_index][1]
+        for neighbour in node_neighbours:
+            neighbour_index = np.where(nodes == neighbour)[0][0]
+            if state[neighbour_index] in ["U", "D"]:
+                state[neighbour_index] = "D"
+                parent[neighbour_index].add(node)
+                queue.put(neighbour)
+        state[node_index] = "P"
+    
+    return parent
 
 
-def girvan_newman(start_node, component: ddf.DataFrame):
-    """ Return dict of Girvan Newman edge scores starting at start_node """
-    grouped_edges = convert_to_multigraph(component)
-    parent = bfs_search() # numpy array; Get parent array using BFS search
-    num_shortest_paths = get_num_shortest_paths() # numpy array; label each node with number of shortest paths to it from start_node
+def girvan_newman(start_node, grouped_edges, df):
+    """ Return dict of Girvan Newman edge scores starting at start_node.
+    df should only contain pre, post, and syn_count cols """
+    parents = bfs_search(start_node, grouped_edges)
+    num_shortest_paths = get_num_shortest_paths(parents, df) # label each node with number of shortest paths to it from start_node
     edge_sums = calculate_raw_edge_sums()
     edge_sums = merge_sums_of_duplicate_edges()
     # Transform edge sums to get final edge scores
+    pass
+
+
+### CLUSTER IDENTIFICATION - IDENTIFY CLUSTERS ----------------------------
+
+def identify_clusters():
     pass
