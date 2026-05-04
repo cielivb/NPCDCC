@@ -35,6 +35,7 @@ TODO
 
 import dask
 import numpy as np
+from collections import defaultdict
 from dask import bag as db
 from dask import dataframe as ddf
 from queue import Queue
@@ -184,8 +185,7 @@ def bfs_components(df: ddf.DataFrame, min_size=30) -> db.Bag:
 def bfs_search(start_node, grouped_edges) -> list:
     """ Create parent array via BFS starting at start node """
     n = len(grouped_edges)
-    parent = np.full(n, -1, dtype=int)
-    parent = [set() for _ in range(n)]
+    parents = defaultdict(set) # key is node, vals are parents
     state = np.full(n, "U", dtype="<U1")
     queue = Queue()
     nodes = np.fromiter(map(lambda tup: tup[0], grouped_edges), dtype=int)
@@ -201,21 +201,59 @@ def bfs_search(start_node, grouped_edges) -> list:
             neighbour_index = np.where(nodes == neighbour)[0][0]
             if state[neighbour_index] in ["U", "D"]:
                 state[neighbour_index] = "D"
-                parent[neighbour_index].add(node)
+                parents[neighbour].add(node)
                 queue.put(neighbour)
         state[node_index] = "P"
     
-    return parent
+    return parents
 
 
-def girvan_newman(start_node, grouped_edges, df):
+def get_num_shortest_paths(start_node: int, parents: dict, 
+                           df: ddf.DataFrame, grouped_edges):
+    """ Label each node with number of shortest paths to it from start_node """
+    state = np.full(len(parents), "U", dtype="<U1")
+    queue = Queue()
+    num_shortest_paths = {start_node: 1}
+    
+    nodes = np.fromiter(map(lambda tup: tup[0], grouped_edges), dtype=int)    
+    start_node_index = np.where(nodes == start_node)[0][0]
+    first_children = grouped_edges[start_node_index][1]
+    for child in first_children:
+        queue.put(child)
+    
+    while not queue.empty():
+        node = queue.get()
+        
+        # Get number of shortest paths to node
+        num_paths_to_node = 0
+        for parent in parents[node]:
+            num_synapses_to_parent = ...
+            num_paths += num_shortest_paths[parent] * num_synapses_to_parent
+        num_shortest_paths[node] = num_paths_to_node
+        
+        # Add node's children to queue
+        node_index = np.where(nodes == node)[0][0]
+        children = grouped_edges[node_index][1]
+        for child in children:
+            queue.put(child)
+    
+    return num_shortest_paths
+
+
+def get_edge_sums(start_node, grouped_edges, df):
     """ Return dict of Girvan Newman edge scores starting at start_node.
     df should only contain pre, post, and syn_count cols """
     parents = bfs_search(start_node, grouped_edges)
-    num_shortest_paths = get_num_shortest_paths(parents, df) # label each node with number of shortest paths to it from start_node
-    edge_sums = calculate_raw_edge_sums()
-    edge_sums = merge_sums_of_duplicate_edges()
-    # Transform edge sums to get final edge scores
+    num_shortest_paths = get_num_shortest_paths(start_node, parents, df)
+    edge_sums = calculate_raw_edge_sums(start_node, parents, num_shortest_paths)
+    return edge_sums    
+
+
+def girvan_newman(start_node, grouped_edges, df):
+    # Note grouped_edges should be undirected (also ? if should make here or in caller)
+    # Choose random subset of nodes
+    # Map random subset of nodes to get_edge_sums()
+    # Sum edge scores and divide by a factor (e.g., 2 if using all nodes)
     pass
 
 
