@@ -194,8 +194,8 @@ class TestBfsComponents(unittest.TestCase):
     
     def report_test_result(self, test, time1, max_mem, 
                            comp_time, comp_max_mem):
-        line = f"{TestPrune.TIMESTAMP} - {test} - {time1} - {max_mem} - {comp_time} - {comp_max_mem}\n"
-        with open(TestPrune.OUTFILE, 'a') as outfile:
+        line = f"{TestBfsComponents.TIMESTAMP} - {test} - {time1} - {max_mem} - {comp_time} - {comp_max_mem}\n"
+        with open(TestBfsComponents.OUTFILE, 'a') as outfile:
             outfile.write(line)
     
     def test_one_component_small(self):
@@ -206,10 +206,10 @@ class TestBfsComponents(unittest.TestCase):
         
         # Get time to run
         start_time = time()
-        result_before_compute = run.bfs_components(df_before)
+        result_before_compute = run.bfs_components(df_before, min_size=0)
         time1 = time() - start_time
         comp_start_time = time()
-        result = result_before_compute.compute()
+        result = result_before_compute.compute()[0].compute()
         time2 = time() - comp_start_time
         
         # Check if test passed
@@ -217,7 +217,7 @@ class TestBfsComponents(unittest.TestCase):
         assert_frame_equal(result, df_after)
         
         # Get max memory usage
-        max_mem = max(memory_usage((run.bfs_components, (df_before,))))
+        max_mem = max(memory_usage((run.bfs_components, (df_before, 0))))
         comp_max_mem = max(memory_usage((lambda: result_before_compute.compute(),)))
         self.report_test_result("test_one_component_small", time1, max_mem, 
                                 time2, comp_max_mem)
@@ -245,19 +245,19 @@ class TestBfsComponents(unittest.TestCase):
         
         # Get time to run
         start_time = time()
-        result_before_compute = run.bfs_components(df_before)
+        result_before_compute = run.bfs_components(df_before, min_size=0)
         time1 = time() - start_time
         comp_start_time = time()
         result = result_before_compute.compute()
         time2 = time() - comp_start_time
         
-        # Check test passed (note - might fail - not sure if compute will also compute the dask dfs in bag)
+        # Check test passed
         num_matches_by_size = {len(comp_df): 0 for comp_df in component_dfs}
         for df in result:
             df = df.sort_values(by=["pre","post"]).reset_index(drop=True)
             for component_df in component_dfs:
                 if len(component_df) == len(df):
-                    assert_frame_equal(df, unseen_df)
+                    assert_frame_equal(df.compute(), component_df)
                     num_matches_by_size[len(df)] += 1
                     break
         for size, num in num_matches_by_size.items():
@@ -265,7 +265,7 @@ class TestBfsComponents(unittest.TestCase):
                 raise Exception(f"Size {size} dataframe matched {num} times")
         
         # Get max memory usage
-        max_mem = max(memory_usage((run.bfs_components, (df_before,))))
+        max_mem = max(memory_usage((run.bfs_components, (df_before, 0))))
         comp_max_mem = max(memory_usage((lambda: result_before_compute.compute(),)))
         self.report_test_result("test_combo_case", time1, max_mem,
                                 time2, comp_max_mem)               

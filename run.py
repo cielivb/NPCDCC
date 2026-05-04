@@ -74,11 +74,11 @@ def grouped_edge_tuples_to_df(tuple_iter, original_df: ddf.DataFrame):
     def expand(tup):
         """ e.g., edge_data = (0, [1, 5]) -> [(0,1), (0,5)] """
         return list(map(lambda target: (tup[0], target), tup[1]))
-    new_edge_bag = db.from_sequence(grouped_edges).map(lambda tup: expand(tup)).flatten()
+    new_edge_bag = db.from_sequence(tuple_iter).map(lambda tup: expand(tup)).flatten()
     
     # Intersect remaining edges with original dataframe
     new_edge_df = new_edge_bag.to_dataframe(meta={"pre": int, "post": int})
-    new_df = new_edge_df.merge(df, on=["pre","post"], how="inner")
+    new_df = new_edge_df.merge(original_df, on=["pre","post"], how="inner")
     return new_df
 
 
@@ -135,12 +135,14 @@ def bfs_loop(grouped_edges, nodes, queue, state):
     """ Discover a component """
     while not queue.empty():
         node = queue.get()
-        node_neighbours = grouped_edges[nodes.index(node)][1]
+        node_index = np.where(nodes == node)[0][0]
+        node_neighbours = grouped_edges[node_index][1]
         for neighbour in node_neighbours:
-            neighbour_index = nodes.index(neighbour)
+            neighbour_index = np.where(nodes == neighbour)[0][0]
             if state[neighbour_index] == "U":
                 state[neighbour_index] == "D"
                 queue.put(neighbour)
+        state[node_index] = "P"
 
 
 def bfs_components(df: ddf.DataFrame, min_size=30) -> db.Bag:
@@ -172,7 +174,7 @@ def bfs_components(df: ddf.DataFrame, min_size=30) -> db.Bag:
             if not components:
                 components = db.from_sequence([component_df])
             else:
-                components = db.concat(components, db.from_sequence([component_df]))
+                components = db.concat([components, db.from_sequence([component_df])])
                 
     return components
         
