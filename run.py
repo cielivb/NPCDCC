@@ -131,12 +131,23 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
 
 ### CLUSTER IDENTIFICATION - BFS COMPONENT SEARCH ------------------------=
 
+def bfs_loop(grouped_edges, nodes, queue, state):
+    """ Discover a component """
+    while not queue.empty():
+        node = queue.get()
+        node_neighbours = grouped_edges[nodes.index(node)][1]
+        for neighbour in node_neighbours:
+            neighbour_index = nodes.index(neighbour)
+            if state[neighbour_index] == "U":
+                state[neighbour_index] == "D"
+                queue.put(neighbour)
+
+
 def bfs_components(df: ddf.DataFrame, min_size=30) -> db.Bag:
     """ Use BFS to return components of df as DataFrames in a Bag """
     grouped_edges = edge_df_to_tuple(df)
     n = len(grouped_edges)
     state = np.full(n, "U", dtype="<U1")
-    parent = np.full(n, -1, dtype=int) # -1 represents None
     queue = Queue()
     components = None # Will later be a dask bag of dask dataframe/s
     
@@ -149,15 +160,15 @@ def bfs_components(df: ddf.DataFrame, min_size=30) -> db.Bag:
             state[node_index] == "D"
             queue.put(node_index)
             
-            bfs_loop(grouped_edges, queue, state, parent) # Discover component
+            bfs_loop(grouped_edges, nodes, queue, state) # Discover component
             
             # Add new component if large enough
             diff_indices = np.where(state != prev_state)[0]
             if len(diff_indices) < min_size:
                 continue
-            component_nodes = filter(lambda tup: grouped_edges.index(tup) in diff_indices,
+            component_edges = filter(lambda tup: grouped_edges.index(tup) in diff_indices,
                                      grouped_edges)
-            component_df = grouped_edge_tuples_to_df(component_nodes, df)
+            component_df = grouped_edge_tuples_to_df(component_edges, df)
             if not components:
                 components = db.from_sequence([component_df])
             else:
