@@ -188,7 +188,87 @@ class TestGetUpperThreshold(unittest.TestCase):
 
 
 class TestBfsComponents(unittest.TestCase):
-    pass
+    
+    OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test-bfs-components.txt")
+    TIMESTAMP = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    def report_test_result(self, test, time1, max_mem, 
+                           comp_time, comp_max_mem):
+        line = f"{TestPrune.TIMESTAMP} - {test} - {time1} - {max_mem} - {comp_time} - {comp_max_mem}\n"
+        with open(TestPrune.OUTFILE, 'a') as outfile:
+            outfile.write(line)
+    
+    def test_one_component_small(self):
+        d = {"pre": [0,1,2], "post": [1,2,0]}
+        df_before = ddf.from_pandas(pd.DataFrame(data=d))
+        df_after = pd.DataFrame(data=d).sort_values(by=["pre","post"])
+        df_after = df_after.reset_index(drop=True)
+        
+        # Get time to run
+        start_time = time()
+        result_before_compute = run.bfs_components(df_before)
+        time1 = time() - start_time
+        comp_start_time = time()
+        result = result_before_compute.compute()
+        time2 = time() - comp_start_time
+        
+        # Check if test passed
+        result = result.sort_values(by=["pre", "post"]).reset_index(drop=True)
+        assert_frame_equal(result, df_after)
+        
+        # Get max memory usage
+        max_mem = max(memory_usage((run.bfs_components, (df_before,))))
+        comp_max_mem = max(memory_usage((lambda: result_before_compute.compute(),)))
+        self.report_test_result("test_one_component_small", time1, max_mem, 
+                                time2, comp_max_mem)
+    
+    def test_multiple_components(self):
+        """ There are 5 components of varying size in the initial dataframe """
+        d_b = {"pre": [0,2,3,4,5,6,8,8,10,5,11,12,13,14,15,16,17,18,
+                       20,21,22,23,24,25,26,27,28,29,30,31,31,31,31,31,31,31,29],
+               "post": [1,3,4,2,6,7,7,9,9,10,12,13,14,15,16,17,18,19,
+                        21,22,23,24,25,26,27,28,29,30,31,29,28,27,26,25,24,23,20]}
+        df_before = ddf.from_pandas(pd.DataFrame(data=d_b))
+        
+        d_c1 = {"pre": [0], "post": [1]}
+        d_c2 = {"pre": [2,3,4], "post": [3,4,2]}
+        d_c3 = {"pre": [5,6,8,8,10,5], "post": [6,7,7,9,9,10]}
+        d_c4 = {"pre": [11,12,13,14,15,16,17,18], 
+                "post": [12,13,14,15,16,17,18,19]}
+        d_c5 = {"pre": [20,21,22,23,24,25,26,27,28,29,30,31,31,31,31,31,31,31,29],
+                "post": [21,22,23,24,25,26,27,28,29,30,31,29,28,27,26,25,24,23,20]}
+        component_dfs = []
+        for component_data in [d_c1, d_c2, d_c3, d_c4, d_c5]:
+            df = pd.DataFrame(data=d_c1).sort_values(by=["pre","post"])
+            df = df.reset_index(drop=True)
+            component_dfs.append(df)
+        
+        # Get time to run
+        start_time = time()
+        result_before_compute = run.bfs_components(df_before)
+        time1 = time() - start_time
+        comp_start_time = time()
+        result = result_before_compute.compute()
+        time2 = time() - comp_start_time
+        
+        # Check test passed (note - might fail - not sure if compute will also compute the dask dfs in bag)
+        num_matches_by_size = {len(comp_df): 0 for comp_df in component_dfs}
+        for df in result:
+            df = df.sort_values(by=["pre","post"]).reset_index(drop=True)
+            for component_df in component_dfs:
+                if len(component_df) == len(df):
+                    assert_frame_equal(df, unseen_df)
+                    num_matches_by_size[len(df)] += 1
+                    break
+        for size, num in num_matches_by_size.items():
+            if num != 1:
+                raise Exception(f"Size {size} dataframe matched {num} times")
+        
+        # Get max memory usage
+        max_mem = max(memory_usage((run.bfs_components, (df_before,))))
+        comp_max_mem = max(memory_usage((lambda: result_before_compute.compute(),)))
+        self.report_test_result("test_combo_case", time1, max_mem,
+                                time2, comp_max_mem)               
 
 
 class TestDijkstra(unittest.TestCase):
