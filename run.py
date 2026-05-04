@@ -62,6 +62,26 @@ def edge_df_to_tuple(df: ddf.DataFrame, undirect=True) -> list[tuple[int,list[in
     return grouped_edges
 
 
+def grouped_edge_tuples_to_df(tuple_iter, original_df: ddf.DataFrame):
+    """ Merge compact tuple edge representation with original dataframe 
+    
+    Tuple edges are expanded into one tuple per edge format. Then for every
+    edge in the original dataframe, if that edge is present in expanded tuple
+    format, that edge in the original dataframe is retained in a new dataframe,
+    which is then returned.
+    """
+    # Get iterable of expanded tuples (one tuple per edge)
+    def expand(tup):
+        """ e.g., edge_data = (0, [1, 5]) -> [(0,1), (0,5)] """
+        return list(map(lambda target: (tup[0], target), tup[1]))
+    new_edge_bag = db.from_sequence(grouped_edges).map(lambda tup: expand(tup)).flatten()
+    
+    # Intersect remaining edges with original dataframe
+    new_edge_df = new_edge_bag.to_dataframe(meta={"pre": int, "post": int})
+    new_df = new_edge_df.merge(df, on=["pre","post"], how="inner")
+    return new_df
+
+
 ### CLUSTER IDENTIFICATION - PRUNE ----------------------------------------
 
 def prune(df: ddf.DataFrame) -> ddf.DataFrame:
@@ -106,16 +126,7 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
         deg1_tuple = list(filter(lambda tup: tup[0] == deg1_node, grouped_edges))[0]
         grouped_edges.remove(deg1_tuple)
                 
-    # Get expanded list of tuples of all edges post-pruning
-    def expand(tup):
-        """ e.g., edge_data = (0, [1, 5]) -> [(0,1), (0,5)] """
-        return list(map(lambda target: (tup[0], target), tup[1]))
-    new_edge_bag = db.from_sequence(grouped_edges).map(lambda tup: expand(tup)).flatten()
-    
-    # Intersect remaining edges with original dataframe to get pruned df    
-    new_edge_df = new_edge_bag.to_dataframe(meta={"pre": int, "post": int})
-    pruned_df = new_edge_df.merge(df, on=["pre","post"], how="inner")
-    return pruned_df
+    return grouped_edge_tuples_to_df(grouped_edges, df)
 
 
 ### CLUSTER IDENTIFICATION - BFS COMPONENT SEARCH ------------------------=
@@ -127,7 +138,7 @@ def bfs_components(df: ddf.DataFrame, min_size=30) -> db.Bag:
     state = np.full(n, "U", dtype="<U1")
     parent = np.full(n, -1, dtype=int) # -1 represents None
     queue = Queue()
-    components = None # Will later be a dask bag of dask dataframes
+    components = None # Will later be a dask bag of dask dataframe/s
     
     # Iterate through each node in grouped_edges to get components via BFS
     nodes = np.fromiter(map(lambda tup: tup[0], grouped_edges), dtype=int)
@@ -137,11 +148,21 @@ def bfs_components(df: ddf.DataFrame, min_size=30) -> db.Bag:
             prev_state = state.copy()
             state[node_index] == "D"
             queue.put(node_index)
-            bfs_loop(grouped_edges, queue, state, parent)
             
-            # Add new component
-            new_component = set()
+            bfs_loop(grouped_edges, queue, state, parent) # Discover component
+            
+            # Add new component if large enough
             diff_indices = np.where(state != prev_state)[0]
-            
+            if len(diff_indices) < min_size:
+                continue
+            component_nodes = filter(lambda tup: grouped_edges.index(tup) in diff_indices,
+                                     grouped_edges)
+            component_df = grouped_edge_tuples_to_df(component_nodes, df)
+            if not components:
+                components = db.from_sequence([component_df])
+            else:
+                components = db.concat(components, db.from_sequence([component_df]))
+                
+    return components
         
     
