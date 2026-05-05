@@ -42,6 +42,11 @@ from dask import dataframe as ddf
 from queue import Queue
 
 
+GRAIN_SIZE = 128
+MIN_CLUSTER_SIZE = 30
+MAD_K = 3.5
+
+
 ### CLUSTER IDENTIFICATION - HELPER FUNCTIONS -----------------------------
 
 def df_to_adjacency_bag(df, undirected=True):
@@ -71,6 +76,54 @@ def df_to_adjacency_bag(df, undirected=True):
     )
     return adjacency_bag
 
+
+class Pennant():
+    """"""    
+    def __init__(self, element: int):
+        """ Initialise a pennant holding a single element """
+        global GRAIN_SIZE # grain size is the # of elements this pennant can hold
+        self.left, self.right = None, None # Assign null pointers to children
+        elements = np.full(GRAIN_SIZE, None, dtype="object")
+        elements[0] = element
+    
+    def pennant_union(self, other):
+        """ Combine self with other pennant.
+        "Two pennants x and y of size 2^k can be combined to form a pennant of 
+        size 2^(k+1) in O(1) time" """
+        other.right = self.left
+        self.left = other
+        return self
+    
+    def pennant_split(self):
+        """ Splits self into two pennants (i.e., inverse of pennant_union()).
+        Requires self to contain at least 2 elements. Pennants self and new will 
+        each contain half the elements in original self. """
+        new = self.left
+        self.left = new.right
+        new.right = None
+        return new
+
+
+class PBag():
+    """ A collection of pennants, no two of which have the same size. """
+    
+    def __init__(self, num_nodes_to_store: int):
+        """ PBFS represents a bag S using a ﬁxed-size array S[0 . . r], called 
+        the backbone, where 2^(r+1) exceeds the maximum number ofelements ever 
+        stored in a bag. Each entry S[k] in the backbone con-tains either a 
+        null pointer or a pointer to a pennant """
+        global GRAIN_SIZE
+        
+        r = log(num_nodes_to_store)/log(2) - 1 # Simple rearrangement of equality
+        backbone_size = int(r) + 2 # Ensure the formula exceeds num_nodes_to_store
+        self.backbone = np.full(backbone_size, None, dtype="object")
+        
+        # A PBag also maintains an additional pennant node called the hopper,
+        # which it fills gradually.
+        hopper = np.full(GRAIN_SIZE, None, dtype="object")
+        
+    def insert(self, element):
+        pass
 
 def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
     """ Return parents dask bag, num_shortest_paths array, and set of leaves. 
@@ -106,6 +159,9 @@ def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
         nodes = adjacency_bag.map(
             lambda node_adjacency: node_adjacency[0]).compute()
     state = np.full(len(nodes), "U", dtype)
+    
+    layer_0 = bag_create(len(nodes)) # Allocate space for a fixed-size backbone of null pointers
+    
     
 
 
