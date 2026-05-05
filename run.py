@@ -79,12 +79,12 @@ def df_to_adjacency_bag(df, undirected=True):
 
 class Pennant():
     """"""    
-    def __init__(self, element: int):
+    def __init__(self, element: int|None):
         """ Initialise a pennant holding a single element """
         global GRAIN_SIZE # grain size is the # of elements this pennant can hold
         self.left, self.right = None, None # Assign null pointers to children
-        elements = np.full(GRAIN_SIZE, None, dtype="object")
-        elements[0] = element
+        self.elements = np.full(GRAIN_SIZE, None, dtype="object")
+        self.elements[0] = element
     
     def pennant_union(self, other):
         """ Combine self with other pennant.
@@ -120,10 +120,60 @@ class PBag():
         
         # A PBag also maintains an additional pennant node called the hopper,
         # which it fills gradually.
-        hopper = np.full(GRAIN_SIZE, None, dtype="object")
+        self.hopper = Pennant(None)
         
-    def insert(self, element):
+    def insert(self, element: int):
+        """ Insert element into bag """
+        new_pennant = Pennant(element)
+        hopper_none_indices = np.where(self.hopper.elements == None)[0]
+        # Insert element into hopper if hopper is not full (most cases).        
+        if hopper_none_indices.size > 0:
+            self.hopper.elements[hopper_none_indices[0]] = new_pennant
+        else:
+            # If hopper full, insert hopper into backbone then put element in new
+            # hopper (occurs once for every GRAIN_SIZE insertions)            
+            backbone_none_indices = np.where(self.backbone == None)[0]
+            self.backbone[backbone_none_indices[0]] = self.hopper
+            self.hopper = new_pennant
+    
+    def _full_adder(x, y, z):
+        """ Union 3 pennants into 2 pennants. 
+        Logic source: https://dl.acm.org/doi/epdf/10.1145/1810479.1810534 pg 5
+        """
+        x_empty = np.all(x.elements == None)
+        y_empty = np.all(y.elements == None)
+        z_empty = np.all(z.elements == None)
+        
+        match (x_empty, y_empty, z_empty):
+            case (True, True, True): return (None, None)
+            case (False, True, True): return (x, None)
+            case (True, False, True): return (y, None)
+            case (True, True, False): return (z, None)
+            case (False, False, True): return (None, x.union(y))
+            case (False, True, False): return (None, x.union(z))
+            case (True, False, False): return (None, y.union(z))
+            case (False, False, False): return (x, y.union(z))
+        
+    def union(self, other_pbag):
+        """ Move all elements from other_pbag to self, and destroy other_pbag """
+        # Determine which bag has the less full hopper
+        num_spaces_avail_self = np.sum(self.hopper.elements == None)
+        num_spaces_avail_other = np.sum(other_pbag.hopper.elements == None)
+        spaces_per_bag = [(self, num_spaces_avail_self), 
+                          (other_pbag, num_spaces_avail_other)]
+        emptier_hopper = max(spaces_per_bag, key = lambda x: x[1])
+        fuller_hopper = min(spaces_per_bag, key = lambda x: x[1])
+        
+        # Move elements of the less full hopper into the more full hopper
+        #    If can move all, merge the bags as usual
+        #    Else set y = the more full hopper, then merge as usual
         pass
+    
+    def split(self):
+        """ Remove half (to within some constant amount GRAIN_SIZE) of the 
+        elements from self, and put them in a new bag new_bag """
+        pass
+
 
 def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
     """ Return parents dask bag, num_shortest_paths array, and set of leaves. 
