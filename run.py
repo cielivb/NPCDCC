@@ -44,24 +44,32 @@ from queue import Queue
 
 ### CLUSTER IDENTIFICATION - HELPER FUNCTIONS -----------------------------
 
-def edge_df_to_tuple(df: ddf.DataFrame, undirect=True) -> list[tuple[int,list[int]]]:
-    """ Used in prune() and bfs_components() """
-    edge_bag = df[["pre","post"]].to_bag()
-    if undirect:
-        # Add (b,a) for every (a,b) in set to the set (makes it undirected)
-        edge_bag = edge_bag.map(lambda edge: [edge, (edge[1], edge[0])])
+def df_to_adjacency_list(df, undirected=True):
+    """ Convert dataframe edges into adjacency list of edges with weights.
+    
+    Return an adjacency list for the dataframe as a dask bag of the form
+        db.from_sequence([(a, [(b, 3)]), (b: [(a, 3)])])
+    if undirected, otherwise
+        db.from_sequence([(a, []), (b, [(a, 3)])])
+    where the edge from b->a (or b->a and a->b in the undirected version) has
+    weight 3.
+    
+    Weight represents the number of synpases between two neurons a and b.
+    
+    """
+    edge_bag = df[["pre", "post", "syn_count"]].to_bag()
+    if undirected: # Add (b,a,w) for every (a,b,w)
+        edge_bag = edge_bag.map(lambda edge: [edge, (edge[1], edge[0], edge[2])])
         edge_bag = edge_bag.flatten().distinct()
     
-    # Create list of tuples where tup[0] is node id, and tup[1] is list of 
-    # neighbour nodes. This makes it easy to track retained edges and/or degree. 
-    # Computing here saves many repeated computations during the iterative while 
-    # in the prune function, but sacrifices some RAM.
-    grouped_edges = edge_bag.foldby(key = lambda edge: edge[0],
-                                    binop = lambda accum, edge: accum + [edge[1]],
-                                    initial = [],
-                                    combine = lambda accum1, accum2: accum1 + accum2,
-                                    combine_initial = []).compute()
-    return grouped_edges
+    adjacency_bag = edge_bag.foldby(
+        key = lambda edge: edge[0],
+        binop = lambda accum, edge: accum + [(edge[1], edge[2])],
+        initial = [],
+        combine = lambda accum1, accum2: accum1 + accum2,
+        combine_initial = []
+    )
+    return adjacency_bag
 
 
 def grouped_edge_tuples_to_df(tuple_iter, original_df: ddf.DataFrame):
@@ -131,7 +139,23 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
     return grouped_edge_tuples_to_df(grouped_edges, df)
 
 
-### CLUSTER IDENTIFICATION - BFS COMPONENT SEARCH ------------------------=
+### CLUSTER IDENTIFICATION - BFS TREE -------------------------------------
+
+def get_component_adjacency_lists(df: ddf.DataFrame, undirected=True):
+    """ Return a dask bag of adjacency lists for each component in df.
+   
+    For each component in the graph represented in df, return the 
+    adjacency list of the component containing each edge and their 
+    weights. Using the above example, the edge between a and b has weight 3.
+    
+    Parent-child relationships require a start node, which is outside the
+    scope of this function. See the bfs_search function.
+
+    """
+    mega_adjacency_list = df_to_adjacency_list(df)
+    pass
+
+### CLUSTER IDENTIFICATION - BFS COMPONENT SEARCH -------------------------
 
 def bfs_loop(grouped_edges, nodes, queue, state):
     """ Discover a component """
@@ -328,7 +352,7 @@ def identify_clusters(df: ddf.DataFrame, is_pruned=True):
     grouped_edges = edge_df_to_tuple(df)
     gn_scores = girvan_newman(grouped_edges, df)
     upper_score_threshold = get_upper_threshold(gn_scores)
-    new_df = filter_df(df, edge_scores, upper_score_threshold)
+    new_df = chop_df(df, edge_scores, upper_score_threshold)
     new_components = bfs_components(new_df)
     new_clusters = db.Bag()
     for component in new_components():
