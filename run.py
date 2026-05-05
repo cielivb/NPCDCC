@@ -114,6 +114,7 @@ class PBag():
         null pointer or a pointer to a pennant """
         global GRAIN_SIZE
         
+        self.max_node_capacity = num_nodes_to_store
         r = log(num_nodes_to_store)/log(2) - 1 # Simple rearrangement of equality
         backbone_size = int(r) + 2 # Ensure the formula exceeds num_nodes_to_store
         self.backbone = np.full(backbone_size, None, dtype="object")
@@ -121,6 +122,7 @@ class PBag():
         # A PBag also maintains an additional pennant node called the hopper,
         # which it fills gradually.
         self.hopper = Pennant(None)
+        self.hopper_capacity = self.hopper.elements.size        
         
     def insert(self, element: int):
         """ Insert element into bag """
@@ -149,10 +151,10 @@ class PBag():
             case (False, True, True): return (x, None)
             case (True, False, True): return (y, None)
             case (True, True, False): return (z, None)
-            case (False, False, True): return (None, x.union(y))
-            case (False, True, False): return (None, x.union(z))
-            case (True, False, False): return (None, y.union(z))
-            case (False, False, False): return (x, y.union(z))
+            case (False, False, True): return (None, x.pennant_union(y))
+            case (False, True, False): return (None, x.pennant_union(z))
+            case (True, False, False): return (None, y.pennant_union(z))
+            case (False, False, False): return (x, y.pennant_union(z))
         
     def union(self, other_pbag):
         """ Move all elements from other_pbag to self, and destroy other_pbag.
@@ -169,7 +171,6 @@ class PBag():
         
         # Move as many elements of the less full hopper into the more full 
         # hopper as possible
-        hopper_capacity = self.hopper.elements.size
         num_elements_in_emptier = np.sum(emptier_hopper.elements != None)
         num_spaces_avail_in_fuller = np.sum(fuller_hopper.elements == None)
         if num_elements_in_emptier > num_spaces_avail_in_fuller:
@@ -187,7 +188,7 @@ class PBag():
         # the emptier hopper, set y = the more full hopper, else None.
         num_elements_in_emptier_hopper = np.sum(emptier_hopper.elements != None)
         y = fuller_hopper if num_elements_in_emptier_hopper > 0 else None
-        for k in range(hopper_capacity + 1):
+        for k in range(self.hopper_capacity + 1):
             emptier_bag.backbone[k], y = self._full_adder(emptier_bag.backbone[k],
                                                           fuller_bag.backbone[k],
                                                           y)
@@ -195,8 +196,17 @@ class PBag():
     
     def split(self):
         """ Remove half (to within some constant amount GRAIN_SIZE) of the 
-        elements from self, and put them in a new bag new_bag """
-        pass
+        elements from self, and put them in a new bag new_bag. "operates like
+        an arithmetic right shift" """
+        bag2 = PBag(self.max_node_capacity)
+        bag2.hopper = self.backbone[0]
+        self.backbone[0] = None
+        for k in range(1, self.hopper_capacity + 1):
+            if self.backbone[k]:
+                bag2.backbone[k-1] = self.backbone[k].pennant_split()
+                self.backbone[k-1] = self.backbone[k]
+                self.backbone[k] = None
+        return bag2
 
 
 def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
