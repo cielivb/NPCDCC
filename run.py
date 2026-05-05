@@ -72,6 +72,43 @@ def df_to_adjacency_bag(df, undirected=True):
     return adjacency_bag
 
 
+def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
+    """ Return parents dask bag, num_shortest_paths array, and set of leaves. 
+    
+    The numpy arrays nodes and state will be automatically computed from the
+    adjacency bag if not supplied. state is not required to complete the bfs
+    search, however, the caller (e.g., get_component_adjacency_bags()) may 
+    wish to validate the status of each node after the search is complete.
+    state is not returned; it is modified in place.
+    
+    Indices in parents_bag and num_shortest_paths array correspond to indices
+    in nodes (or more generally, to indices in adjacency_bag, although that
+    cannot be indexed). 
+    
+    parents_bag has the general form
+        db.from_sequence([(c, {a, b}), (d, {c})])
+    where a and b are parents of c, and c is the only parent of d.
+    
+    The values in num_shortest_paths are the number of shortest paths from the
+    start node to that respective node. Given an edge a->b with weight = 3,
+    there are 3 synaptic connections between a and b, and thus 3 paths from
+    a to b. That is, the integer weight represents the number of paths from
+    a to b.
+    
+    The set of leaves contains nodes that do not have any children.
+    
+    Parallel algorithm inspired by:
+    https://dl.acm.org/doi/epdf/10.1145/1810479.1810534
+    
+    """
+    # Set up
+    if not nodes:
+        nodes = adjacency_bag.map(
+            lambda node_adjacency: node_adjacency[0]).compute()
+    state = np.full(len(nodes), "U", dtype)
+    
+
+
 def grouped_edge_tuples_to_df(tuple_iter, original_df: ddf.DataFrame):
     """ Merge compact tuple edge representation with original dataframe 
     
@@ -141,12 +178,14 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
 
 ### CLUSTER IDENTIFICATION - BFS TREE -------------------------------------
 
-def get_component_adjacency_lists(df: ddf.DataFrame, undirected=True):
-    """ Return a dask bag of adjacency lists for each component in df.
+def get_component_adjacency_bags(df: ddf.DataFrame, undirected=True):
+    """ Return a dask bag of adjacency lists/bags for each component in df.
    
     For each component in the graph represented in df, return the 
     adjacency list of the component containing each edge and their 
-    weights. Using the above example, the edge between a and b has weight 3.
+    weights. This is done by performing iteratively performing parallel BFS to 
+    identify nodes belonging to different components. Only one component can
+    be discovered at a time.
     
     Parent-child relationships require a start node, which is outside the
     scope of this function. See the bfs_search function.
@@ -166,7 +205,7 @@ def get_component_adjacency_lists(df: ddf.DataFrame, undirected=True):
             node = nodes[node_index]            
             state[node_index] = "D"
             
-            pbfs_search(node_index, big_adjacency_bag, state)
+            pbfs_search(node, big_adjacency_bag, nodes, state)
             
             # Add new component
             diff_indices = np.where(state != prev_state)[0]
