@@ -35,6 +35,7 @@ TODO
 
 import dask
 import numpy as np
+import random
 from collections import defaultdict
 from dask import bag as db
 from dask import dataframe as ddf
@@ -285,19 +286,52 @@ def get_edge_scores(start_node, grouped_edges, df):
     df should only contain pre, post, and syn_count cols """
     parents = bfs_search(start_node, grouped_edges)
     num_shortest_paths, leaves = get_num_shortest_paths(start_node, parents, df, grouped_edges)
-    edge_scores = calculate_raw_edge_scores(start_node, parents, num_shortest_paths, grouped_edges, leaves)
+    edge_scores = calculate_edge_scores(start_node, parents, num_shortest_paths, grouped_edges, leaves)
     return edge_scores
 
 
-def girvan_newman(start_node, grouped_edges, df):
-    # Note grouped_edges should be undirected (also ? if should make here or in caller)
-    # Choose random subset of nodes
-    # Map random subset of nodes to get_edge_sums()
+def girvan_newman(grouped_edges, df):
+    # Choose random subset of nodes. 
+    # For now, using sample size = half the number of nodes in the df.
+    nodes = db.concat([df["pre"].unique().to_bag(), 
+                       df["post"].unique().to_bag]).unique().compute()
+    random_nodes = db.from_sequence(random.sample(nodes, len(nodes)/2))
+    
+    # Map random subset of nodes to get_edge_scores()
+    score_dicts = random_nodes.map(get_edge_scores, grouped_edges, df)
     # Sum edge scores and divide by a factor (e.g., 2 if using all nodes)
-    pass
+    def score_dict_to_tuples(score_dict):
+        """ Score dict contains edge scores for each edge """
+        score_tuples = []
+        for edge, score in score_dict.items():
+            score_tuples.append((edge, score))
+        return db.from_sequence(score_tuples)
+    score_tuples = score_dicts.map(score_dict_to_tuples).flatten()
+    scores = score_tuples.foldby(
+        key = lambda edge_score: edge_score[0],
+        binop = lambda accum, edge_score: accum + edge_score[1],
+        initial = 0,
+        combine = lambda accum1, accum2: accum1 + accum2,
+        combine_initial = 0
+    )
+    # Used sample size = half # nodes in df -> factor = 1
+    factor = 1
+    standardised_scores = scores.map(lambda edge_score: (edge_score[0], edge_score[1]/factor))
+    return standardised_scores
 
 
 ### CLUSTER IDENTIFICATION - IDENTIFY CLUSTERS ----------------------------
 
-def identify_clusters():
-    pass
+def identify_clusters(df: ddf.DataFrame, is_pruned=True):
+    if not is_pruned:
+        df = prune(df)
+    grouped_edges = edge_df_to_tuple(df)
+    gn_scores = girvan_newman(grouped_edges, df)
+    upper_score_threshold = get_upper_threshold(gn_scores)
+    new_df = filter_df(df, edge_scores, upper_score_threshold)
+    new_components = bfs_components(new_df)
+    new_clusters = db.Bag()
+    for component in new_components():
+        cluster = prune(component)
+        new_clusters = db.concat([new_clusters, cluster])
+    return new_clusters
