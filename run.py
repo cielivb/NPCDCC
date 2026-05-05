@@ -209,10 +209,13 @@ def bfs_search(start_node, grouped_edges) -> list:
 
 
 def get_num_shortest_paths(start_node: int, parents: dict, 
-                           df: ddf.DataFrame, grouped_edges):
-    """ Label each node with number of shortest paths to it from start_node """
+                           df: ddf.DataFrame, grouped_edges) -> dict:
+    """ Label each node with number of shortest paths to it from start_node. 
+    Accounts for number of synapses.
+    """
     state = np.full(len(parents), "U", dtype="<U1")
     queue = Queue()
+    leaves = []
     num_shortest_paths = {start_node: 1}
     
     nodes = np.fromiter(map(lambda tup: tup[0], grouped_edges), dtype=int)    
@@ -234,19 +237,56 @@ def get_num_shortest_paths(start_node: int, parents: dict,
         # Add node's children to queue
         node_index = np.where(nodes == node)[0][0]
         children = grouped_edges[node_index][1]
+        if len(children) == 0:
+            leaves.append(node)
         for child in children:
             queue.put(child)
     
-    return num_shortest_paths
+    return (num_shortest_paths, leaves)
 
 
-def get_edge_sums(start_node, grouped_edges, df):
+def calculate_edge_scores(start_node: int, parents: list, 
+                          num_shortest_paths: dict, grouped_edges: list, leaves: list):
+    """ Edge scoring rules are detailed on page 365 of MMDS Chapter 10 """
+    nodes = np.fromiter(map(lambda tup: tup[0], grouped_edges), dtype=int) 
+    nodes_to_score, edge_scores = Queue(), dict()
+    with nodes_to_score.mutex: # with queue lock
+        nodes_to_score.queue.extend(leaves) # Add all leaves at once
+        
+    while not nodes_to_score.empty():
+        node = nodes_to_score.get()
+        node_index = np.where(nodes == node)[0][0]
+        
+        if node in leaves:
+            node_credit = 1 # Rule 1
+        else:
+            # Rule 2
+            children = grouped_edges[node_index][1]
+            child_edge_credits = 0
+            for child in children:
+                child_edge_credits += edge_scores[(node, child)]
+            node_credit = 1 + child_edge_credits
+            
+        # Rule 3
+        node_parents = parents[node_index]
+        total_num_shortest_paths_to_parents = 0
+        for parent in node_parents:
+            total_num_shortest_paths_to_parents += num_shortest_paths[parent]
+        for parent in node_parents:
+            edge_credit = node_credit * num_shortest_paths[parent] / total_num_shortest_paths_to_parents
+            edge_scores[(parent, node)] = edge_credit
+            nodes_to_score.put(parent)
+    
+    return edge_scores
+
+
+def get_edge_scores(start_node, grouped_edges, df):
     """ Return dict of Girvan Newman edge scores starting at start_node.
     df should only contain pre, post, and syn_count cols """
     parents = bfs_search(start_node, grouped_edges)
-    num_shortest_paths = get_num_shortest_paths(start_node, parents, df)
-    edge_sums = calculate_raw_edge_sums(start_node, parents, num_shortest_paths)
-    return edge_sums    
+    num_shortest_paths, leaves = get_num_shortest_paths(start_node, parents, df, grouped_edges)
+    edge_scores = calculate_raw_edge_scores(start_node, parents, num_shortest_paths, grouped_edges, leaves)
+    return edge_scores
 
 
 def girvan_newman(start_node, grouped_edges, df):
