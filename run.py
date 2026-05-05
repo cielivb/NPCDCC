@@ -155,19 +155,43 @@ class PBag():
             case (False, False, False): return (x, y.union(z))
         
     def union(self, other_pbag):
-        """ Move all elements from other_pbag to self, and destroy other_pbag """
+        """ Move all elements from other_pbag to self, and destroy other_pbag.
+        Uses an algorithm similar to ripple-carry addition of two binary 
+        counters """
         # Determine which bag has the less full hopper
         num_spaces_avail_self = np.sum(self.hopper.elements == None)
         num_spaces_avail_other = np.sum(other_pbag.hopper.elements == None)
         spaces_per_bag = [(self, num_spaces_avail_self), 
                           (other_pbag, num_spaces_avail_other)]
-        emptier_hopper = max(spaces_per_bag, key = lambda x: x[1])
-        fuller_hopper = min(spaces_per_bag, key = lambda x: x[1])
+        emptier_bag = max(spaces_per_bag, key = lambda x: x[1])
+        fuller_bag = min(spaces_per_bag, key = lambda x: x[1])
+        emptier_hopper, fuller_hopper = emptier_bag.hopper, fuller_bag.hopper
         
-        # Move elements of the less full hopper into the more full hopper
-        #    If can move all, merge the bags as usual
-        #    Else set y = the more full hopper, then merge as usual
-        pass
+        # Move as many elements of the less full hopper into the more full 
+        # hopper as possible
+        hopper_capacity = self.hopper.elements.size
+        num_elements_in_emptier = np.sum(emptier_hopper.elements != None)
+        num_spaces_avail_in_fuller = np.sum(fuller_hopper.elements == None)
+        if num_elements_in_emptier > num_spaces_avail_in_fuller:
+            # Cut the last items in the emptier hopper to be moved
+            elements_to_move = emptier_hopper.elements[-num_spaces_avail_in_fuller:]
+            emptier_hopper.elements[-num_spaces_avail_in_fuller] = None
+        else:
+            elements_to_move = emptier_hopper.elements
+            emptier_hopper.elements = None
+        max_fill = len(elements_to_move)        
+        fuller_none_indices = np.where(fuller_hopper.elements == None)[0]
+        fuller_hopper[fuller_none_indices[:max_fill]] = elements_to_move
+        
+        # Finally, the actual union step. Should at least one element remain in 
+        # the emptier hopper, set y = the more full hopper, else None.
+        num_elements_in_emptier_hopper = np.sum(emptier_hopper.elements != None)
+        y = fuller_hopper if num_elements_in_emptier_hopper > 0 else None
+        for k in range(hopper_capacity + 1):
+            emptier_bag.backbone[k], y = self._full_adder(emptier_bag.backbone[k],
+                                                          fuller_bag.backbone[k],
+                                                          y)
+        del fuller_bag
     
     def split(self):
         """ Remove half (to within some constant amount GRAIN_SIZE) of the 
