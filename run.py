@@ -44,8 +44,8 @@ from queue import Queue
 
 ### CLUSTER IDENTIFICATION - HELPER FUNCTIONS -----------------------------
 
-def df_to_adjacency_list(df, undirected=True):
-    """ Convert dataframe edges into adjacency list of edges with weights.
+def df_to_adjacency_bag(df, undirected=True):
+    """ Convert dataframe edges into adjacency list/bag of edges with weights.
     
     Return an adjacency list for the dataframe as a dask bag of the form
         db.from_sequence([(a, [(b, 3)]), (b: [(a, 3)])])
@@ -152,8 +152,34 @@ def get_component_adjacency_lists(df: ddf.DataFrame, undirected=True):
     scope of this function. See the bfs_search function.
 
     """
-    mega_adjacency_list = df_to_adjacency_list(df)
-    pass
+    big_adjacency_bag = df_to_adjacency_bag(df)
+    nodes = big_adjacency_bag.map(
+        lambda node_adjacency: node_adjacency[0]).compute() # numpy array
+    state = np.full(len(nodes), "U", "<U1") # nodes indices map to state indices
+    components = None # Will be a dask bag of adjacency bags (one per component)
+    
+    # Iterate until all nodes are assigned to a component. Must find one
+    # component at a time.
+    for node_index in range(len(nodes)):
+        if state[node_index] == "U":
+            prev_state = state.copy()
+            node = nodes[node_index]            
+            state[node_index] = "D"
+            
+            pbfs_search(node_index, big_adjacency_bag, state)
+            
+            # Add new component
+            diff_indices = np.where(state != prev_state)[0]
+            component_nodes = nodes[diff_indices]
+            component_adj = big_adjacency_bag.filter(
+                lambda node_adjacency: node_adjacency[0] in component_nodes)
+            if not components:
+                components = [component_adj]
+            else:
+                components = components.append(component_adj)
+    
+    return db.from_sequence(components)
+
 
 ### CLUSTER IDENTIFICATION - BFS COMPONENT SEARCH -------------------------
 
@@ -185,7 +211,7 @@ def bfs_components(df: ddf.DataFrame, min_size=30) -> db.Bag:
         
         if state[node_index] == "U":
             prev_state = state.copy()
-            state[node_index] == "D"
+            state[node_index] = "D"
             queue.put(node_index)
             
             bfs_loop(grouped_edges, nodes, queue, state) # Discover component
