@@ -115,16 +115,19 @@ class Pennant():
         return new
 
 
+    def get_tree_size(self):
+        """ Get the total # of elements stored in self and all descendants """
+        pass
+
+
 class PBag():
-    """ A collection of pennants, no two of which have the same size. """
+    """ Represents a layer d at depth d of parallel BFS search """
     
     def __init__(self, num_nodes_to_store: int):
         """ PBFS represents a bag S using a ﬁxed-size array S[0 . . r], called 
         the backbone, where 2^(r+1) exceeds the maximum number ofelements ever 
         stored in a bag. Each entry S[k] in the backbone con-tains either a 
-        null pointer or a pointer to a pennant """
-        global GRAIN_SIZE
-        
+        null pointer or a pointer to a pennant """        
         self.max_node_capacity = num_nodes_to_store
         r = log(num_nodes_to_store)/log(2) - 1 # Simple rearrangement of equality
         backbone_size = int(r) + 2 # Ensure the formula exceeds num_nodes_to_store
@@ -133,22 +136,25 @@ class PBag():
         # A PBag also maintains an additional pennant node called the hopper,
         # which it fills gradually.
         self.hopper = Pennant(None)
-        self.hopper_capacity = self.hopper.elements.size        
+        self.hopper_capacity = self.hopper.elements.size
+        
+        self.bag_lock = Lock()
         
         
     def insert(self, element: int):
         """ Insert element into bag """
         new_pennant = Pennant(element)
         hopper_none_indices = np.where(self.hopper.elements == None)[0]
-        # Insert element into hopper if hopper is not full (most cases).        
-        if hopper_none_indices.size > 0:
-            self.hopper.elements[hopper_none_indices[0]] = new_pennant
-        else:
-            # If hopper full, insert hopper into backbone then put element in new
-            # hopper (occurs once for every GRAIN_SIZE insertions)            
-            backbone_none_indices = np.where(self.backbone == None)[0]
-            self.backbone[backbone_none_indices[0]] = self.hopper
-            self.hopper = new_pennant
+        with self.bag_lock:
+            # Insert element into hopper if hopper is not full (most cases)
+            if hopper_none_indices.size > 0:
+                self.hopper.elements[hopper_none_indices[0]] = new_pennant
+            else:
+                # If hopper full, insert hopper into backbone then put element in new
+                # hopper (occurs once for every GRAIN_SIZE insertions)            
+                backbone_none_indices = np.where(self.backbone == None)[0]
+                self.backbone[backbone_none_indices[0]] = self.hopper
+                self.hopper = new_pennant
     
     
     def _full_adder(x, y, z):
@@ -225,10 +231,21 @@ class PBag():
     
     
     def is_empty(self):
-        pass # TODO
+        """ Return True if no elements are stored in the bag 
+        TODO : Validate """
+        if np.all(self.hopper == None) and np.all(self.backbone == None):
+            return True
+        return False
     
     
     def size(self):
+        """ Return number of elements stored in the bag 
+        TODO: validate """
+        # Get the indices of the backbone where there are pennants
+        pennant_indices = np.where(self.backbone != None)[0][0]
+        # Sum the elements in the pennants.
+        
+        # Add on the number of elements in the hopper.
         pass # TODO
 
 
@@ -271,7 +288,7 @@ def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
     layer_0.insert(start_node)
     current_layer = layer_0
     
-    def process_node(child_node, parent_node, out_bag):
+    def process_node(child_node, parent_node, out_bag, out_bag_lock):
         child_node_index = np.where(nodes == child_node)[0][0]
         # Discover child node
         if state[child_node_index] == "U":
@@ -291,6 +308,9 @@ def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
             parents[child_node].add((parent_node, num_synapses))
             
     def process_layer(in_bag, out_bag):
+        """ Each iteration processes the layer in_bag by checking all the 
+        neighbors of vertices in in_bag for those that should be added to 
+        the next layer out_bag """
         global GRAIN_SIZE
         if in_bag.size() < GRAIN_SIZE:
             for parent_node in in_bag:
