@@ -40,11 +40,15 @@ from collections import defaultdict
 from dask import bag as db
 from dask import dataframe as ddf
 from queue import Queue
+from threading import Lock
+from threading import Thread
 
 
 GRAIN_SIZE = 128
 MIN_CLUSTER_SIZE = 30
 MAD_K = 3.5
+
+
 
 
 ### CLUSTER IDENTIFICATION - HELPER FUNCTIONS -----------------------------
@@ -77,14 +81,41 @@ def df_to_adjacency_bag(df, undirected=True):
     return adjacency_bag
 
 
+def grouped_edge_tuples_to_df(tuple_iter, original_df: ddf.DataFrame):
+    """ Merge compact tuple edge representation with original dataframe 
+    
+    Tuple edges are expanded into one tuple per edge format. Then for every
+    edge in the original dataframe, if that edge is present in expanded tuple
+    format, that edge in the original dataframe is retained in a new dataframe,
+    which is then returned.
+    """
+    # Get iterable of expanded tuples (one tuple per edge)
+    def expand(tup):
+        """ e.g., edge_data = (0, [1, 5]) -> [(0,1), (0,5)] """
+        return list(map(lambda target: (tup[0], target), tup[1]))
+    new_edge_bag = db.from_sequence(tuple_iter).map(lambda tup: expand(tup)).flatten()
+    
+    # Intersect remaining edges with original dataframe
+    new_edge_df = new_edge_bag.to_dataframe(meta={"pre": int, "post": int})
+    new_df = new_edge_df.merge(original_df, on=["pre","post"], how="inner")
+    return new_df
+
+
+
+
+
+### PARALLEL BFS ----------------------------------------------------------
+
 class Pennant():
     """"""    
+    
     def __init__(self, element: int|None):
         """ Initialise a pennant holding a single element """
         global GRAIN_SIZE # grain size is the # of elements this pennant can hold
         self.left, self.right = None, None # Assign null pointers to children
         self.elements = np.full(GRAIN_SIZE, None, dtype="object")
         self.elements[0] = element
+    
     
     def pennant_union(self, other):
         """ Combine self with other pennant.
@@ -93,6 +124,7 @@ class Pennant():
         other.right = self.left
         self.left = other
         return self
+    
     
     def pennant_split(self):
         """ Splits self into two pennants (i.e., inverse of pennant_union()).
@@ -124,6 +156,7 @@ class PBag():
         self.hopper = Pennant(None)
         self.hopper_capacity = self.hopper.elements.size        
         
+        
     def insert(self, element: int):
         """ Insert element into bag """
         new_pennant = Pennant(element)
@@ -137,6 +170,7 @@ class PBag():
             backbone_none_indices = np.where(self.backbone == None)[0]
             self.backbone[backbone_none_indices[0]] = self.hopper
             self.hopper = new_pennant
+    
     
     def _full_adder(x, y, z):
         """ Union 3 pennants into 2 pennants. 
@@ -155,6 +189,7 @@ class PBag():
             case (False, True, False): return (None, x.pennant_union(z))
             case (True, False, False): return (None, y.pennant_union(z))
             case (False, False, False): return (x, y.pennant_union(z))
+        
         
     def union(self, other_pbag):
         """ Move all elements from other_pbag to self, and destroy other_pbag.
@@ -194,6 +229,7 @@ class PBag():
                                                           y)
         del fuller_bag
     
+    
     def split(self):
         """ Remove half (to within some constant amount GRAIN_SIZE) of the 
         elements from self, and put them in a new bag new_bag. "operates like
@@ -207,10 +243,18 @@ class PBag():
                 self.backbone[k-1] = self.backbone[k]
                 self.backbone[k] = None
         return bag2
+    
+    
+    def is_empty(self):
+        pass # TODO
+    
+    
+    def size(self):
+        pass # TODO
 
 
 def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
-    """ Return parents dask bag, num_shortest_paths array, and set of leaves. 
+    """ Return parents dask bag and a set of leaves. 
     
     The numpy arrays nodes and state will be automatically computed from the
     adjacency bag if not supplied. state is not required to complete the bfs
@@ -218,55 +262,86 @@ def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
     wish to validate the status of each node after the search is complete.
     state is not returned; it is modified in place.
     
-    Indices in parents_bag and num_shortest_paths array correspond to indices
-    in nodes (or more generally, to indices in adjacency_bag, although that
-    cannot be indexed). 
+    Indices in parents_bag correspond to indices in nodes (or more generally, 
+    to indices in adjacency_bag, although that cannot be indexed). 
     
     parents_bag has the general form
-        db.from_sequence([(c, {a, b}), (d, {c})])
-    where a and b are parents of c, and c is the only parent of d.
-    
-    The values in num_shortest_paths are the number of shortest paths from the
-    start node to that respective node. Given an edge a->b with weight = 3,
-    there are 3 synaptic connections between a and b, and thus 3 paths from
-    a to b. That is, the integer weight represents the number of paths from
-    a to b.
-    
+        db.from_sequence([(c, [(a, w), (b, w)]), (d, [(c, w)])])
+    where a and b are parents of c, c is the only parent of d, and w is the
+    edge weight or number of synapses along that edge.
+
     The set of leaves contains nodes that do not have any children.
     
     Parallel algorithm inspired by:
     https://dl.acm.org/doi/epdf/10.1145/1810479.1810534
     
     """
-    # Set up
     if not nodes:
         nodes = adjacency_bag.map(
             lambda node_adjacency: node_adjacency[0]).compute()
-    state = np.full(len(nodes), "U", dtype)
+    parents_dict = defaultdict(set)
+    leaves = set()
+    n = len(nodes)
+    state = np.full(n, "U", dtype)
+    start_node_index = np.where(nodes == start_node)[0][0]
+    state[start_node_index] = "D"
     
-    layer_0 = bag_create(len(nodes)) # Allocate space for a fixed-size backbone of null pointers
+    state_lock, parent_lock = Lock(), Lock()
     
+    layer_0 = PBag(n)
+    layer_0.insert(start_node)
+    current_layer = layer_0
     
+    def process_node(child_node, parent_node, out_bag):
+        child_node_index = np.where(nodes == child_node)[0][0]
+        # Discover child node
+        if state[child_node_index] == "U":
+            with state_lock:
+                state[child_node_index] = "D"
+            out_bag.insert(child_node)
+            
+        # Adjacency bag has general format:
+        # [(node_id, [(neighbour1_id, num_synapses), (neighbour2_id, num_synapses)]), (...), (...)]
+        # Get the number of synapses between parent and child node
+        num_synapses = adjacency_bag.filter(
+            lambda node_adjacency: node_adjacency[0] == child_node).map(
+                lambda node_adjacency: node_adjacency[1]).filter(
+                    lambda tup: tup[0] == parent_node).map(lambda tup: tup[1])
+        # Add parent and edge weight to child entry in parents dictionary
+        with parent_lock:
+            parents[child_node].add((parent_node, num_synapses))
+            
+    def process_layer(in_bag, out_bag):
+        global GRAIN_SIZE
+        if in_bag.size() < GRAIN_SIZE:
+            for parent_node in in_bag:
+                children_and_weights = adjacency_bag.filter(
+                    lambda node_adjacency: node_adjacency[0] == node).map(
+                        lambda node_adjacency: node_adjacency[1])
+                if children_and_weights.count() == 0:
+                    leaves.add(parent_node)
+                    continue
+                children = children_and_weights.map(lambda tup: tup[0])
+                children = children.map(
+                    lambda child: process_node(child, parent_node, out_bag))
+            return
+        new_bag = in_bag.split()
+        thread = Thread(target=process_layer, args=(new_bag, out_bag))
+        thread.start()
+        process_layer(in_bag, out_bag)
+        thread.join()
+
+    while not current_layer.is_empty():
+        next_layer = PBag(n)
+        process_layer(current_layer, next_layer)
+        current_layer = next_layer
+    
+    # Convert parents_dict values to lists, then convert parents_dict to dask bag
+    parents_dict = {child: list(parents) for child, parents in parents_dict.items()}
+    parents = db.from_sequence(parents_dict.items())
+    return (parents, leaves)
 
 
-def grouped_edge_tuples_to_df(tuple_iter, original_df: ddf.DataFrame):
-    """ Merge compact tuple edge representation with original dataframe 
-    
-    Tuple edges are expanded into one tuple per edge format. Then for every
-    edge in the original dataframe, if that edge is present in expanded tuple
-    format, that edge in the original dataframe is retained in a new dataframe,
-    which is then returned.
-    """
-    # Get iterable of expanded tuples (one tuple per edge)
-    def expand(tup):
-        """ e.g., edge_data = (0, [1, 5]) -> [(0,1), (0,5)] """
-        return list(map(lambda target: (tup[0], target), tup[1]))
-    new_edge_bag = db.from_sequence(tuple_iter).map(lambda tup: expand(tup)).flatten()
-    
-    # Intersect remaining edges with original dataframe
-    new_edge_df = new_edge_bag.to_dataframe(meta={"pre": int, "post": int})
-    new_df = new_edge_df.merge(original_df, on=["pre","post"], how="inner")
-    return new_df
 
 
 ### CLUSTER IDENTIFICATION - PRUNE ----------------------------------------
