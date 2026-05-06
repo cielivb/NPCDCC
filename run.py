@@ -81,27 +81,6 @@ def df_to_adjacency_bag(df, undirected=True):
     return adjacency_bag
 
 
-def grouped_edge_tuples_to_df(tuple_iter, original_df: ddf.DataFrame):
-    """ Merge compact tuple edge representation with original dataframe 
-    
-    Tuple edges are expanded into one tuple per edge format. Then for every
-    edge in the original dataframe, if that edge is present in expanded tuple
-    format, that edge in the original dataframe is retained in a new dataframe,
-    which is then returned.
-    """
-    # Get iterable of expanded tuples (one tuple per edge)
-    def expand(tup):
-        """ e.g., edge_data = (0, [1, 5]) -> [(0,1), (0,5)] """
-        return list(map(lambda target: (tup[0], target), tup[1]))
-    new_edge_bag = db.from_sequence(tuple_iter).map(lambda tup: expand(tup)).flatten()
-    
-    # Intersect remaining edges with original dataframe
-    new_edge_df = new_edge_bag.to_dataframe(meta={"pre": int, "post": int})
-    new_df = new_edge_df.merge(original_df, on=["pre","post"], how="inner")
-    return new_df
-
-
-
 
 
 ### PARALLEL BFS ----------------------------------------------------------
@@ -435,82 +414,9 @@ def get_component_adjacency_bags(df: ddf.DataFrame, undirected=True):
     return db.from_sequence(components)
 
 
-### CLUSTER IDENTIFICATION - BFS COMPONENT SEARCH -------------------------
-
-def bfs_loop(grouped_edges, nodes, queue, state):
-    """ Discover a component """
-    while not queue.empty():
-        node = queue.get()
-        node_index = np.where(nodes == node)[0][0]
-        node_neighbours = grouped_edges[node_index][1]
-        for neighbour in node_neighbours:
-            neighbour_index = np.where(nodes == neighbour)[0][0]
-            if state[neighbour_index] == "U":
-                state[neighbour_index] == "D"
-                queue.put(neighbour)
-        state[node_index] = "P"
-
-
-def bfs_components(df: ddf.DataFrame, min_size=30) -> db.Bag:
-    """ Use BFS to return components of df as DataFrames in a Bag """
-    grouped_edges = edge_df_to_tuple(df)
-    n = len(grouped_edges)
-    state = np.full(n, "U", dtype="<U1")
-    queue = Queue()
-    components = None # Will later be a dask bag of dask dataframe/s
-    
-    # Iterate through each node in grouped_edges to get components via BFS
-    nodes = np.fromiter(map(lambda tup: tup[0], grouped_edges), dtype=int)
-    for node_index in range(n):
-        
-        if state[node_index] == "U":
-            prev_state = state.copy()
-            state[node_index] = "D"
-            queue.put(node_index)
-            
-            bfs_loop(grouped_edges, nodes, queue, state) # Discover component
-            
-            # Add new component if large enough
-            diff_indices = np.where(state != prev_state)[0]
-            if len(diff_indices) < min_size:
-                continue
-            component_edges = filter(lambda tup: grouped_edges.index(tup) in diff_indices,
-                                     grouped_edges)
-            component_df = grouped_edge_tuples_to_df(component_edges, df)
-            if not components:
-                components = db.from_sequence([component_df])
-            else:
-                components = db.concat([components, db.from_sequence([component_df])])
-                
-    return components
 
 
 ### CLUSTER IDENTIFICATION - GIRVAN NEWMAN --------------------------------
-
-def bfs_search(start_node, grouped_edges) -> list:
-    """ Create parent array via BFS starting at start node """
-    n = len(grouped_edges)
-    parents = defaultdict(set) # key is node, vals are parents
-    state = np.full(n, "U", dtype="<U1")
-    queue = Queue()
-    nodes = np.fromiter(map(lambda tup: tup[0], grouped_edges), dtype=int)
-    start_node_index = np.where(nodes == start_node)[0][0]
-    state[start_node_index] = "D"
-    queue.put(start_node)
-    
-    while not queue.empty():
-        node = queue.get()
-        node_index = np.where(nodes == node)[0][0]
-        node_neighbours = grouped_edges[node_index][1]
-        for neighbour in node_neighbours:
-            neighbour_index = np.where(nodes == neighbour)[0][0]
-            if state[neighbour_index] in ["U", "D"]:
-                state[neighbour_index] = "D"
-                parents[neighbour].add(node)
-                queue.put(neighbour)
-        state[node_index] = "P"
-    
-    return parents
 
 
 def get_num_shortest_paths(start_node: int, parents: dict, 
@@ -626,16 +532,25 @@ def girvan_newman(grouped_edges, df):
 
 ### CLUSTER IDENTIFICATION - IDENTIFY CLUSTERS ----------------------------
 
-def identify_clusters(df: ddf.DataFrame, is_pruned=True):
-    if not is_pruned:
-        df = prune(df)
-    grouped_edges = edge_df_to_tuple(df)
-    gn_scores = girvan_newman(grouped_edges, df)
+def identify_clusters(df=None, adjacency_bags=None):
+    global MIN_CLUSTER_SIZE, CLIENT
+    # Clean and filter
+    if df: adjacency_bags = get_component_adjacency_bags(df)
+    adjacency_bags = adjacency_bags.map(prune)
+    adjacency_bags = adjacency_bags.filter(
+        lambda adj_bag: adj_bag.count >= MIN_CLUSTER_SIZE)
+    if adjacency_bags.count == 0:
+        return # Base case - no large enough components, don't process further
+    
+    # Partition adjacency bags into further components
+    edge_scores = girvan_newman(adjacency_bags)
     upper_score_threshold = get_upper_threshold(gn_scores)
-    new_df = chop_df(df, edge_scores, upper_score_threshold)
-    new_components = bfs_components(new_df)
-    new_clusters = db.Bag()
-    for component in new_components():
-        cluster = prune(component)
-        new_clusters = db.concat([new_clusters, cluster])
-    return new_clusters
+    new_df, num_edges_removed = chop_df(df, edge_scores, upper_score_threshold)
+    if num_edges_removed == 0:
+        if new_df.shape[0].compute() >= MIN_CLUSTER_SIZE:
+            return df # Cluster found!
+        return # No edges removed, but the cluster is too small to report.
+    
+    new_components = component_adjacency_bags(new_df)
+    clusters = CLIENT.map(identify_clusters, adjacency_bags=new_components)
+    return clusters # Caller will have to wait for result then flatten.
