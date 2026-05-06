@@ -85,168 +85,20 @@ def df_to_adjacency_bag(df, undirected=True):
 
 ### PARALLEL BFS ----------------------------------------------------------
 
-class Pennant():
-    """"""    
+class Layer():
+    """ Represents a layer d of nodes at depth d of parallel BFS """
     
-    def __init__(self, element: int|None):
-        """ Initialise a pennant holding a single element """
-        global GRAIN_SIZE # grain size is the # of elements this pennant can hold
-        self.left, self.right = None, None # Assign null pointers to children
-        self.elements = np.full(GRAIN_SIZE, None, dtype="object")
-        self.elements[0] = element
+    def __init__(self):
+        self.nodes = set()
     
-    
-    def pennant_union(self, other):
-        """ Combine self with other pennant.
-        "Two pennants x and y of size 2^k can be combined to form a pennant of 
-        size 2^(k+1) in O(1) time" """
-        other.right = self.left
-        self.left = other
-        return self
-    
-    
-    def pennant_split(self):
-        """ Splits self into two pennants (i.e., inverse of pennant_union()).
-        Requires self to contain at least 2 elements. Pennants self and new will 
-        each contain half the elements in original self. """
-        new = self.left
-        self.left = new.right
-        new.right = None
-        return new
-
-
-    def get_tree_size(self):
-        """ Get the total # of elements stored in self and all descendants """
-        pass
-
-
-class PBag():
-    """ Represents a layer d at depth d of parallel BFS search """
-    
-    def __init__(self, num_nodes_to_store: int):
-        """ PBFS represents a bag S using a ﬁxed-size array S[0 . . r], called 
-        the backbone, where 2^(r+1) exceeds the maximum number ofelements ever 
-        stored in a bag. Each entry S[k] in the backbone con-tains either a 
-        null pointer or a pointer to a pennant """        
-        self.max_node_capacity = num_nodes_to_store
-        r = log(num_nodes_to_store)/log(2) - 1 # Simple rearrangement of equality
-        backbone_size = int(r) + 2 # Ensure the formula exceeds num_nodes_to_store
-        self.backbone = np.full(backbone_size, None, dtype="object")
-        
-        # A PBag also maintains an additional pennant node called the hopper,
-        # which it fills gradually.
-        self.hopper = Pennant(None)
-        self.hopper_capacity = self.hopper.elements.size
-        
-        self.bag_lock = Lock()
-        
-        
-    def insert(self, element: int):
-        """ Insert element into bag """
-        new_pennant = Pennant(element)
-        hopper_none_indices = np.where(self.hopper.elements == None)[0]
-        with self.bag_lock:
-            # Insert element into hopper if hopper is not full (most cases)
-            if hopper_none_indices.size > 0:
-                self.hopper.elements[hopper_none_indices[0]] = new_pennant
-            else:
-                # If hopper full, insert hopper into backbone then put element in new
-                # hopper (occurs once for every GRAIN_SIZE insertions)            
-                backbone_none_indices = np.where(self.backbone == None)[0]
-                self.backbone[backbone_none_indices[0]] = self.hopper
-                self.hopper = new_pennant
-    
-    
-    def _full_adder(x, y, z):
-        """ Union 3 pennants into 2 pennants. 
-        Logic source: https://dl.acm.org/doi/epdf/10.1145/1810479.1810534 pg 5
-        """
-        x_empty = np.all(x.elements == None)
-        y_empty = np.all(y.elements == None)
-        z_empty = np.all(z.elements == None)
-        
-        match (x_empty, y_empty, z_empty):
-            case (True, True, True): return (None, None)
-            case (False, True, True): return (x, None)
-            case (True, False, True): return (y, None)
-            case (True, True, False): return (z, None)
-            case (False, False, True): return (None, x.pennant_union(y))
-            case (False, True, False): return (None, x.pennant_union(z))
-            case (True, False, False): return (None, y.pennant_union(z))
-            case (False, False, False): return (x, y.pennant_union(z))
-        
-        
-    def union(self, other_pbag):
-        """ Move all elements from other_pbag to self, and destroy other_pbag.
-        Uses an algorithm similar to ripple-carry addition of two binary 
-        counters """
-        # Determine which bag has the less full hopper
-        num_spaces_avail_self = np.sum(self.hopper.elements == None)
-        num_spaces_avail_other = np.sum(other_pbag.hopper.elements == None)
-        spaces_per_bag = [(self, num_spaces_avail_self), 
-                          (other_pbag, num_spaces_avail_other)]
-        emptier_bag = max(spaces_per_bag, key = lambda x: x[1])
-        fuller_bag = min(spaces_per_bag, key = lambda x: x[1])
-        emptier_hopper, fuller_hopper = emptier_bag.hopper, fuller_bag.hopper
-        
-        # Move as many elements of the less full hopper into the more full 
-        # hopper as possible
-        num_elements_in_emptier = np.sum(emptier_hopper.elements != None)
-        num_spaces_avail_in_fuller = np.sum(fuller_hopper.elements == None)
-        if num_elements_in_emptier > num_spaces_avail_in_fuller:
-            # Cut the last items in the emptier hopper to be moved
-            elements_to_move = emptier_hopper.elements[-num_spaces_avail_in_fuller:]
-            emptier_hopper.elements[-num_spaces_avail_in_fuller] = None
-        else:
-            elements_to_move = emptier_hopper.elements
-            emptier_hopper.elements = None
-        max_fill = len(elements_to_move)        
-        fuller_none_indices = np.where(fuller_hopper.elements == None)[0]
-        fuller_hopper[fuller_none_indices[:max_fill]] = elements_to_move
-        
-        # Finally, the actual union step. Should at least one element remain in 
-        # the emptier hopper, set y = the more full hopper, else None.
-        num_elements_in_emptier_hopper = np.sum(emptier_hopper.elements != None)
-        y = fuller_hopper if num_elements_in_emptier_hopper > 0 else None
-        for k in range(self.hopper_capacity + 1):
-            emptier_bag.backbone[k], y = self._full_adder(emptier_bag.backbone[k],
-                                                          fuller_bag.backbone[k],
-                                                          y)
-        del fuller_bag
-    
-    
-    def split(self):
-        """ Remove half (to within some constant amount GRAIN_SIZE) of the 
-        elements from self, and put them in a new bag new_bag. "operates like
-        an arithmetic right shift" """
-        bag2 = PBag(self.max_node_capacity)
-        bag2.hopper = self.backbone[0]
-        self.backbone[0] = None
-        for k in range(1, self.hopper_capacity + 1):
-            if self.backbone[k]:
-                bag2.backbone[k-1] = self.backbone[k].pennant_split()
-                self.backbone[k-1] = self.backbone[k]
-                self.backbone[k] = None
-        return bag2
-    
+    def insert(self, node: int):
+        self.nodes.add(node)
     
     def is_empty(self):
-        """ Return True if no elements are stored in the bag 
-        TODO : Validate """
-        if np.all(self.hopper == None) and np.all(self.backbone == None):
-            return True
-        return False
-    
+        return len(self.nodes) == 0
     
     def size(self):
-        """ Return number of elements stored in the bag 
-        TODO: validate """
-        # Get the indices of the backbone where there are pennants
-        pennant_indices = np.where(self.backbone != None)[0][0]
-        # Sum the elements in the pennants.
-        
-        # Add on the number of elements in the hopper.
-        pass # TODO
+        return len(self.nodes)
 
 
 def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
