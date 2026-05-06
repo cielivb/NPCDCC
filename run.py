@@ -86,19 +86,62 @@ def df_to_adjacency_bag(df, undirected=True):
 ### PARALLEL BFS ----------------------------------------------------------
 
 class Layer():
-    """ Represents a layer d of nodes at depth d of parallel BFS """
+    """ Represents a layer d of nodes at depth d of parallel BFS.
+    
+    The original PBFS inspiration comes from the logic behind 'Bags' and 'Pennants'
+    described at https://dl.acm.org/doi/epdf/10.1145/1810479.1810534. This is
+    a simplified daskified implementation of their PBFS.
+    
+    """
     
     def __init__(self):
-        self.nodes = set()
+        self.nodes = None
     
-    def insert(self, node: int):
-        self.nodes.add(node)
+    def insert(self, node_bag: db.Bag):
+        self.nodes = node_bag # bag of int nodes in layer e.g., bag([1,2,...])
     
     def is_empty(self):
-        return len(self.nodes) == 0
+        return self.nodes.count.compute() == 0
     
-    def size(self):
-        return len(self.nodes)
+    def process(self, adjacency_bag, nodes, parents_dict, leaves, state):
+        """ Check all neighbours of vertices for those that should be added
+        to the next layer out_layer. Updates parents_dict, leaves, and state
+        as required. Returns out_layer. """
+        out_layer = Layer()
+        # Get the children of each node in self
+        adjacencies = adjacency_bag.filter(
+            lambda node_adjacency: node_adjacency[0] in self.nodes)
+        
+        # Find and store leaf nodes (those with no children)
+        leaf_nodes = adjacencies.filter(
+            lambda node_adjacency: len(node_adjacency[1]) == 0).map(
+                lambda node_adjacency: node_adjacency[0])
+        leaves = db.concat([leaves, leaf_nodes])
+        
+        # Discover undiscovered children and add them to next layer out_layer
+        all_children = adjacencies.map(
+            lambda node_adjacency: node_adjacency[1]).map(
+                lambda tup: tup[0]).distinct()
+        all_children = all_children.map( # Append indices
+            lambda child_id: (child_id, np.where(nodes == child_id)[0][0]))
+        undiscovered_children = all_children.filter(
+            lambda child: state[child[1]] == "U") # Isolate undiscovered children
+        new_children = undiscovered_children.map(
+            lambda child: state[child[1]] == "D") # Discover the undiscovered children
+        out_layer.insert(new_children)
+        
+        # Establish parentage
+        def num_synapses(parent, child, node_adjacency):
+            ...
+        def record_parentage(node_adjacency):
+            parent, children_bag = node_adjacency
+            children_bag = children_bag.map(
+                lambda child: parents[child].add(
+                    (parent, num_synapses(parent, child, node_adjacency))))
+        adjacencies.map(record_parentage)
+        
+        return out_layer
+        
 
 
 def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
@@ -119,10 +162,7 @@ def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
     edge weight or number of synapses along that edge.
 
     The set of leaves contains nodes that do not have any children.
-    
-    Parallel algorithm inspired by:
-    https://dl.acm.org/doi/epdf/10.1145/1810479.1810534
-    
+
     """
     if not nodes:
         nodes = adjacency_bag.map(
@@ -136,7 +176,7 @@ def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
     
     state_lock, parent_lock = Lock(), Lock()
     
-    layer_0 = PBag(n)
+    layer_0 = Layer()
     layer_0.insert(start_node)
     current_layer = layer_0
     
@@ -159,10 +199,11 @@ def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
         with parent_lock:
             parents[child_node].add((parent_node, num_synapses))
             
-    def process_layer(in_bag, out_bag):
+    def process_layer(in_layer, out_layer):
         """ Each iteration processes the layer in_bag by checking all the 
         neighbors of vertices in in_bag for those that should be added to 
-        the next layer out_bag """
+        the next layer out_bag. in_layer contains at least one node, while
+        out_layer starts off with no nodes. """
         global GRAIN_SIZE
         if in_bag.size() < GRAIN_SIZE:
             for parent_node in in_bag:
@@ -183,7 +224,7 @@ def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
         thread.join()
 
     while not current_layer.is_empty():
-        next_layer = PBag(n)
+        next_layer = Layer()
         process_layer(current_layer, next_layer)
         current_layer = next_layer
     
