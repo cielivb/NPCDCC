@@ -114,10 +114,8 @@ class Layer():
         
         """
         out_layer = Layer()
-        # TODO : could probably map in a similar way to the child discovery
-        # portion to avoid computing self.nodes in the below filter
         adjacencies = adjacency_bag.filter( # Get adjacencies for this layer's nodes
-            lambda node_adjacency: node_adjacency[0] in self.nodes)
+            lambda node_adjacency: node_adjacency[0] in self.nodes.compute())
         
         # TODO : choose a more efficient data structure if there's a 
         # bottleneck (e.g., bitarray or numpy array of bool)
@@ -130,7 +128,7 @@ class Layer():
         # Discover undiscovered children and add them to next layer out_layer
         all_children = adjacencies.map( # Get child node_ids
             lambda node_adjacency: node_adjacency[1]).map(
-                lambda children_bag: children_bag.map(lambda tup: tup[0]))
+                lambda children_bag: children_bag.map(lambda tup: tup[0])).distinct()
         all_children_w_i = all_children.map( # Append indices
             lambda child_id: (child_id, np.where(nodes == child_id)[0][0]))
         undiscovered_children = all_children_w_i.filter( # Get undiscovered children
@@ -149,31 +147,45 @@ class Layer():
             # where the states of those nodes are 'P'. Parent-child relationships
             # with parents in an upper layer are already included in parents_dict,
             # so the following code involves duplicating those relationships.
+            child_adjacencies = adjacencies.filter(
+                lambda node_adjacency: node_adjacency[0] in all_children.compute())
             
+            def attach_neighbour_i(neighbour_bag):
+                # For each tuple in neighbour_bag, append the index of the node
+                # neighbour_bag e.g., Bag([(b, 3), (c, 4), ...])
+                neighbour_bag = neighbour_bag.map(
+                    lambda tup: (tup[0], tup[1], np.where(nodes == tup[0])[0][0]))
+                return neighbour_bag
             
-            #def attach_child_i(children_bag):
-                ## For each tuple in children_bag, append the index of the node
-                ## in the first position of the tuple.
-                ## children_bag e.g., Bag([(b, 3), (c, 4), ...])
-                #children_bag = children_bag.map(
-                    #lambda tup: (tup[0], tup[1], np.where(nodes == tup[0])[0][0]))
-                #return children_bag
+            child_adjacencies = child_adjacencies.map(
+                lambda node_adjacency: (node_adjacency[0], 
+                                        attach_neighbour_i(node_adjacency[1])))
             
-            #adjacencies.map(
-                #lambda node_adjacency:
-                    #(node_adjacency[0], attach_child_i(node_adjacency[1]))
+            def get_child_parent_rels(node_adjacency):
+                # Filter to include only edges to parents.
+                # node_adjacency e.g., (child, Bag([(b, w, i), (c, w, i), ...]))
+                neighbour_bag = node_adjacency[1]
+                parents = neighbour_bag.filter(
+                    lambda tup: state[tup[2]] == "P")
+                parents = parents.map(lambda tup: (tup[0], tup[1])) # Remove i
+                return (child, parents)
             
+            child_parent_rels = child_adjacencies.map(
+                lambda node_adjacency: get_child_parent_rels(node_adjacency))
             
-        #def num_synapses(parent, child, node_adjacency):
-            #...
-        #def record_parentage(node_adjacency):
-            #parent, children_bag = node_adjacency
-            #children_bag = children_bag.map(
-                #lambda child: parents[child].add(
-                    #(parent, num_synapses(parent, child, node_adjacency))))
-        #adjacencies.map(record_parentage)
+            def write_to_parent_dict(child_parent_rel):
+                # child_parent_rel, e.g., (child, [(b, w), (c, w), ...])
+                child, parents = child_parent_rel[0], child_parent_rel[1]
+                parents_dict[child] = parents_dict[child].union(
+                    set(child_parent_rel[1].compute()))
+                
+            # Children are unique so parallel write to dict should be ok    
+            child_parent_rels = child_parent_rels.map(write_to_parent_dict)
         
         # Mark this layer's nodes as processed
+        processed = adjacencies.map( # Get this layer's node's indices
+            lambda node_adjacency: np.where(nodes == node_adjacency[0])[0][0]).map(
+                lambda i: state[i] = "P") # Mark as processed
         
         return out_layer
         
