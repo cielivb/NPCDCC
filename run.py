@@ -103,42 +103,77 @@ class Layer():
     def is_empty(self):
         return self.nodes.count.compute() == 0
     
-    def process(self, adjacency_bag, nodes, parents_dict, leaves, state):
+    def process(self, adjacency_bag, nodes, state, parents_dict=None, leaves=None):
         """ Check all neighbours of vertices for those that should be added
         to the next layer out_layer. Updates parents_dict, leaves, and state
-        as required. Returns out_layer. """
+        as required. Returns out_layer. 
+        
+        adjacency_bag is of the form:
+            Bag([(a, Bag([(b, 3)])), (b: Bag([(a, 3), (c, 2)]), ...]))
+        where the edge from b->a and a->b has weight 3 (i.e., 3 synapses). 
+        
+        """
         out_layer = Layer()
-        # Get the children of each node in self
-        adjacencies = adjacency_bag.filter(
+        # TODO : could probably map in a similar way to the child discovery
+        # portion to avoid computing self.nodes in the below filter
+        adjacencies = adjacency_bag.filter( # Get adjacencies for this layer's nodes
             lambda node_adjacency: node_adjacency[0] in self.nodes)
         
-        # Find and store leaf nodes (those with no children)
-        leaf_nodes = adjacencies.filter(
-            lambda node_adjacency: len(node_adjacency[1]) == 0).map(
-                lambda node_adjacency: node_adjacency[0])
-        leaves = db.concat([leaves, leaf_nodes])
+        # TODO : choose a more efficient data structure if there's a 
+        # bottleneck (e.g., bitarray or numpy array of bool)
+        if leaves: # Find and store leaf nodes (those with no children)
+            leaf_nodes = adjacencies.filter(
+                lambda node_adjacency: node_adjacency[1].count == 0).map(
+                    lambda node_adjacency: node_adjacency[0])
+            leaves = db.concat([leaves, leaf_nodes])
         
         # Discover undiscovered children and add them to next layer out_layer
-        all_children = adjacencies.map(
+        all_children = adjacencies.map( # Get child node_ids
             lambda node_adjacency: node_adjacency[1]).map(
-                lambda tup: tup[0]).distinct()
-        all_children = all_children.map( # Append indices
+                lambda children_bag: children_bag.map(lambda tup: tup[0]))
+        all_children_w_i = all_children.map( # Append indices
             lambda child_id: (child_id, np.where(nodes == child_id)[0][0]))
-        undiscovered_children = all_children.filter(
-            lambda child: state[child[1]] == "U") # Isolate undiscovered children
-        new_children = undiscovered_children.map(
-            lambda child: state[child[1]] == "D") # Discover the undiscovered children
+        undiscovered_children = all_children_w_i.filter( # Get undiscovered children
+            lambda child: state[child[1]] == "U")
+        new_children = undiscovered_children.map( # Discover undiscovered children
+            lambda child: state[child[1]] == "D")
         out_layer.insert(new_children)
         
-        # Establish parentage
-        def num_synapses(parent, child, node_adjacency):
-            ...
-        def record_parentage(node_adjacency):
-            parent, children_bag = node_adjacency
-            children_bag = children_bag.map(
-                lambda child: parents[child].add(
-                    (parent, num_synapses(parent, child, node_adjacency))))
-        adjacencies.map(record_parentage)
+        # Establish parentage for each child
+        # TODO : implement file read/write mechanism to keep RAM usage down as
+        # the parents_dict has the potential to get very large - it is basically
+        # another in-memory adjacency list in dict form at the moment.
+        if parents_dict:
+            # Already have child node IDs in all_children.
+            # The child node's parents are those nodes in the child's adjacencies
+            # where the states of those nodes are 'P'. Parent-child relationships
+            # with parents in an upper layer are already included in parents_dict,
+            # so the following code involves duplicating those relationships.
+            
+            
+            #def attach_child_i(children_bag):
+                ## For each tuple in children_bag, append the index of the node
+                ## in the first position of the tuple.
+                ## children_bag e.g., Bag([(b, 3), (c, 4), ...])
+                #children_bag = children_bag.map(
+                    #lambda tup: (tup[0], tup[1], np.where(nodes == tup[0])[0][0]))
+                #return children_bag
+            
+            #adjacencies.map(
+                #lambda node_adjacency:
+                    #(node_adjacency[0], attach_child_i(node_adjacency[1]))
+            
+            
+        #def num_synapses(parent, child, node_adjacency):
+            #...
+        #def record_parentage(node_adjacency):
+            #parent, children_bag = node_adjacency
+            #children_bag = children_bag.map(
+                #lambda child: parents[child].add(
+                    #(parent, num_synapses(parent, child, node_adjacency))))
+        #adjacencies.map(record_parentage)
+        
+        # Mark this layer's nodes as processed
         
         return out_layer
         
