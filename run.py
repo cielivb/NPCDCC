@@ -90,13 +90,8 @@ def df_to_adjacency_bag(df, undirect=True):
     # where all the pre values within an entry are equal. Edges are currently
     # represented by indices.
     grouped_as_bag = grouped.to_bag()
-    
-    def process_post_syn(post_list, syn_count_list):
-        processed = db.from_sequence((zip(post_list, syn_count_list)))
-        return processed
-                         
     adjacency_bag = grouped_as_bag.map(
-        lambda entry: (entry[0][0], process_post_syn(entry[1], entry[2])))
+        lambda entry: (entry[0][0], db.from_sequence((zip(entry[1], entry[2])))))
     return adjacency_bag
 
 
