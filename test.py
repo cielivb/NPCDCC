@@ -6,6 +6,7 @@ import pandas as pd
 import unittest
 
 from dask import dataframe as ddf
+from dask.distributed import Client
 from datetime import datetime
 from memory_profiler import memory_usage
 from pandas.testing import assert_frame_equal
@@ -371,9 +372,15 @@ class TestPBFS(unittest.TestCase):
     
     OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test_pbfs.txt")
     
+    def setUp(self):
+        run.CLIENT = Client()
+        
+    def tearDown(self):
+        run.CLIENT.close()
+    
     def test_case_1(self):
         df = get_six_node_cycle_dask_df()
-        adjacency_bag = run.df_to_adjacency_bag(df)
+        adjacency_bag = run.df_to_adjacency_bag(df).persist()
         start_node = 0
         exp_leaves = {3}
         exp_state = np.full(6, "P", "<U1")
@@ -388,10 +395,11 @@ class TestPBFS(unittest.TestCase):
         self.assertEqual(state, exp_state)
         self.assertTrue(len(leaves) == 1)
         self.assertTrue(exp_leaves == set(leaves))
+        del adjacency_bag
         
     def test_case_2(self):
         df = get_nine_node_line_dask_df()
-        adjacency_bag = run.df_to_adjacency_bag(df)
+        adjacency_bag = run.df_to_adjacency_bag(df).persist()
         start_node = 12
         exp_leaves = {11, 19}
         exp_state = np.full(9, "P", "<U1")
@@ -407,10 +415,11 @@ class TestPBFS(unittest.TestCase):
         self.assertEqual(state, exp_state)
         self.assertTrue(len(leaves) == 2)
         self.assertTrue(exp_leaves == set(leaves))
+        del adjacency_bag
         
     def test_case_3(self):
         df = get_twelve_node_dask_df()
-        adjacency_bag = run.df_to_adjacency_bag(df)
+        adjacency_bag = run.df_to_adjacency_bag(df).persist()
         start_node = 29
         exp_leaves = {22, 24, 25, 26, 27, 30}
         exp_state = np.full(12, "P", "<U1")
@@ -428,12 +437,13 @@ class TestPBFS(unittest.TestCase):
         self.assertEqual(state, exp_state)
         self.assertTrue(len(leaves) == 6)
         self.assertTrue(exp_leaves == set(leaves))
+        del adjacency_bag
         
     def test_case_4(self):
         """ Combines case 3 and case 1 """
         df = ddf.concat([get_six_node_cycle_dask_df(),
                          get_twelve_node_dask_df()], axis=0)
-        adjacency_bag = run.df_to_adjacency_bag(df)
+        adjacency_bag = run.df_to_adjacency_bag(df).persist()
         start_node = 29
         exp_leaves = {22, 24, 25, 26, 27, 30}
         exp_parent_adj = [(22, [(21, 5), (23, 2)]), (24, [(31, 2)]),
@@ -461,6 +471,7 @@ class TestPBFS(unittest.TestCase):
         max_mem = max(memory_usage((run.pbfs, (start_node, adjacency_bag))))
         report_test_result(TestPBFS.OUTFILE, "test_case_4",
                            time1, max_mem, None, None)
+        del adjacency_bag
         
         
         

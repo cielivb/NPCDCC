@@ -40,9 +40,11 @@ import random
 from collections import defaultdict
 from dask import bag as db
 from dask import dataframe as ddf
+from dask.distributed import Client
 from queue import Queue
 from threading import Lock
 
+CLIENT = None # Assigned properly at bottom of script
 MIN_CLUSTER_SIZE = 30
 MAD_K = 3.5
 
@@ -92,7 +94,7 @@ def df_to_adjacency_bag(df, undirect=True):
     grouped_as_bag = grouped.to_bag()
     adjacency_bag = grouped_as_bag.map(
         lambda entry: (entry[0][0], db.from_sequence((zip(entry[1], entry[2])))))
-    return adjacency_bag
+    return adjacency_bag.persist()
 
 
 
@@ -132,7 +134,7 @@ class Layer():
         leaf_nodes = adj_w_neighbour_i.map(
             lambda node_adjacency: (node_adjacency[0], has_child(node_adjacency[1]))).filter(
                 lambda rel: not rel[1]).map(lambda rel: rel[0])
-        leaves = db.concat([leaves, leaf_nodes])
+        leaves = db.concat([leaves, leaf_nodes]).persist()
            
         
     def attach_neighbour_i(self, neighbour_bag, nodes):
@@ -143,17 +145,22 @@ class Layer():
         return neighbour_bag    
     
     
-    def get_child_parent_rels(self, adjacency_bag, state, nodes, all_children):
+    def get_child_parent_rels(self, adjacency_bag, adjacencies, state, nodes, all_children):
         """ Record parentage for each child 
         The child node's parents are those nodes in the child's adjacencies
         where the states of those nodes are 'P'."""
         child_ids = all_children.compute()
+        parent_ids = adjacencies.map(
+            lambda node_adjacency: node_adjacency[0]).filter(
+                lambda node_id: state[np.where(nodes == node_id)[0][0]] == "P").compute()
+        print(f"Candidate child ids: {child_ids}")
+        print(f"Candidate parent ids: {parent_ids}")
         child_adjacencies = adjacency_bag.filter(
             lambda node_adjacency: node_adjacency[0] in child_ids)
-        parent_child_rels = child_adjacencies.map(
+        child_parent_rels = child_adjacencies.map(
             lambda node_adjacency: (node_adjacency[0], 
                                     node_adjacency[1].filter(
-                                        lambda tup: state[np.where(nodes == tup[0])[0][0]] == "P")))
+                                        lambda tup: tup[0] in parent_ids)))
         print(f"child_parent_rels: {child_parent_rels.compute()}")
         return child_parent_rels
         
@@ -168,10 +175,11 @@ class Layer():
         where the edge from b->a and a->b has weight 3 (i.e., 3 synapses). 
         
         """
+        global CLIENT
         print(f"\nLayer: {adjacency_bag}, {nodes}, {state}, {leaves}")
         out_layer = Layer()
         adjacencies = adjacency_bag.filter( # Get adjacencies for this layer's nodes
-            lambda node_adjacency: node_adjacency[0] in self.nodes.compute())
+            lambda node_adjacency: node_adjacency[0] in self.nodes.compute()).persist()
         
         self.update_leaves(adjacencies, leaves, state, nodes)
 
@@ -188,12 +196,15 @@ class Layer():
                 lambda child_id: np.where(nodes == child_id)[0][0]).compute()
             state[undiscovered_is] = "D"
             child_parent_rels = self.get_child_parent_rels(
-                adjacency_bag, state, nodes, all_children)
+                adjacency_bag, adjacencies, state, nodes, all_children).persist()
         
         # Mark this layer's nodes as processed
         processed_is = adjacencies.map( # Get this layer's node's indices
             lambda node_adjacency: np.where(nodes == node_adjacency[0])[0][0]).compute()
         state[processed_is] = "P"
+        
+        # Free memory
+        CLIENT.cancel(adjacencies, self.nodes)
         return (out_layer, child_parent_rels)
         
 
@@ -244,7 +255,8 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
     while not current_layer.is_empty():
         next_layer, child_parent_rels = current_layer.process(
             adjacency_bag, nodes, state, leaves)
-        all_child_parent_rels = db.concat([all_child_parent_rels, child_parent_rels])
+        all_child_parent_rels = db.concat(
+            [all_child_parent_rels, child_parent_rels]).persist()
         current_layer = next_layer
 
     return (all_child_parent_rels, state, leaves)
@@ -483,3 +495,10 @@ def identify_clusters(df=None, adjacency_bags=None):
     new_components = component_adjacency_bags(new_df)
     clusters = CLIENT.map(identify_clusters, adjacency_bags=new_components)
     return clusters # Caller will have to wait for result then flatten.
+
+
+
+### -----------------------------------------------------------------------
+
+if __name__ == "__main__":
+    CLIENT = Client()
