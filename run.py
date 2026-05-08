@@ -43,7 +43,6 @@ from dask import dataframe as ddf
 from queue import Queue
 from threading import Lock
 
-GRAIN_SIZE = 128
 MIN_CLUSTER_SIZE = 30
 MAD_K = 3.5
 
@@ -91,8 +90,13 @@ def df_to_adjacency_bag(df, undirect=True):
     # where all the pre values within an entry are equal. Edges are currently
     # represented by indices.
     grouped_as_bag = grouped.to_bag()
+    
+    def process_post_syn(post_list, syn_count_list):
+        processed = db.from_sequence((zip(post_list, syn_count_list)))
+        return processed
+                         
     adjacency_bag = grouped_as_bag.map(
-        lambda entry: (entry[0][0], list(zip(entry[1], entry[2]))))
+        lambda entry: (entry[0][0], process_post_syn(entry[1], entry[2])))
     return adjacency_bag
 
 
@@ -112,7 +116,7 @@ class Layer():
     
     
     def is_empty(self):
-        return self.nodes.count.compute() == 0
+        return self.nodes.count().compute() == 0
     
     
     def update_leaves(self, adjacencies, leaves, state, nodes):
@@ -251,14 +255,15 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
     if not type(nodes) is np.array:
         nodes = np.array(adjacency_bag.map( # TODO: is there a better way?
             lambda node_adjacency: node_adjacency[0]).compute())
-    leaves, n = set(), len(nodes)
+    leaves, n = db.from_sequence([]), len(nodes)
     if not type(state) is np.array:
         state = np.full(n, "U", dtype="<U1")        
     start_node_index = np.where(nodes == start_node)[0][0]
     state[start_node_index] = "D"
         
     layer_0 = Layer()
-    layer_0.insert(start_node)
+    start_node_as_bag = db.from_sequence([start_node])
+    layer_0.insert(start_node_as_bag)
     current_layer = layer_0
 
     while not current_layer.is_empty():
