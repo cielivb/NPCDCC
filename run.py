@@ -71,18 +71,28 @@ def df_to_adjacency_bag(df, undirect=True):
     project (I have not tested with the directed version).
     
     """
-    edge_bag = df[["pre", "post", "syn_count"]].to_bag()
     if undirect: # Add (b,a,w) for every (a,b,w)
+        edge_bag = df[["pre", "post", "syn_count"]].to_bag()        
         edge_bag = edge_bag.map(lambda edge: [edge, (edge[1], edge[0], edge[2])])
         edge_bag = edge_bag.flatten().distinct()
+        adj_df = edge_bag.to_dataframe(
+            meta = {"pre": int, "post": int, "syn_count": int})
+    else:
+        adj_df = df
+        
+    # grouped is of the general form
+    # pre    post      syn_count
+    # 0      [1, 5]    [2, 4]
+    # where there is an edge of weight 2 between 0 and 1,
+    # an edge of weight 4 between 0 and 5, etc
+    grouped = adj_df.groupby("pre").agg({"pre": list, "post": list, "syn_count": list})
     
-    adjacency_bag = edge_bag.foldby(
-        key = lambda edge: edge[0],
-        binop = lambda accum, edge: accum + [(edge[1], edge[2])],
-        initial = [],
-        combine = lambda accum1, accum2: accum1 + accum2,
-        combine_initial = []
-    )
+    # Each entry of form ([pre, pre, ...], [post, post, ...], [syn_count, syn_count, ...])
+    # where all the pre values within an entry are equal. Edges are currently
+    # represented by indices.
+    grouped_as_bag = grouped.to_bag()
+    adjacency_bag = grouped_as_bag.map(
+        lambda entry: (entry[0][0], list(zip(entry[1], entry[2]))))
     return adjacency_bag
 
 
@@ -203,10 +213,9 @@ class Layer():
         self.record_parentage(adjacencies, state, nodes, all_children)
         
         # Mark this layer's nodes as processed
-        processed = adjacencies.map( # Get this layer's node's indices
-            lambda node_adjacency: np.where(nodes == node_adjacency[0])[0][0]).map(
-                lambda i: state[i] = "P") # Mark as processed
-        
+        processed_is = adjacencies.map( # Get this layer's node's indices
+            lambda node_adjacency: np.where(nodes == node_adjacency[0])[0][0]).compute()
+        state[processed_is] = "P"
         return out_layer
         
 

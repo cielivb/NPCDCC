@@ -32,7 +32,7 @@ class TestDfToAdjacencyBag(unittest.TestCase):
         very_sorted_result = []
         for adjacency in sorted(result):
             # Sort the lists in the tuples
-            very_sorted_result.append(sorted(adjacency[1]))
+            very_sorted_result.append((adjacency[0], sorted(adjacency[1])))
         return very_sorted_result
         
     def test_case_1_undirect(self):
