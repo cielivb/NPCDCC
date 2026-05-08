@@ -105,7 +105,7 @@ class Layer():
     """ Represents a layer d of nodes at depth d of parallel BFS """
     
     def __init__(self):
-        self.nodes = None
+        self.nodes = db.from_sequence([])
     
     
     def insert(self, node_bag: db.Bag):
@@ -152,20 +152,17 @@ class Layer():
         child_ids = all_children.compute()
         parent_ids = adjacencies.map(
             lambda node_adjacency: node_adjacency[0]).filter(
-                lambda node_id: state[np.where(nodes == node_id)[0][0]] == "P").compute()
-        print(f"Candidate child ids: {child_ids}")
-        print(f"Candidate parent ids: {parent_ids}")
+                lambda node_id: state[np.where(nodes == node_id)[0]] == "P").compute()
         child_adjacencies = adjacency_bag.filter(
             lambda node_adjacency: node_adjacency[0] in child_ids)
         child_parent_rels = child_adjacencies.map(
             lambda node_adjacency: (node_adjacency[0], 
                                     node_adjacency[1].filter(
                                         lambda tup: tup[0] in parent_ids)))
-        print(f"child_parent_rels: {child_parent_rels.compute()}")
         return child_parent_rels
         
     
-    def process(self, adjacency_bag, nodes, state, leaves):
+    def process(self, adjacency_bag, nodes, state, leaves, all_child_parent_rels):
         """ Check all neighbours of vertices for those that should be added
         to the next layer out_layer. Updates parents_dict, leaves, and state
         as required. Returns out_layer. 
@@ -176,7 +173,6 @@ class Layer():
         
         """
         global CLIENT
-        print(f"\nLayer: {adjacency_bag}, {nodes}, {state}, {leaves}")
         out_layer = Layer()
         adjacencies = adjacency_bag.filter( # Get adjacencies for this layer's nodes
             lambda node_adjacency: node_adjacency[0] in self.nodes.compute()).persist()
@@ -190,23 +186,22 @@ class Layer():
         state[processed_is] = "P"        
 
         # Discover undiscovered children and add them to next layer out_layer
-        all_children = adjacencies.map( # Get child node_ids
-            lambda node_adjacency: node_adjacency[1]).map(
-                lambda children_bag: children_bag.map(lambda tup: tup[0])).distinct().compute()[0]
+        children_bags = adjacencies.map(lambda tup: tup[1]).compute()
+        all_children = db.concat(children_bags).map(
+            lambda tup: tup[0]).distinct().filter(
+                lambda node_id: state[np.where(nodes == node_id)[0][0]] != "P")
         if all_children.count().compute() > 0:
-            
-            undiscovered_children = all_children.filter(
-                lambda child_id: state[np.where(nodes == child_id)[0][0]] == "U")
-            out_layer.insert(undiscovered_children)
-            undiscovered_is = undiscovered_children.map(
+            out_layer.insert(all_children)
+            undiscovered_is = all_children.map(
                 lambda child_id: np.where(nodes == child_id)[0]).compute()
             state[undiscovered_is] = "D"
             child_parent_rels = self.get_child_parent_rels(
                 adjacency_bag, adjacencies, state, nodes, all_children).persist()
+            all_child_parent_rels = db.concat([all_child_parent_rels, child_parent_rels])
         
         # Free memory
         CLIENT.cancel([adjacencies, self.nodes])
-        return (out_layer, child_parent_rels)
+        return (out_layer, all_child_parent_rels)
         
 
 
@@ -246,18 +241,15 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
         state = np.full(n, "U", dtype="<U1")        
     start_node_index = np.where(nodes == start_node)[0][0]
     state[start_node_index] = "D"
-    all_child_parent_rels = db.from_sequence([])    
-        
+    all_child_parent_rels = db.from_sequence([(start_node, db.from_sequence([]))])
     layer_0 = Layer()
     start_node_as_bag = db.from_sequence([start_node])
     layer_0.insert(start_node_as_bag)
     current_layer = layer_0
 
     while not current_layer.is_empty():
-        next_layer, child_parent_rels = current_layer.process(
-            adjacency_bag, nodes, state, leaves)
-        all_child_parent_rels = db.concat(
-            [all_child_parent_rels, child_parent_rels]).persist()
+        next_layer, all_child_parent_rels = current_layer.process(
+            adjacency_bag, nodes, state, leaves, all_child_parent_rels)
         current_layer = next_layer
 
     return (all_child_parent_rels, state, leaves)

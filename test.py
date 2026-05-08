@@ -46,7 +46,6 @@ def get_twelve_node_dask_df():
 def process_computed_adjacency_bag(result):
     """ Sort by node and sort node neighbours by their nodes too """
     very_sorted_result = []
-    print(result)
     for adjacency in sorted(result, key=lambda x: x[0]):
         # Sort the lists in the tuples
         node, neighbours = adjacency[0], adjacency[1]
@@ -389,10 +388,12 @@ class TestPBFS(unittest.TestCase):
         exp_parent_adj = process_computed_adjacency_bag(exp_parent_adj)
         
         parents_bag, state, leaves = run.pbfs(start_node, adjacency_bag)
+        leaves = leaves.compute()
+        print(leaves)
         
         parent_adj = process_computed_adjacency_bag(parents_bag.compute())
         self.assertEqual(parent_adj, exp_parent_adj)
-        self.assertEqual(state, exp_state)
+        assert (state == exp_state).all()
         self.assertTrue(len(leaves) == 1)
         self.assertTrue(exp_leaves == set(leaves))
         del adjacency_bag
