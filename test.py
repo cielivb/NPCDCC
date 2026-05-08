@@ -17,6 +17,23 @@ TEST_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "test_output")
 TIMESTAMP = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def get_six_node_cycle_dask_df():
+    d = {"pre": [0,0,1,5,3,3],
+         "post": [1,5,2,4,2,4],
+         "syn_count": [2,4,6,7,3,8],
+         "misc": [1,2,3,4,5,6]}
+    df = ddf.from_pandas(pd.DataFrame(data=d))
+    return df
+
+def get_nine_node_line_dask_df():
+    d = {"pre": [11,12,13,14,15,16,17,18],
+         "post": [12,13,14,15,16,17,18,19],
+         "syn_count": [2,3,1,3,2,1,1,2],
+         "misc": [7,8,9,10,11,12,13,14]}
+    df = ddf.from_pandas(pd.DataFrame(data=d))
+    return df
+
+
 def report_test_result(outfile, test, time1, max_mem, comp_time, comp_max_mem):
     global TIMESTAMP
     line = f"{TIMESTAMP} - {test} - {time1} - {max_mem} - {comp_time} - {comp_max_mem}\n"
@@ -38,11 +55,7 @@ class TestDfToAdjacencyBag(unittest.TestCase):
         return very_sorted_result
         
     def test_case_1_undirect(self):
-        d = {"pre": [0,0,1,5,3,3],
-             "post": [1,5,2,4,2,4],
-             "syn_count": [2,4,6,7,3,8],
-             "misc": [1,2,3,4,5,6]}
-        df = ddf.from_pandas(pd.DataFrame(data=d))
+        df = get_six_node_cycle_dask_df()
         expected = [(0, [(1, 2), (5, 4)]),
                     (1, [(0, 2), (2, 6)]),
                     (2, [(1, 6), (3, 3)]),
@@ -53,11 +66,7 @@ class TestDfToAdjacencyBag(unittest.TestCase):
         self.assertEqual(result, expected)
     
     def test_case_2_undirect(self):
-        d = {"pre": [11,12,13,14,15,16,17,18],
-             "post": [12,13,14,15,16,17,18,19],
-             "syn_count": [2,3,1,3,2,1,1,2],
-             "misc": [7,8,9,10,11,12,13,14]}
-        df = ddf.from_pandas(pd.DataFrame(data=d))
+        df = get_nine_node_line_dask_df()
         expected = [(11, [(12, 2)]),
                     (12, [(11, 2), (13, 3)]),
                     (13, [(12, 3), (14, 1)]),
@@ -72,11 +81,9 @@ class TestDfToAdjacencyBag(unittest.TestCase):
         
     def test_case_3_undirect_2_components(self):
         """ Combines test case 2 and 1 """
-        d = {"pre": [0,0,1,5,3,3,11,12,13,14,15,16,17,18],
-             "post": [1,5,2,4,2,4,12,13,14,15,16,17,18,19],
-             "syn_count": [2,4,6,7,3,8,2,3,1,3,2,1,1,2],
-             "misc": [1,2,3,4,5,6,7,8,9,10,11,12,13,14]}      
-        df = ddf.from_pandas(pd.DataFrame(data=d))       
+        df = ddf.concat([get_six_node_cycle_dask_df(), 
+                        get_nine_node_line_dask_df()],
+                       axis=0)
         expected = [(0, [(1, 2), (5, 4)]),
                     (1, [(0, 2), (2, 6)]),
                     (2, [(1, 6), (3, 3)]),
@@ -104,58 +111,6 @@ class TestDfToAdjacencyBag(unittest.TestCase):
         report_test_result(TestDfToAdjacencyBag.OUTFILE, 
                            "test_case_3_undirect_2_components",
                            time1, max_mem, None, None)
-
-
-class TestGetComponentAdjacencyBags(unittest.TestCase):
-    
-    OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test-get-component-adjacency-bags.txt")    
-    
-    def test_case_2_components(self):
-        d = {"pre": [0,0,1,5,3,3,11,12,13,14,15,16,17,18],
-             "post": [1,5,2,4,2,4,12,13,14,15,16,17,18,19],
-             "syn_count": [2,4,6,7,3,8,2,3,1,3,2,1,1,2],
-             "misc": [1,2,3,4,5,6,7,8,9,10,11,12,13,14]}
-        df = ddf.from_pandas(pd.DataFrame(data=d))        
-        expected1 = [(0, [(1, 2), (5, 4)]),
-                    (1, [(0, 2), (2, 6)]),
-                    (2, [(1, 6), (3, 3)]),
-                    (3, [(2, 3), (4, 8)]),
-                    (4, [(3, 8), (5, 7)]),
-                    (5, [(0, 4), (4, 7)])]
-        expected2 = [(11, [(12, 2)]),
-                    (12, [(11, 2), (13, 3)]),
-                    (13, [(12, 3), (14, 1)]),
-                    (14, [(13, 1), (15, 3)]),
-                    (15, [(14, 3), (16, 2)]),
-                    (16, [(15, 2), (17, 1)]),
-                    (17, [(16, 1), (18, 1)]),
-                    (18, [(17, 1), (19, 2)]),
-                    (19, [(18, 2)])]
-        
-        start_time = time()
-        result = run.get_component_adjacency_bags(df)
-        time1 = time() - start_time
-        
-        # Run assertions
-        self.assertInstance(result, db.Bag)
-        components = result.compute()
-        self.assertTrue(len(components) == 2)
-        self.assertInstance(components[0], db.Bag)
-        c1, c2 = components[0].compute(), components[1].compute()
-        self.assertNotEqual(c1, c2)
-        if len(c1) == 6:
-            self.assertEqual(c1, expected1)
-            self.assertEqual(c2, expected2)
-        elif len(c2) == 6:
-            self.assertEqual(c1, expected2)
-            self.assertEqual(c2, expected1)
-        else:
-            raise(f"Expected component lengths 6 and 9: got {len(c1)}, {len(c2)}")
-        
-        # Get memory usage and report results
-        max_mem = max(memory_usage((run.get_component_adjacency_bags, (df,))))
-        report_test_result(TestGetComponentAdjacencyBags.OUTFILE, 
-                           "test_case_2_components", time1, max_mem, None, None)
 
 
 @unittest.skip("OBSOLETE - bfs_components no longer takes dataframes")
@@ -413,6 +368,57 @@ class TestGirvanNewman(unittest.TestCase):
 
 
 ### INTEGRATION TESTS -----------------------------------------------------
+
+class TestGetComponentAdjacencyBags(unittest.TestCase):
+    """ Function depends on PBFS and df_to_adjacency_bag """
+    
+    OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test-get-component-adjacency-bags.txt")    
+    
+    def test_case_2_components(self):
+        df = ddf.concat([get_six_node_cycle_dask_df(), 
+                        get_nine_node_line_dask_df()],
+                       axis=0)     
+        expected1 = [(0, [(1, 2), (5, 4)]),
+                    (1, [(0, 2), (2, 6)]),
+                    (2, [(1, 6), (3, 3)]),
+                    (3, [(2, 3), (4, 8)]),
+                    (4, [(3, 8), (5, 7)]),
+                    (5, [(0, 4), (4, 7)])]
+        expected2 = [(11, [(12, 2)]),
+                    (12, [(11, 2), (13, 3)]),
+                    (13, [(12, 3), (14, 1)]),
+                    (14, [(13, 1), (15, 3)]),
+                    (15, [(14, 3), (16, 2)]),
+                    (16, [(15, 2), (17, 1)]),
+                    (17, [(16, 1), (18, 1)]),
+                    (18, [(17, 1), (19, 2)]),
+                    (19, [(18, 2)])]
+        
+        start_time = time()
+        result = run.get_component_adjacency_bags(df)
+        time1 = time() - start_time
+        
+        # Run assertions
+        self.assertInstance(result, db.Bag)
+        components = result.compute()
+        self.assertTrue(len(components) == 2)
+        self.assertInstance(components[0], db.Bag)
+        c1, c2 = components[0].compute(), components[1].compute()
+        self.assertNotEqual(c1, c2)
+        if len(c1) == 6:
+            self.assertEqual(c1, expected1)
+            self.assertEqual(c2, expected2)
+        elif len(c2) == 6:
+            self.assertEqual(c1, expected2)
+            self.assertEqual(c2, expected1)
+        else:
+            raise(f"Expected component lengths 6 and 9: got {len(c1)}, {len(c2)}")
+        
+        # Get memory usage and report results
+        max_mem = max(memory_usage((run.get_component_adjacency_bags, (df,))))
+        report_test_result(TestGetComponentAdjacencyBags.OUTFILE, 
+                           "test_case_2_components", time1, max_mem, None, None)
+
 
 class TestIdentifyClusters(unittest.TestCase):
     pass
