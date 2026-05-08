@@ -33,6 +33,14 @@ def get_nine_node_line_dask_df():
     df = ddf.from_pandas(pd.DataFrame(data=d))
     return df
 
+def get_twelve_node_dask_df():
+    d = {"pre": [20,21,22,23,24,25,26,27,28,29,29,30,31,31,31,31,31,31,31],
+         "post": [21,22,23,24,25,26,27,28,29,20,30,31,23,29,28,27,26,25,24],
+         "syn_count": [7,5,2,1,1,2,3,4,3,2,1,2,1,2,2,3,2,2,2],
+         "misc": [15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33]}
+    df = ddf.from_pandas(pd.DataFrame(data=d))
+    return df
+
 def sort_computed_adjacency_bag(result):
     """ Sort by node and sort node neighbours by their nodes too """
     very_sorted_result = []
@@ -82,8 +90,7 @@ class TestDfToAdjacencyBag(unittest.TestCase):
     def test_case_3_undirect_2_components(self):
         """ Combines test case 2 and 1 """
         df = ddf.concat([get_six_node_cycle_dask_df(), 
-                        get_nine_node_line_dask_df()],
-                       axis=0)
+                        get_nine_node_line_dask_df()], axis=0)
         expected = [(0, [(1, 2), (5, 4)]),
                     (1, [(0, 2), (2, 6)]),
                     (2, [(1, 6), (3, 3)]),
@@ -377,12 +384,83 @@ class TestPBFS(unittest.TestCase):
         self.assertEqual(state, exp_state)
         self.assertTrue(len(leaves) == 1)
         self.assertTrue(exp_leaves == set(leaves))
-
-
-class TestGirvanNewman(unittest.TestCase):
-    """ Technically an integration test (depends on dijkstra). """
-    pass
-
+        
+    def test_case_2(self):
+        df = get_nine_node_line_dask_df()
+        adjacency_bag = run.df_to_adjacency_bag(df)
+        start_node = 12
+        exp_leaves = {11, 19}
+        exp_state = np.full(9, "P", "<U1")
+        exp_parent_adj = [(11, [(12, 2)]), (19, [(18, 2)]), (12, []),
+                          (18, [(17, 1)]), (17, [(16, 1)]), (16, [(15, 2)]),
+                          (15, [(14, 3)]), (14, [(13, 1)]), (13, [(12, 3)])]
+        exp_parent_adj = sort_computed_adjacency_bag(exp_parent_adj)
+        
+        parents_bag, state, leaves = run.pbfs(start_node, adjacency_bag)
+        
+        parent_adj = sort_computed_adjacency_bag(parents_bag.compute())
+        self.assertEqual(parent_adj, exp_parent_adj)
+        self.assertEqual(state, exp_state)
+        self.assertTrue(len(leaves) == 2)
+        self.assertTrue(exp_leaves == set(leaves))
+        
+    def test_case_3(self):
+        df = get_twelve_node_dask_df()
+        adjacency_bag = run.df_to_adjacency_bag(df)
+        start_node = 29
+        exp_leaves = {22, 24, 25, 26, 27, 30}
+        exp_state = np.full(12, "P", "<U1")
+        exp_parent_adj = [(22, [(21, 5), (23, 2)]), (24, [(31, 2)]),
+                          (25, [(31, 2)]), (26, [(31, 2)]), 
+                          (27, [(31, 3), (28, 4)]), (30, [(29, 1)]),
+                          (23, [(31, 1)]), (21, [(20, 7)]), (20, [(29, 2)]),
+                          (31, [(29, 2)]), (28, [(29, 3)]), (29, [])]
+        exp_parent_adj = sort_computed_adjacency_bag(exp_parent_adj)
+        
+        parents_bag, state, leaves = run.pbfs(start_node, adjacency_bag)
+        
+        parent_adj = sort_computed_adjacency_bag(parents_bag.compute())
+        self.assertEqual(parent_adj, exp_parent_adj)
+        self.assertEqual(state, exp_state)
+        self.assertTrue(len(leaves) == 6)
+        self.assertTrue(exp_leaves == set(leaves))
+        
+    def test_case_4(self):
+        """ Combines case 3 and case 1 """
+        df = ddf.concat([get_six_node_cycle_dask_df(),
+                         get_twelve_node_dask_df()], axis=0)
+        adjacency_bag = run.df_to_adjacency_bag(df)
+        start_node = 29
+        exp_leaves = {22, 24, 25, 26, 27, 30}
+        exp_parent_adj = [(22, [(21, 5), (23, 2)]), (24, [(31, 2)]),
+                          (25, [(31, 2)]), (26, [(31, 2)]), 
+                          (27, [(31, 3), (28, 4)]), (30, [(29, 1)]),
+                          (23, [(31, 1)]), (21, [(20, 7)]), (20, [(29, 2)]),
+                          (31, [(29, 2)]), (28, [(29, 3)]), (29, [])]  
+        exp_parent_adj = sort_computed_adjacency_bag(exp_parent_adj)
+        
+        # Time it
+        start_time = time()
+        parents_bag, state, leaves = run.pbfs(start_node, adjacency_bag)
+        time1 = time() - start_time
+        
+        # Do assertions
+        parent_adj = sort_computed_adjacency_bag(parents_bag.compute())
+        self.assertEqual(parent_adj, exp_parent_adj)
+        self.assertEqual(18, len(state))
+        self.assertEqual(12, np.sum(state == "P"))
+        self.assertEqual(6, np.sum(state == "U"))
+        self.assertTrue(len(leaves) == 6)
+        self.assertTrue(exp_leaves == set(leaves))       
+        
+        # Get memory usage and report results
+        max_mem = max(memory_usage((run.pbfs, (start_node, adjacency_bag))))
+        report_test_result(TestPBFS.OUTFILE, "test_case_4",
+                           time1, max_mem, None, None)
+        
+        
+        
+        
 
 
 ### INTEGRATION TESTS -----------------------------------------------------
@@ -438,6 +516,10 @@ class TestGetComponentAdjacencyBags(unittest.TestCase):
         max_mem = max(memory_usage((run.get_component_adjacency_bags, (df,))))
         report_test_result(TestGetComponentAdjacencyBags.OUTFILE, 
                            "test_case_2_components", time1, max_mem, None, None)
+
+
+class TestGirvanNewman(unittest.TestCase):
+    pass
 
 
 class TestIdentifyClusters(unittest.TestCase):
