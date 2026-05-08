@@ -35,19 +35,18 @@ TODO
 
 import dask
 import numpy as np
+import os
 import random
 from collections import defaultdict
 from dask import bag as db
 from dask import dataframe as ddf
 from queue import Queue
 from threading import Lock
-from threading import Thread
-
 
 GRAIN_SIZE = 128
 MIN_CLUSTER_SIZE = 30
 MAD_K = 3.5
-
+ROOT_DIR = os.path.dirname(__file__)
 
 
 
@@ -86,13 +85,7 @@ def df_to_adjacency_bag(df, undirected=True):
 ### PARALLEL BFS ----------------------------------------------------------
 
 class Layer():
-    """ Represents a layer d of nodes at depth d of parallel BFS.
-    
-    The original PBFS inspiration comes from the logic behind 'Bags' and 'Pennants'
-    described at https://dl.acm.org/doi/epdf/10.1145/1810479.1810534. This is
-    a simplified daskified implementation of their PBFS.
-    
-    """
+    """ Represents a layer d of nodes at depth d of parallel BFS """
     
     def __init__(self):
         self.nodes = None
@@ -103,7 +96,34 @@ class Layer():
     def is_empty(self):
         return self.nodes.count.compute() == 0
     
-    def process(self, adjacency_bag, nodes, state, parents_dict=None, leaves=None):
+    def update_leaves(adjacencies, leaves, state, nodes):
+        """ Add leaf nodes in adjacencies to leaves bag. 
+        Leaf nodes are those with no children, i.e., none of their neighbours
+        in adjacencies are undiscovered. """
+        # TODO : choose a more efficient data structure if there's a 
+        # bottleneck (e.g., bitarray or numpy array of bool)
+        
+        def has_child(neighbour_bag):
+            """ True if at least one node in neighbour_bag is undiscovered """
+            return neighbour_bag.map(
+                lambda tup: state[tup[2]] == "U").any().compute()
+        
+        adj_w_neighbour_i = adjacencies.map( # Get indices of neighbours
+            lambda node_adjacency: (node_adjacency[0], 
+                                    attach_neighbour_i(node_adjacency[1], nodes)))        
+        leaf_nodes = adj_w_neighbour_i.map(
+            lambda node_adjacency: (node_adjacency[0], has_child(node_adjacency[1]))).filter(
+                lambda rel: not rel[1]).map(lambda rel: rel[0])
+        leaves = db.concat([leaves, leaf_nodes])
+        
+    def attach_neighbour_i(neighbour_bag, nodes):
+        """ For each tuple in neighbour_bag, append the index of the node.
+        neighbour_bag e.g., Bag([(b, 3), (c, 4), ...]) """
+        neighbour_bag = neighbour_bag.map(
+            lambda tup: (tup[0], tup[1], np.where(nodes == tup[0])[0][0]))
+        return neighbour_bag    
+    
+    def process(self, adjacency_bag, nodes, state, leaves):
         """ Check all neighbours of vertices for those that should be added
         to the next layer out_layer. Updates parents_dict, leaves, and state
         as required. Returns out_layer. 
@@ -116,15 +136,8 @@ class Layer():
         out_layer = Layer()
         adjacencies = adjacency_bag.filter( # Get adjacencies for this layer's nodes
             lambda node_adjacency: node_adjacency[0] in self.nodes.compute())
-        
-        # TODO : choose a more efficient data structure if there's a 
-        # bottleneck (e.g., bitarray or numpy array of bool)
-        if leaves: # Find and store leaf nodes (those with no children)
-            leaf_nodes = adjacencies.filter(
-                lambda node_adjacency: node_adjacency[1].count == 0).map(
-                    lambda node_adjacency: node_adjacency[0])
-            leaves = db.concat([leaves, leaf_nodes])
-        
+        update_leaves(adjacencies, leaves, state)
+
         # Discover undiscovered children and add them to next layer out_layer
         all_children = adjacencies.map( # Get child node_ids
             lambda node_adjacency: node_adjacency[1]).map(
@@ -137,12 +150,8 @@ class Layer():
             lambda child: state[child[1]] == "D")
         out_layer.insert(new_children)
         
-        # Establish parentage for each child
-        # TODO : implement file read/write mechanism to keep RAM usage down as
-        # the parents_dict has the potential to get very large - it is basically
-        # another in-memory adjacency list in dict form at the moment.
+        # Record parentage for each child
         if parents_dict:
-            # Already have child node IDs in all_children.
             # The child node's parents are those nodes in the child's adjacencies
             # where the states of those nodes are 'P'. Parent-child relationships
             # with parents in an upper layer are already included in parents_dict,
@@ -150,16 +159,10 @@ class Layer():
             child_adjacencies = adjacencies.filter(
                 lambda node_adjacency: node_adjacency[0] in all_children.compute())
             
-            def attach_neighbour_i(neighbour_bag):
-                # For each tuple in neighbour_bag, append the index of the node
-                # neighbour_bag e.g., Bag([(b, 3), (c, 4), ...])
-                neighbour_bag = neighbour_bag.map(
-                    lambda tup: (tup[0], tup[1], np.where(nodes == tup[0])[0][0]))
-                return neighbour_bag
             
             child_adjacencies = child_adjacencies.map(
                 lambda node_adjacency: (node_adjacency[0], 
-                                        attach_neighbour_i(node_adjacency[1])))
+                                        self.attach_neighbour_i(node_adjacency[1])))
             
             def get_child_parent_rels(node_adjacency):
                 # Filter to include only edges to parents.
@@ -173,14 +176,22 @@ class Layer():
             child_parent_rels = child_adjacencies.map(
                 lambda node_adjacency: get_child_parent_rels(node_adjacency))
             
-            def write_to_parent_dict(child_parent_rel):
-                # child_parent_rel, e.g., (child, [(b, w), (c, w), ...])
-                child, parents = child_parent_rel[0], child_parent_rel[1]
-                parents_dict[child] = parents_dict[child].union(
-                    set(child_parent_rel[1].compute()))
-                
-            # Children are unique so parallel write to dict should be ok    
-            child_parent_rels = child_parent_rels.map(write_to_parent_dict)
+            def dump_child_parent_data(child_parent_rel):
+                """ Write to child-parent data to minimise data held in RAM """
+                global ROOT_DIR
+                outfile = os.path.join(ROOT_DIR, "temp", "child_parent_rel.csv")                
+                with cpr_lock:
+                    child, parents = child_parent_rel[0], child_parent_rel[1].compute()
+                    with open(outfile, 'a') as file:
+                        for parent_info in parents:
+                            parent, num_synapses = parent_info[0], parent_info[1]
+                            file.write(f"{child},{parent},{num_synapses}\n")
+                    del child, parents # Free RAM immediately
+
+            # Use a lock to avoid computing child_parent_rels and minimise RAM.
+            # Parallel writing to file is dodgy so am doing it iteratively.
+            cpr_lock = Lock()
+            done = child_parent_rels.map(dump_child_parent_data, cpr_lock)
         
         # Mark this layer's nodes as processed
         processed = adjacencies.map( # Get this layer's node's indices
@@ -191,14 +202,13 @@ class Layer():
         
 
 
-def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
+def pbfs_search(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
     """ Return parents dask bag and a set of leaves. 
     
     The numpy arrays nodes and state will be automatically computed from the
     adjacency bag if not supplied. state is not required to complete the bfs
     search, however, the caller (e.g., get_component_adjacency_bags()) may 
     wish to validate the status of each node after the search is complete.
-    state is not returned; it is modified in place.
     
     Indices in parents_bag correspond to indices in nodes (or more generally, 
     to indices in adjacency_bag, although that cannot be indexed). 
@@ -209,76 +219,36 @@ def pbfs_search(start_node: int, adjacency_bag: db.Bag, nodes=None, state=None):
     edge weight or number of synapses along that edge.
 
     The set of leaves contains nodes that do not have any children.
+    
+    The original PBFS inspiration comes from the logic behind 'Bags' and 'Pennants'
+    described at https://dl.acm.org/doi/epdf/10.1145/1810479.1810534. This is
+    a simplified daskified implementation of their PBFS. What they term a 'bag'
+    is here a 'Layer', which represents all the nodes at some leve/depth d in the 
+    BFS tree.
+    
+    Returns parents_bag, state, and leaves
 
     """
     if not nodes:
-        nodes = adjacency_bag.map(
-            lambda node_adjacency: node_adjacency[0]).compute()
-    parents_dict = defaultdict(set)
-    leaves = set()
-    n = len(nodes)
+        nodes = adjacency_bag.map(lambda node_adjacency: 
+                                  node_adjacency[0]).compute()
+    leaves, n = set(), len(nodes)
     state = np.full(n, "U", dtype)
     start_node_index = np.where(nodes == start_node)[0][0]
     state[start_node_index] = "D"
-    
-    state_lock, parent_lock = Lock(), Lock()
-    
+        
     layer_0 = Layer()
     layer_0.insert(start_node)
     current_layer = layer_0
-    
-    def process_node(child_node, parent_node, out_bag, out_bag_lock):
-        child_node_index = np.where(nodes == child_node)[0][0]
-        # Discover child node
-        if state[child_node_index] == "U":
-            with state_lock:
-                state[child_node_index] = "D"
-            out_bag.insert(child_node)
-            
-        # Adjacency bag has general format:
-        # [(node_id, [(neighbour1_id, num_synapses), (neighbour2_id, num_synapses)]), (...), (...)]
-        # Get the number of synapses between parent and child node
-        num_synapses = adjacency_bag.filter(
-            lambda node_adjacency: node_adjacency[0] == child_node).map(
-                lambda node_adjacency: node_adjacency[1]).filter(
-                    lambda tup: tup[0] == parent_node).map(lambda tup: tup[1])
-        # Add parent and edge weight to child entry in parents dictionary
-        with parent_lock:
-            parents[child_node].add((parent_node, num_synapses))
-            
-    def process_layer(in_layer, out_layer):
-        """ Each iteration processes the layer in_bag by checking all the 
-        neighbors of vertices in in_bag for those that should be added to 
-        the next layer out_bag. in_layer contains at least one node, while
-        out_layer starts off with no nodes. """
-        global GRAIN_SIZE
-        if in_bag.size() < GRAIN_SIZE:
-            for parent_node in in_bag:
-                children_and_weights = adjacency_bag.filter(
-                    lambda node_adjacency: node_adjacency[0] == node).map(
-                        lambda node_adjacency: node_adjacency[1])
-                if children_and_weights.count() == 0:
-                    leaves.add(parent_node)
-                    continue
-                children = children_and_weights.map(lambda tup: tup[0])
-                children = children.map(
-                    lambda child: process_node(child, parent_node, out_bag))
-            return
-        new_bag = in_bag.split()
-        thread = Thread(target=process_layer, args=(new_bag, out_bag))
-        thread.start()
-        process_layer(in_bag, out_bag)
-        thread.join()
 
     while not current_layer.is_empty():
-        next_layer = Layer()
-        process_layer(current_layer, next_layer)
+        next_layer = current_layer.process(adjacency_bag, nodes, state, leaves)
         current_layer = next_layer
     
     # Convert parents_dict values to lists, then convert parents_dict to dask bag
     parents_dict = {child: list(parents) for child, parents in parents_dict.items()}
-    parents = db.from_sequence(parents_dict.items())
-    return (parents, leaves)
+    parents_bag = db.from_sequence(parents_dict.items())
+    return (parents_bag, state, leaves)
 
 
 
