@@ -107,7 +107,7 @@ class Layer():
     
     
     def insert(self, node_bag: db.Bag):
-        self.nodes = node_bag # bag of int nodes in layer e.g., bag([1,2,...])
+        self.nodes = node_bag.persist() # bag of int nodes in layer e.g., bag([1,2,...])
     
     
     def is_empty(self):
@@ -133,7 +133,7 @@ class Layer():
             lambda node_adjacency: (node_adjacency[0], has_child(node_adjacency[1]))).filter(
                 lambda rel: not rel[1]).map(lambda rel: rel[0])
         leaves = db.concat([leaves, leaf_nodes])
-    
+           
         
     def attach_neighbour_i(self, neighbour_bag, nodes):
         """ For each tuple in neighbour_bag, append the index of the node.
@@ -143,43 +143,20 @@ class Layer():
         return neighbour_bag    
     
     
-    def record_parentage(self, adjacencies, state, nodes, all_children):
+    def get_child_parent_rels(self, adjacency_bag, state, nodes, all_children):
         """ Record parentage for each child 
         The child node's parents are those nodes in the child's adjacencies
         where the states of those nodes are 'P'."""
-        child_adjacencies = adjacencies.filter(
-            lambda node_adjacency: node_adjacency[0] in all_children.compute())
-        child_adjacencies = child_adjacencies.map(
+        child_ids = all_children.compute()
+        child_adjacencies = adjacency_bag.filter(
+            lambda node_adjacency: node_adjacency[0] in child_ids)
+        parent_child_rels = child_adjacencies.map(
             lambda node_adjacency: (node_adjacency[0], 
-                                    self.attach_neighbour_i(node_adjacency[1])))
-            
-        def get_child_parent_rels(node_adjacency):
-            """ Filter to include only edges to parents.
-            node_adjacency e.g., (child, Bag([(b, w, i), (c, w, i), ...])) """
-            neighbour_bag = node_adjacency[1]
-            parents = neighbour_bag.filter(
-                lambda tup: state[tup[2]] == "P")
-            parents = parents.map(lambda tup: (tup[0], tup[1])) # Remove i
-            return (child, parents)
-            
-        def dump_child_parent_data(child_parent_rel):
-            """ Write child-parent data to file.
-            Use a lock to avoid computing child_parent_rels and to minimise RAM.
-            Parallel writing to file is dodgy so this is iterative. """
-            global TEMP_CPR_CSV
-            with cpr_lock:
-                child, parents = child_parent_rel[0], child_parent_rel[1].compute()
-                with open(TEMP_CPR_CSV, 'a') as file:
-                    for parent_info in parents:
-                        parent, num_synapses = parent_info[0], parent_info[1]
-                        file.write(f"{child},{parent},{num_synapses}\n")
-                del child, parents # Free RAM immediately
-
-        child_parent_rels = child_adjacencies.map(
-            lambda node_adjacency: get_child_parent_rels(node_adjacency))
-        cpr_lock = Lock()
-        done = child_parent_rels.map(dump_child_parent_data, cpr_lock)
-
+                                    node_adjacency[1].filter(
+                                        lambda tup: state[np.where(nodes == tup[0])[0][0]] == "P")))
+        print(f"child_parent_rels: {child_parent_rels.compute()}")
+        return child_parent_rels
+        
     
     def process(self, adjacency_bag, nodes, state, leaves):
         """ Check all neighbours of vertices for those that should be added
@@ -191,6 +168,7 @@ class Layer():
         where the edge from b->a and a->b has weight 3 (i.e., 3 synapses). 
         
         """
+        print(f"\nLayer: {adjacency_bag}, {nodes}, {state}, {leaves}")
         out_layer = Layer()
         adjacencies = adjacency_bag.filter( # Get adjacencies for this layer's nodes
             lambda node_adjacency: node_adjacency[0] in self.nodes.compute())
@@ -200,22 +178,23 @@ class Layer():
         # Discover undiscovered children and add them to next layer out_layer
         all_children = adjacencies.map( # Get child node_ids
             lambda node_adjacency: node_adjacency[1]).map(
-                lambda children_bag: children_bag.map(lambda tup: tup[0])).distinct()
-        all_children_w_i = all_children.map( # Append indices
-            lambda child_id: (child_id, np.where(nodes == child_id)[0][0]))
-        undiscovered_children = all_children_w_i.filter( # Get undiscovered children
-            lambda child: state[child[1]] == "U")
-        new_children = undiscovered_children.map( # Discover undiscovered children
-            lambda child: state[child[1]] == "D")
-        out_layer.insert(new_children)
-        
-        self.record_parentage(adjacencies, state, nodes, all_children)
+                lambda children_bag: children_bag.map(lambda tup: tup[0])).distinct().compute()[0]
+        if all_children.count().compute() > 0:
+            
+            undiscovered_children = all_children.filter(
+                lambda child_id: state[np.where(nodes == child_id)[0][0]] == "U")
+            out_layer.insert(undiscovered_children)
+            undiscovered_is = undiscovered_children.map(
+                lambda child_id: np.where(nodes == child_id)[0][0]).compute()
+            state[undiscovered_is] = "D"
+            child_parent_rels = self.get_child_parent_rels(
+                adjacency_bag, state, nodes, all_children)
         
         # Mark this layer's nodes as processed
         processed_is = adjacencies.map( # Get this layer's node's indices
             lambda node_adjacency: np.where(nodes == node_adjacency[0])[0][0]).compute()
         state[processed_is] = "P"
-        return out_layer
+        return (out_layer, child_parent_rels)
         
 
 
@@ -255,6 +234,7 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
         state = np.full(n, "U", dtype="<U1")        
     start_node_index = np.where(nodes == start_node)[0][0]
     state[start_node_index] = "D"
+    all_child_parent_rels = db.from_sequence([])    
         
     layer_0 = Layer()
     start_node_as_bag = db.from_sequence([start_node])
@@ -262,21 +242,12 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
     current_layer = layer_0
 
     while not current_layer.is_empty():
-        next_layer = current_layer.process(adjacency_bag, nodes, state, leaves)
+        next_layer, child_parent_rels = current_layer.process(
+            adjacency_bag, nodes, state, leaves)
+        all_child_parent_rels = db.concat([all_child_parent_rels, child_parent_rels])
         current_layer = next_layer
-    
-    # Create parent bag from csv file
-    all_cpr = dd.read_csv(TEMP_CPR_CSV).to_bag() # Bag([(child, parent, num_synapses), ...])
-    parents_bag = all_cpr.foldby(
-        key = lambda rel: rel[0],
-        binop = lambda accum, rel: accum + [(rel[1], rel[2])],
-        initial = [],
-        combine = lambda accum1, accum2: accum1 + accum2,
-        combine_initial = []
-    )
-    os.remove(TEMP_CPR_CSV)
 
-    return (parents_bag, state, leaves)
+    return (all_child_parent_rels, state, leaves)
 
 
 

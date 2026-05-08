@@ -45,7 +45,8 @@ def get_twelve_node_dask_df():
 def process_computed_adjacency_bag(result):
     """ Sort by node and sort node neighbours by their nodes too """
     very_sorted_result = []
-    for adjacency in sorted(result):
+    print(result)
+    for adjacency in sorted(result, key=lambda x: x[0]):
         # Sort the lists in the tuples
         node, neighbours = adjacency[0], adjacency[1]
         very_sorted_result.append((node, sorted(neighbours)))
