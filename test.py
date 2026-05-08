@@ -12,7 +12,16 @@ from time import time
 
 import run
 
+
 TEST_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "test_output")
+TIMESTAMP = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def report_test_result(outfile, test, time1, max_mem, comp_time, comp_max_mem):
+    global TIMESTAMP
+    line = f"{TIMESTAMP} - {test} - {time1} - {max_mem} - {comp_time} - {comp_max_mem}\n"
+    with open(outfile, 'a') as file:
+        file.write(line)
 
 
 ### UNIT TESTS ------------------------------------------------------------
@@ -20,13 +29,6 @@ TEST_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "test_output")
 class TestPrune(unittest.TestCase):
     
     OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test-prune.txt")
-    TIMESTAMP = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    def report_test_result(self, test, time1, max_mem, 
-                           comp_time, comp_max_mem):
-        line = f"{TestPrune.TIMESTAMP} - {test} - {time1} - {max_mem} - {comp_time} - {comp_max_mem}\n"
-        with open(TestPrune.OUTFILE, 'a') as outfile:
-            outfile.write(line)
     
     def test_base_case(self):
         """ A graph with no degree 1 edges returns itself """
@@ -50,8 +52,8 @@ class TestPrune(unittest.TestCase):
         # Get max memory usage
         max_mem = max(memory_usage((run.prune, (df_before,))))
         comp_max_mem = max(memory_usage((lambda: result_before_compute.compute(),)))
-        self.report_test_result("test_base_case", time1, max_mem, 
-                                     time2, comp_max_mem)
+        report_test_result(TestPrune.OUTFILE, "test_base_case", 
+                           time1, max_mem, time2, comp_max_mem)
         
     def test_single_incoming_deg1_edge(self):
         d_b = {"pre": [0,1,3,3,5,0,6], "post": [1,2,2,4,4,5,0]}
@@ -179,8 +181,8 @@ class TestPrune(unittest.TestCase):
         # Get max memory usage
         max_mem = max(memory_usage((run.prune, (df_before,))))
         comp_max_mem = max(memory_usage((lambda: result_before_compute.compute(),)))
-        self.report_test_result("test_combo_case", time1, max_mem, 
-                                     time2, comp_max_mem)        
+        report_test_result(TestPrune.OUTFILE, "test_combo_case", 
+                           time1, max_mem, time2, comp_max_mem)        
 
 
 class TestGetUpperThreshold(unittest.TestCase):
@@ -190,13 +192,6 @@ class TestGetUpperThreshold(unittest.TestCase):
 class TestBfsComponents(unittest.TestCase):
     
     OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test-bfs-components.txt")
-    TIMESTAMP = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    def report_test_result(self, test, time1, max_mem, 
-                           comp_time, comp_max_mem):
-        line = f"{TestBfsComponents.TIMESTAMP} - {test} - {time1} - {max_mem} - {comp_time} - {comp_max_mem}\n"
-        with open(TestBfsComponents.OUTFILE, 'a') as outfile:
-            outfile.write(line)
     
     def test_one_component_small(self):
         d = {"pre": [0,1,2], "post": [1,2,0]}
@@ -219,8 +214,8 @@ class TestBfsComponents(unittest.TestCase):
         # Get max memory usage
         max_mem = max(memory_usage((run.bfs_components, (df_before, 0))))
         comp_max_mem = max(memory_usage((lambda: result_before_compute.compute(),)))
-        self.report_test_result("test_one_component_small", time1, max_mem, 
-                                time2, comp_max_mem)
+        report_test_result(TestBfsComponents.OUTFILE, "test_one_component_small", 
+                           time1, max_mem, time2, comp_max_mem)
     
     def test_multiple_components(self):
         """ There are 5 components of varying size in the initial dataframe """
@@ -267,12 +262,13 @@ class TestBfsComponents(unittest.TestCase):
         # Get max memory usage
         max_mem = max(memory_usage((run.bfs_components, (df_before, 0))))
         comp_max_mem = max(memory_usage((lambda: result_before_compute.compute(),)))
-        self.report_test_result("test_combo_case", time1, max_mem,
-                                time2, comp_max_mem)               
+        report_test_result(TestBfsComponents.OUTFILE, "test_combo_case", 
+                           time1, max_mem, time2, comp_max_mem)               
 
 
-class TestDijkstra(unittest.TestCase):
-    pass
+class TestPBFS(unittest.TestCase):
+    
+    OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test_pbfs.txt")
 
 
 class TestGirvanNewman(unittest.TestCase):
