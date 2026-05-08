@@ -248,11 +248,12 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
 
     """
     global TEMP_CPR_CSV
-    if not nodes:
-        nodes = adjacency_bag.map(lambda node_adjacency: 
-                                  node_adjacency[0]).compute()
+    if not type(nodes) is np.array:
+        nodes = np.array(adjacency_bag.map( # TODO: is there a better way?
+            lambda node_adjacency: node_adjacency[0]).compute())
     leaves, n = set(), len(nodes)
-    state = np.full(n, "U", dtype)
+    if not type(state) is np.array:
+        state = np.full(n, "U", dtype="<U1")        
     start_node_index = np.where(nodes == start_node)[0][0]
     state[start_node_index] = "D"
         
