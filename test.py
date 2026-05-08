@@ -33,6 +33,13 @@ def get_nine_node_line_dask_df():
     df = ddf.from_pandas(pd.DataFrame(data=d))
     return df
 
+def sort_computed_adjacency_bag(result):
+    """ Sort by node and sort node neighbours by their nodes too """
+    very_sorted_result = []
+    for adjacency in sorted(result):
+        # Sort the lists in the tuples
+        very_sorted_result.append((adjacency[0], sorted(adjacency[1])))
+    return very_sorted_result
 
 def report_test_result(outfile, test, time1, max_mem, comp_time, comp_max_mem):
     global TIMESTAMP
@@ -46,13 +53,6 @@ def report_test_result(outfile, test, time1, max_mem, comp_time, comp_max_mem):
 class TestDfToAdjacencyBag(unittest.TestCase):
     
     OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test-df-to-adjacency-bag.txt")
-    
-    def sort(self, result):
-        very_sorted_result = []
-        for adjacency in sorted(result):
-            # Sort the lists in the tuples
-            very_sorted_result.append((adjacency[0], sorted(adjacency[1])))
-        return very_sorted_result
         
     def test_case_1_undirect(self):
         df = get_six_node_cycle_dask_df()
@@ -62,7 +62,7 @@ class TestDfToAdjacencyBag(unittest.TestCase):
                     (3, [(2, 3), (4, 8)]),
                     (4, [(3, 8), (5, 7)]),
                     (5, [(0, 4), (4, 7)])]
-        result = self.sort(run.df_to_adjacency_bag(df).compute())
+        result = sort_computed_adjacency_bag(run.df_to_adjacency_bag(df).compute())
         self.assertEqual(result, expected)
     
     def test_case_2_undirect(self):
@@ -76,7 +76,7 @@ class TestDfToAdjacencyBag(unittest.TestCase):
                     (17, [(16, 1), (18, 1)]),
                     (18, [(17, 1), (19, 2)]),
                     (19, [(18, 2)])]
-        result = self.sort(run.df_to_adjacency_bag(df).compute())
+        result = sort_computed_adjacency_bag(run.df_to_adjacency_bag(df).compute())
         self.assertEqual(result, expected)        
         
     def test_case_3_undirect_2_components(self):
@@ -102,7 +102,7 @@ class TestDfToAdjacencyBag(unittest.TestCase):
         
         # Time test while it runs
         start_time = time()
-        result = self.sort(run.df_to_adjacency_bag(df).compute())
+        result = sort_computed_adjacency_bag(run.df_to_adjacency_bag(df).compute())
         time1 = time() - start_time
         self.assertEqual(result, expected) # Check test passes
         
@@ -359,6 +359,24 @@ class TestBfsComponents(unittest.TestCase):
 class TestPBFS(unittest.TestCase):
     
     OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test_pbfs.txt")
+    
+    def test_case_1(self):
+        df = get_six_node_cycle_dask_df()
+        adjacency_bag = run.df_to_adjacency_bag(df)
+        start_node = 0
+        exp_leaves = {3}
+        exp_state = np.full(6, "P", "<U1")
+        exp_parent_adj = [(3, [(2, 3), (4, 8)]), (2, [(1, 6)]), (4, [(5, 7)]), 
+                          (1, [(0, 2)]), (5, [(0, 4)]), (0, [])]
+        exp_parent_adj = sort_computed_adjacency_bag(exp_parent_adj)
+        
+        parents_bag, state, leaves = run.pbfs(start_node, adjacency_bag)
+        
+        parent_adj = sort_computed_adjacency_bag(parents_bag.compute())
+        self.assertEqual(parent_adj, exp_parent_adj)
+        self.assertEqual(state, exp_state)
+        self.assertTrue(len(leaves) == 1)
+        self.assertTrue(exp_leaves == set(leaves))
 
 
 class TestGirvanNewman(unittest.TestCase):
@@ -404,6 +422,8 @@ class TestGetComponentAdjacencyBags(unittest.TestCase):
         self.assertTrue(len(components) == 2)
         self.assertInstance(components[0], db.Bag)
         c1, c2 = components[0].compute(), components[1].compute()
+        c1 = sort_computed_adjacency_bag(c1)
+        c2 = sort_computed_adjacency_bag(c2)
         self.assertNotEqual(c1, c2)
         if len(c1) == 6:
             self.assertEqual(c1, expected1)
