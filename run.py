@@ -46,7 +46,9 @@ from threading import Lock
 GRAIN_SIZE = 128
 MIN_CLUSTER_SIZE = 30
 MAD_K = 3.5
+
 ROOT_DIR = os.path.dirname(__file__)
+TEMP_CPR_CSV = os.path.join(ROOT_DIR, "temp", "child_parent_rel.csv")
 
 
 
@@ -151,11 +153,10 @@ class Layer():
             """ Write child-parent data to file.
             Use a lock to avoid computing child_parent_rels and to minimise RAM.
             Parallel writing to file is dodgy so this is iterative. """
-            global ROOT_DIR
-            outfile = os.path.join(ROOT_DIR, "temp", "child_parent_rel.csv")                
+            global TEMP_CPR_CSV
             with cpr_lock:
                 child, parents = child_parent_rel[0], child_parent_rel[1].compute()
-                with open(outfile, 'a') as file:
+                with open(TEMP_CPR_CSV, 'a') as file:
                     for parent_info in parents:
                         parent, num_synapses = parent_info[0], parent_info[1]
                         file.write(f"{child},{parent},{num_synapses}\n")
@@ -233,6 +234,7 @@ def pbfs_search(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
     Returns parents_bag, state, and leaves
 
     """
+    global TEMP_CPR_CSV
     if not nodes:
         nodes = adjacency_bag.map(lambda node_adjacency: 
                                   node_adjacency[0]).compute()
@@ -249,9 +251,17 @@ def pbfs_search(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
         next_layer = current_layer.process(adjacency_bag, nodes, state, leaves)
         current_layer = next_layer
     
-    # Convert parents_dict values to lists, then convert parents_dict to dask bag
-    parents_dict = {child: list(parents) for child, parents in parents_dict.items()}
-    parents_bag = db.from_sequence(parents_dict.items())
+    # Create parent bag from csv file
+    all_cpr = dd.read_csv(TEMP_CPR_CSV).to_bag() # Bag([(child, parent, num_synapses), ...])
+    parents_bag = all_cpr.foldby(
+        key = lambda rel: rel[0],
+        binop = lambda accum, rel: accum + [(rel[1], rel[2])],
+        initial = [],
+        combine = lambda accum1, accum2: accum1 + accum2,
+        combine_initial = []
+    )
+    os.remove(TEMP_CPR_CSV)
+
     return (parents_bag, state, leaves)
 
 
