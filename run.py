@@ -182,6 +182,12 @@ class Layer():
             lambda node_adjacency: node_adjacency[0] in self.nodes.compute()).persist()
         
         self.update_leaves(adjacencies, leaves, state, nodes)
+        
+        # Mark this layer's nodes as processed. The child-parent rel section
+        # relies on parents being marked as P.
+        processed_is = adjacencies.map( # Get this layer's node's indices
+            lambda node_adjacency: np.where(nodes == node_adjacency[0])[0]).compute()
+        state[processed_is] = "P"        
 
         # Discover undiscovered children and add them to next layer out_layer
         all_children = adjacencies.map( # Get child node_ids
@@ -193,18 +199,13 @@ class Layer():
                 lambda child_id: state[np.where(nodes == child_id)[0][0]] == "U")
             out_layer.insert(undiscovered_children)
             undiscovered_is = undiscovered_children.map(
-                lambda child_id: np.where(nodes == child_id)[0][0]).compute()
+                lambda child_id: np.where(nodes == child_id)[0]).compute()
             state[undiscovered_is] = "D"
             child_parent_rels = self.get_child_parent_rels(
                 adjacency_bag, adjacencies, state, nodes, all_children).persist()
         
-        # Mark this layer's nodes as processed
-        processed_is = adjacencies.map( # Get this layer's node's indices
-            lambda node_adjacency: np.where(nodes == node_adjacency[0])[0][0]).compute()
-        state[processed_is] = "P"
-        
         # Free memory
-        CLIENT.cancel(adjacencies, self.nodes)
+        CLIENT.cancel([adjacencies, self.nodes])
         return (out_layer, child_parent_rels)
         
 
