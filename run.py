@@ -90,13 +90,16 @@ class Layer():
     def __init__(self):
         self.nodes = None
     
+    
     def insert(self, node_bag: db.Bag):
         self.nodes = node_bag # bag of int nodes in layer e.g., bag([1,2,...])
+    
     
     def is_empty(self):
         return self.nodes.count.compute() == 0
     
-    def update_leaves(adjacencies, leaves, state, nodes):
+    
+    def update_leaves(self, adjacencies, leaves, state, nodes):
         """ Add leaf nodes in adjacencies to leaves bag. 
         Leaf nodes are those with no children, i.e., none of their neighbours
         in adjacencies are undiscovered. """
@@ -110,18 +113,59 @@ class Layer():
         
         adj_w_neighbour_i = adjacencies.map( # Get indices of neighbours
             lambda node_adjacency: (node_adjacency[0], 
-                                    attach_neighbour_i(node_adjacency[1], nodes)))        
+                                    self.attach_neighbour_i(node_adjacency[1], nodes)))        
         leaf_nodes = adj_w_neighbour_i.map(
             lambda node_adjacency: (node_adjacency[0], has_child(node_adjacency[1]))).filter(
                 lambda rel: not rel[1]).map(lambda rel: rel[0])
         leaves = db.concat([leaves, leaf_nodes])
+    
         
-    def attach_neighbour_i(neighbour_bag, nodes):
+    def attach_neighbour_i(self, neighbour_bag, nodes):
         """ For each tuple in neighbour_bag, append the index of the node.
         neighbour_bag e.g., Bag([(b, 3), (c, 4), ...]) """
         neighbour_bag = neighbour_bag.map(
             lambda tup: (tup[0], tup[1], np.where(nodes == tup[0])[0][0]))
         return neighbour_bag    
+    
+    
+    def record_parentage(self, adjacencies, state, nodes, all_children):
+        """ Record parentage for each child 
+        The child node's parents are those nodes in the child's adjacencies
+        where the states of those nodes are 'P'."""
+        child_adjacencies = adjacencies.filter(
+            lambda node_adjacency: node_adjacency[0] in all_children.compute())
+        child_adjacencies = child_adjacencies.map(
+            lambda node_adjacency: (node_adjacency[0], 
+                                    self.attach_neighbour_i(node_adjacency[1])))
+            
+        def get_child_parent_rels(node_adjacency):
+            """ Filter to include only edges to parents.
+            node_adjacency e.g., (child, Bag([(b, w, i), (c, w, i), ...])) """
+            neighbour_bag = node_adjacency[1]
+            parents = neighbour_bag.filter(
+                lambda tup: state[tup[2]] == "P")
+            parents = parents.map(lambda tup: (tup[0], tup[1])) # Remove i
+            return (child, parents)
+            
+        def dump_child_parent_data(child_parent_rel):
+            """ Write child-parent data to file.
+            Use a lock to avoid computing child_parent_rels and to minimise RAM.
+            Parallel writing to file is dodgy so this is iterative. """
+            global ROOT_DIR
+            outfile = os.path.join(ROOT_DIR, "temp", "child_parent_rel.csv")                
+            with cpr_lock:
+                child, parents = child_parent_rel[0], child_parent_rel[1].compute()
+                with open(outfile, 'a') as file:
+                    for parent_info in parents:
+                        parent, num_synapses = parent_info[0], parent_info[1]
+                        file.write(f"{child},{parent},{num_synapses}\n")
+                del child, parents # Free RAM immediately
+
+        child_parent_rels = child_adjacencies.map(
+            lambda node_adjacency: get_child_parent_rels(node_adjacency))
+        cpr_lock = Lock()
+        done = child_parent_rels.map(dump_child_parent_data, cpr_lock)
+
     
     def process(self, adjacency_bag, nodes, state, leaves):
         """ Check all neighbours of vertices for those that should be added
@@ -136,7 +180,8 @@ class Layer():
         out_layer = Layer()
         adjacencies = adjacency_bag.filter( # Get adjacencies for this layer's nodes
             lambda node_adjacency: node_adjacency[0] in self.nodes.compute())
-        update_leaves(adjacencies, leaves, state)
+        
+        self.update_leaves(adjacencies, leaves, state, nodes)
 
         # Discover undiscovered children and add them to next layer out_layer
         all_children = adjacencies.map( # Get child node_ids
@@ -150,48 +195,7 @@ class Layer():
             lambda child: state[child[1]] == "D")
         out_layer.insert(new_children)
         
-        # Record parentage for each child
-        if parents_dict:
-            # The child node's parents are those nodes in the child's adjacencies
-            # where the states of those nodes are 'P'. Parent-child relationships
-            # with parents in an upper layer are already included in parents_dict,
-            # so the following code involves duplicating those relationships.
-            child_adjacencies = adjacencies.filter(
-                lambda node_adjacency: node_adjacency[0] in all_children.compute())
-            
-            
-            child_adjacencies = child_adjacencies.map(
-                lambda node_adjacency: (node_adjacency[0], 
-                                        self.attach_neighbour_i(node_adjacency[1])))
-            
-            def get_child_parent_rels(node_adjacency):
-                # Filter to include only edges to parents.
-                # node_adjacency e.g., (child, Bag([(b, w, i), (c, w, i), ...]))
-                neighbour_bag = node_adjacency[1]
-                parents = neighbour_bag.filter(
-                    lambda tup: state[tup[2]] == "P")
-                parents = parents.map(lambda tup: (tup[0], tup[1])) # Remove i
-                return (child, parents)
-            
-            child_parent_rels = child_adjacencies.map(
-                lambda node_adjacency: get_child_parent_rels(node_adjacency))
-            
-            def dump_child_parent_data(child_parent_rel):
-                """ Write to child-parent data to minimise data held in RAM """
-                global ROOT_DIR
-                outfile = os.path.join(ROOT_DIR, "temp", "child_parent_rel.csv")                
-                with cpr_lock:
-                    child, parents = child_parent_rel[0], child_parent_rel[1].compute()
-                    with open(outfile, 'a') as file:
-                        for parent_info in parents:
-                            parent, num_synapses = parent_info[0], parent_info[1]
-                            file.write(f"{child},{parent},{num_synapses}\n")
-                    del child, parents # Free RAM immediately
-
-            # Use a lock to avoid computing child_parent_rels and minimise RAM.
-            # Parallel writing to file is dodgy so am doing it iteratively.
-            cpr_lock = Lock()
-            done = child_parent_rels.map(dump_child_parent_data, cpr_lock)
+        self.record_parentage(adjacencies, state, nodes, all_children)
         
         # Mark this layer's nodes as processed
         processed = adjacencies.map( # Get this layer's node's indices
