@@ -28,6 +28,8 @@ def report_test_result(outfile, test, time1, max_mem, comp_time, comp_max_mem):
 
 class TestDfToAdjacencyBag(unittest.TestCase):
     
+    OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test-df-to-adjacency-bag.txt")
+    
     def sort(self, result):
         very_sorted_result = []
         for adjacency in sorted(result):
@@ -90,8 +92,19 @@ class TestDfToAdjacencyBag(unittest.TestCase):
                     (17, [(16, 1), (18, 1)]),
                     (18, [(17, 1), (19, 2)]),
                     (19, [(18, 2)])]
+        
+        # Time test while it runs
+        start_time = time()
         result = self.sort(run.df_to_adjacency_bag(df).compute())
-        self.assertEqual(result, expected)
+        time1 = time() - start_time
+        self.assertEqual(result, expected) # Check test passes
+        
+        # Get max memory usage
+        max_mem = max(memory_usage((run.df_to_adjacency_bag, (df,))))
+        report_test_result(TestDfToAdjacencyBag.OUTFILE, 
+                           "test_case_3_undirect_2_components",
+                           time1, max_mem, None, None)
+
 
 
 @unittest.skip("OBSOLETE - bfs_components no longer takes dataframes")

@@ -1,0 +1,1 @@
+2026-05-08 16:56:43 - test_case_3_undirect_2_components - 1.1533246040344238 - 157.18359375 - None - None
