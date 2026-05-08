@@ -54,7 +54,7 @@ TEMP_CPR_CSV = os.path.join(ROOT_DIR, "temp", "child_parent_rel.csv")
 
 ### CLUSTER IDENTIFICATION - HELPER FUNCTIONS -----------------------------
 
-def df_to_adjacency_bag(df, undirected=True):
+def df_to_adjacency_bag(df, undirect=True):
     """ Convert dataframe edges into adjacency list/bag of edges with weights.
     
     Return an adjacency list for the dataframe as a dask bag of the form
@@ -66,9 +66,13 @@ def df_to_adjacency_bag(df, undirected=True):
     
     Weight represents the number of synpases between two neurons a and b.
     
+    For the DATA301 project, only the undirected version is required, but I
+    have included the option for directed should I choose to extend the 
+    project (I have not tested with the directed version).
+    
     """
     edge_bag = df[["pre", "post", "syn_count"]].to_bag()
-    if undirected: # Add (b,a,w) for every (a,b,w)
+    if undirect: # Add (b,a,w) for every (a,b,w)
         edge_bag = edge_bag.map(lambda edge: [edge, (edge[1], edge[0], edge[2])])
         edge_bag = edge_bag.flatten().distinct()
     
@@ -207,7 +211,7 @@ class Layer():
         
 
 
-def pbfs_search(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
+def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
     """ Return parents dask bag and a set of leaves. 
     
     The numpy arrays nodes and state will be automatically computed from the
@@ -343,7 +347,7 @@ def get_component_adjacency_bags(df: ddf.DataFrame, undirected=True):
             node = nodes[node_index]            
             state[node_index] = "D"
             
-            pbfs_search(node, big_adjacency_bag, nodes, state)
+            pbfs(node, big_adjacency_bag, nodes, state)
             
             # Add new component
             diff_indices = np.where(state != prev_state)[0]

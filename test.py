@@ -26,7 +26,77 @@ def report_test_result(outfile, test, time1, max_mem, comp_time, comp_max_mem):
 
 ### UNIT TESTS ------------------------------------------------------------
 
+class TestDfToAdjacencyBag(unittest.TestCase):
+    
+    def sort(self, result):
+        very_sorted_result = []
+        for adjacency in sorted(result):
+            # Sort the lists in the tuples
+            very_sorted_result.append(sorted(adjacency[1]))
+        return very_sorted_result
+        
+    def test_case_1_undirect(self):
+        d = {"pre": [0,0,1,5,3,3],
+             "post": [1,5,2,4,2,4],
+             "syn_count": [2,4,6,7,3,8],
+             "misc": [1,2,3,4,5,6]}
+        df = ddf.from_pandas(pd.DataFrame(data=d))
+        expected = [(0, [(1, 2), (5, 4)]),
+                    (1, [(0, 2), (2, 6)]),
+                    (2, [(1, 6), (3, 3)]),
+                    (3, [(2, 3), (4, 8)]),
+                    (4, [(3, 8), (5, 7)]),
+                    (5, [(0, 4), (4, 7)])]
+        result = self.sort(run.df_to_adjacency_bag(df).compute())
+        self.assertEqual(result, expected)
+    
+    def test_case_2_undirect(self):
+        d = {"pre": [11,12,13,14,15,16,17,18],
+             "post": [12,13,14,15,16,17,18,19],
+             "syn_count": [2,3,1,3,2,1,1,2],
+             "misc": [7,8,9,10,11,12,13,14]}
+        df = ddf.from_pandas(pd.DataFrame(data=d))
+        expected = [(11, [(12, 2)]),
+                    (12, [(11, 2), (13, 3)]),
+                    (13, [(12, 3), (14, 1)]),
+                    (14, [(13, 1), (15, 3)]),
+                    (15, [(14, 3), (16, 2)]),
+                    (16, [(15, 2), (17, 1)]),
+                    (17, [(16, 1), (18, 1)]),
+                    (18, [(17, 1), (19, 2)]),
+                    (19, [(18, 2)])]
+        result = self.sort(run.df_to_adjacency_bag(df).compute())
+        self.assertEqual(result, expected)        
+        
+    def test_case_3_undirect_2_components(self):
+        """ Combines test case 2 and 1 """
+        d = {"pre": [0,0,1,5,3,3,11,12,13,14,15,16,17,18],
+             "post": [1,5,2,4,2,4,12,13,14,15,16,17,18,19],
+             "syn_count": [2,4,6,7,3,8,2,3,1,3,2,1,1,2],
+             "misc": [1,2,3,4,5,6,7,8,9,10,11,12,13,14]}      
+        df = ddf.from_pandas(pd.DataFrame(data=d))       
+        expected = [(0, [(1, 2), (5, 4)]),
+                    (1, [(0, 2), (2, 6)]),
+                    (2, [(1, 6), (3, 3)]),
+                    (3, [(2, 3), (4, 8)]),
+                    (4, [(3, 8), (5, 7)]),
+                    (5, [(0, 4), (4, 7)]),
+                    (11, [(12, 2)]),
+                    (12, [(11, 2), (13, 3)]),
+                    (13, [(12, 3), (14, 1)]),
+                    (14, [(13, 1), (15, 3)]),
+                    (15, [(14, 3), (16, 2)]),
+                    (16, [(15, 2), (17, 1)]),
+                    (17, [(16, 1), (18, 1)]),
+                    (18, [(17, 1), (19, 2)]),
+                    (19, [(18, 2)])]
+        result = self.sort(run.df_to_adjacency_bag(df).compute())
+        self.assertEqual(result, expected)
+
+
+@unittest.skip("OBSOLETE - bfs_components no longer takes dataframes")
 class TestPrune(unittest.TestCase):
+    """ OBSOLETE - bfs_components no longer takes dataframes """    
     
     OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test-prune.txt")
     
@@ -188,8 +258,9 @@ class TestPrune(unittest.TestCase):
 class TestGetUpperThreshold(unittest.TestCase):
     pass
 
-
+@unittest.skip("OBSOLETE - bfs_components no longer takes dataframes")
 class TestBfsComponents(unittest.TestCase):
+    """ OBSOLETE - bfs_components no longer takes dataframes """
     
     OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test-bfs-components.txt")
     
