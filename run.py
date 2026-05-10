@@ -305,40 +305,32 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
     edges to one and only one other node. No nodes in the dataset will have 
     edges to themselves. Synapse count and directionality are not considered.
     
+    Adjacency bag format:
+            db.from_sequence([(a, [(b, 3)]), (b: [(a, 3)])])
+
     """
-    deg1_nodes = adjacency_bag.filter( # Get degree 1 nodes (deg 0 not present)
-        lambda node_adj: len(node_adj[1] == 1)).map(lambda tup: tup[0]).compute()
+    deg1_node_adjs = adjacency_bag.filter( # Get degree 1 nodes (deg 0 not present)
+        lambda node_adj: len(node_adj[1] == 1))
     
-    # Queue all degree 1 nodes
-    # This is a bit hacky (using private vars) but avoids a for loop
-    # Idea from https://www.py4u.org/blog/python-putting-list-items-in-a-queue/#3-better-code-practices-for-optimization
-    deg1_queue = Queue()        
-    with deg1_queue.mutex: # with queue lock
-        deg1_queue.queue.extend(deg1_nodes) # Add all nodes at once
+    def cut_deg1_edge(node_adj, should_cut: bool):
+        """ Change node adjacency list to empty list if should cut. 
+        This effectively makes the node a degree 0 node. """
+        if should_cut:
+            node_adj = (node_adj[0], [])
+        return node_adj
+    
+    while deg1_node_adjs.count().compute() > 0:
+        deg1_nodes = deg1_node_adjs.map(
+            lambda node_adj: node_adj[1][0][0]).compute()
+        neighbours = deg1_nodes_adj.map(
+            lambda node_adjacency: node_adjacency[1][0][0])
         
-    # Iteratively prune away degree 1 nodes
-    while not deg1_queue.empty():
-        deg1_node = deg1_queue.get()
-        deg1_node_in_tree = len(list(
-            filter(lambda tup: tup[0] == deg1_node, grouped_edges))) == 1
-        if not deg1_node_in_tree: continue
-        neighbour = list(map(lambda tup: tup[1], 
-                             filter(lambda tup: tup[0] == deg1_node, grouped_edges)))[0][0]
+        # Remove edge from deg1 node to neighbour
+        adjacency_bag = adjacency_bag.map(
+            lambda node_adj: cut_deg1_edge(node_adj, node_adj[0] in deg1_nodes))
+        # Remove edge from neighbour to deg1 node
         
-        # Remove deg1 node from neighbour's connections 
-        # (i.e.,remove neighbour -> deg1 edge)
-        neighbour_neighbours = list(map(lambda tup: tup[1], 
-                                        filter(lambda tup: tup[0] == neighbour, grouped_edges)))[0]
-        neighbour_neighbours.remove(deg1_node)
-        # If neighbour is now deg1, add neighbour to deg1 queue
-        if len(neighbour_neighbours) == 1:
-            deg1_queue.put(neighbour)
-            
-        # Remove deg1 node key from dict (remove deg1 -> neighbour edge)
-        deg1_tuple = list(filter(lambda tup: tup[0] == deg1_node, grouped_edges))[0]
-        grouped_edges.remove(deg1_tuple)
-                
-    return grouped_edge_tuples_to_df(grouped_edges, df)
+
 
 
 ### CLUSTER IDENTIFICATION - BFS TREE -------------------------------------
