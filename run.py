@@ -389,7 +389,7 @@ def get_component_adjacency_bags(df: ddf.DataFrame, undirected=True):
                 lambda node_adjacency: node_adjacency[0] in component_nodes)
             components = components + [component_adj.persist()]
             print(f"Component appended: {component_adj}")
-            print(f"Components: {components.compute()}")
+            print(f"Components: {components}")
     
     print("Finishing get_component_adjacency_bags")
     return db.from_sequence(components)
