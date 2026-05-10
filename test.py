@@ -477,13 +477,19 @@ class TestGirvanNewman(unittest.TestCase):
         Bag([((pre, post), edge_score), ...])
     where there is an edge from pre to post with score = edge_score.
     
+    This integration test relies on run.get_upper_threshold which is tested
+    elsewhere.
+    
     """
     
     def test_case_1(self):
         """ 6-node cycle with no bridges - similar edge scores for each edge """
         before = run.df_to_adjacency_bag(get_six_node_cycle_dask_df())
         edge_scores = run.girvan_newman(before).compute()
-        
+        upper_thresh = run.get_upper_threshold(edge_scores, 2.5)
+        scores = map(lambda tup: tup[1], edge_scores)
+        exceeds_thresh = list(map(lambda score: score > upper_thresh, scores))
+        self.assertFalse(any(exceeds_thresh))
       
         
 
