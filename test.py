@@ -156,74 +156,83 @@ class TestPrune(unittest.TestCase):
         
     def test_single_incoming_deg1_edge(self):
         d_b = {"pre": [0,1,3,3,5,0,6], "post": [1,2,2,4,4,5,0],
-               "syn_count": [2,4,6,7,3,8,21], "misc": [1,2,3,4,5,6,7]}
+               "syn_count": [2,6,3,8,7,4,21], "misc": [1,2,3,4,5,6,7]}
         before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
-        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
-        result = run.prune(before).compute()
+        expected = process_computed_adjacency_bag(
+            run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute())
+        result = process_computed_adjacency_bag(run.prune(before).compute())
         self.assertEqual(result, expected)
         
     def test_single_outgoing_deg1_edge(self):
         d_b = {"pre": [0,1,3,3,5,0,0], "post": [1,2,2,4,4,5,6],
-               "syn_count": [2,4,6,7,3,8,21], "misc": [1,2,3,4,5,6,7]}
+               "syn_count": [2,6,3,8,7,4,21], "misc": [1,2,3,4,5,6,7]}
         before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
-        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
-        result = run.prune(before).compute()
+        expected = process_computed_adjacency_bag(
+            run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute())
+        result = process_computed_adjacency_bag(run.prune(before).compute())
         self.assertEqual(result, expected)
         
     def test_two_deg1_edges_both_incoming(self):
         d_b = {"pre": [0,1,3,3,5,0,6,7], "post": [1,2,2,4,4,5,0,4],
-               "syn_count": [2,4,6,7,3,8,21,21], "misc": [1,2,3,4,5,6,7,8]}        
+               "syn_count": [2,6,3,8,7,4,21,21], "misc": [1,2,3,4,5,6,7,8]}
         before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
-        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
-        result = run.prune(before).compute()
+        expected = process_computed_adjacency_bag(
+            run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute())
+        result = process_computed_adjacency_bag(run.prune(before).compute())
         self.assertEqual(result, expected)
     
     def test_two_deg1_edges_both_outgoing(self):
         d_b = {"pre": [0,1,3,3,5,0,0,4], "post": [1,2,2,4,4,5,6,7],
-               "syn_count": [2,4,6,7,3,8,21,21], "misc": [1,2,3,4,5,6,7,8]}        
+               "syn_count": [2,6,3,8,7,4,21,21], "misc": [1,2,3,4,5,6,7,8]}
         before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
-        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
-        result = run.prune(before).compute()
+        expected = process_computed_adjacency_bag(
+            run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute())
+        result = process_computed_adjacency_bag(run.prune(before).compute())
         self.assertEqual(result, expected)
     
     def test_two_deg1_edges_one_in_one_out(self):
         d_b = {"pre": [0,1,3,3,5,0,6,4], "post": [1,2,2,4,4,5,0,7],
-               "syn_count": [2,4,6,7,3,8,21,21], "misc": [1,2,3,4,5,6,7,8]}        
+               "syn_count": [2,6,3,8,7,4,21,21], "misc": [1,2,3,4,5,6,7,8]}
         before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
-        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
-        result = run.prune(before).compute()
+        expected = process_computed_adjacency_bag(
+            run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute())
+        result = process_computed_adjacency_bag(run.prune(before).compute())
         self.assertEqual(result, expected)
     
     def test_two_deg1_edges_one_out_one_in(self):
         d_b = {"pre": [0,1,3,3,5,0,0,7], "post": [1,2,2,4,4,5,6,4],
-               "syn_count": [2,4,6,7,3,8,21,21], "misc": [1,2,3,4,5,6,7,8]}        
+               "syn_count": [2,6,3,8,7,4,21,21], "misc": [1,2,3,4,5,6,7,8]}
         before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
-        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
-        result = run.prune(before).compute()
+        expected = process_computed_adjacency_bag(
+            run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute())
+        result = process_computed_adjacency_bag(run.prune(before).compute())
         self.assertEqual(result, expected)
         
     def test_two_deg1_edges_both_incoming_2(self):
         d_b = {"pre": [0,1,3,3,5,0,6,7], "post": [1,2,2,4,4,5,0,0],
-               "syn_count": [2,4,6,7,3,8,21,21], "misc": [1,2,3,4,5,6,7,8]}
+               "syn_count": [2,6,3,8,7,4,21,21], "misc": [1,2,3,4,5,6,7,8]}
         before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
-        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
-        result = run.prune(before).compute()
+        expected = process_computed_adjacency_bag(
+            run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute())
+        result = process_computed_adjacency_bag(run.prune(before).compute())
         self.assertEqual(result, expected)
     
     def test_two_deg1_edges_both_outgoing_2(self):
         d_b = {"pre": [0,1,3,3,5,0,0,0], "post": [1,2,2,4,4,5,6,7],
-               "syn_count": [2,4,6,7,3,8,21,21], "misc": [1,2,3,4,5,6,7,8]}
+               "syn_count": [2,6,3,8,7,4,21,21], "misc": [1,2,3,4,5,6,7,8]}
         before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
-        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
-        result = run.prune(before).compute()
+        expected = process_computed_adjacency_bag(
+            run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute())
+        result = process_computed_adjacency_bag(run.prune(before).compute())
         self.assertEqual(result, expected)
     
     def test_two_deg1_edges_one_in_one_out_2(self):
         d_b = {"pre": [0,1,3,3,5,0,0,7], "post": [1,2,2,4,4,5,6,0],
-               "syn_count": [2,4,6,7,3,8,21,21], "misc": [1,2,3,4,5,6,7,8]}
+               "syn_count": [2,6,3,8,7,4,21,21], "misc": [1,2,3,4,5,6,7,8]}
         before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
-        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
-        result = run.prune(before).compute()
+        expected = process_computed_adjacency_bag(
+            run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute())
+        result = process_computed_adjacency_bag(run.prune(before).compute())
         self.assertEqual(result, expected)
     
     def test_two_deg1_edges_one_out_one_in_2(self):
@@ -240,16 +249,17 @@ class TestPrune(unittest.TestCase):
                        15,15,17,18,18,20,4,21,22,24,25], 
                "post": [1,2,2,4,4,5,6,7,8,8,10,11,12,1,2,
                         3,16,16,4,19,19,21,22,23,23,24],
-               "syn_count": [2,4,6,7,3,8,21,38,1,69,78,254,3,1,18,
+               "syn_count": [2,6,3,8,7,4,21,38,1,69,78,254,3,1,18,
                              2,5,3,23,21,1,2,21532,2,35,10], 
                "misc": [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
                         16,17,18,19,20,21,22,23,24,25,26]}
         before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
-        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()      
+        expected = process_computed_adjacency_bag(
+            run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute())  
 
         # Get time to run
         start_time = time()
-        result_before_compute = run.prune(before).compute()
+        result = process_computed_adjacency_bag(run.prune(before).compute())
         time1 = time() - start_time
         
         # Check test passed

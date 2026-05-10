@@ -403,7 +403,6 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
         adjacency_bag = adjacency_bag.map(
             lambda node_adj: remove_deg_1_nodes(node_adj, deg1_nodes)).persist()
     
-    print(adjacency_bag.compute())
     return adjacency_bag
 
 
