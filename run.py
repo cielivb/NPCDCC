@@ -386,11 +386,11 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
     to process the longest 'chain'.
 
     """
-    while True:
-        deg1_node_adjs = adjacency_bag.filter(
-            lambda node_adj: len(node_adj[1]) == 1)
-        deg1_nodes = deg1_node_adjs.map(
+    deg1_nodes = adjacency_bag.filter(
+        lambda node_adj: len(node_adj[1]) == 1).map(
             lambda node_adj: node_adj[0]).compute()
+    
+    while True:
         if len(deg1_nodes) == 0:
             break
         
@@ -468,7 +468,8 @@ def get_edge_scores(start_node, component):
 
 
 def girvan_newman(component):
-    """ Set up and do the edge-score calculation phase of Girvan-Newman """
+    """ Set up and do the edge-score calculation phase of Girvan-Newman on a 
+    single component """
     # Map random subset of nodes to get_edge_scores.
     # For now, using sample size = quarter the number of nodes in the df.
     component_nodes = get_all_nodes(component).compute()
@@ -496,12 +497,20 @@ def girvan_newman(component):
 
 ### CLUSTER IDENTIFICATION - DECOMPOSITION --------------------------------
 
-def get_upper_threshold(edge_scores):
+def get_upper_threshold(edge_scores, k):
     """ Calculate MAD-based upper threshold.
     edge_scores of form Bag([((pre, post), edge_score), ...])
     """
     global MAD_K
-    pass # TODO
+    if not k:
+        k = MAD_K
+    scores = np.array(edge_scores.map(lambda tup: tup[1]).compute())
+    median_score = np.median(scores)
+    print(f"median score = {median_score}")
+    mad = np.median(np.absolute(scores - median_score))
+    print(f"mad = {mad}")
+    upper_threshold = median_score + k * mad
+    return upper_threshold
 
 
 def chop(component, edge_scores, upper_threshold):

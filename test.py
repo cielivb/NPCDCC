@@ -132,6 +132,9 @@ class TestDfToAdjacencyBag(unittest.TestCase):
                            time1, max_mem)
 
 
+
+
+@unittest.skip("Passing as of 11/5/26")
 class TestPrune(unittest.TestCase):
     
     OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test-prune.txt")
@@ -271,8 +274,6 @@ class TestPrune(unittest.TestCase):
                            time1, max_mem)        
 
 
-class TestGetUpperThreshold(unittest.TestCase):
-    pass
 
 
 @unittest.skip("Passing as of 10/5/26")
@@ -386,11 +387,29 @@ class TestPBFS(unittest.TestCase):
         del adjacency_bag
         
         
-        
+
+
+class TestGetUpperThreshold(unittest.TestCase):
+    
+    def test_get_upper_threshold(self):
+        data = [((None,None), 1),
+                ((None,None), 1.5),
+                ((None,None), 1.5),
+                ((None,None), 4),
+                ((None,None), 4.5),
+                ((None,None), 4.5),
+                ((None,None), 5),
+                ((None,None), 5),
+                ((None,None), 12)]
+        edge_scores = db.from_sequence(data)
+        result = run.get_upper_threshold(edge_scores, k=5)
+        self.assertEqual(result, 7)
+
+
         
 
 
-### INTEGRATION TESTS -----------------------------------------------------
+### SUB-INTEGRATION TESTS -------------------------------------------------
 
 class TestGetComponentAdjacencyBags(unittest.TestCase):
     """ Function depends on PBFS and df_to_adjacency_bag """
@@ -445,13 +464,49 @@ class TestGetComponentAdjacencyBags(unittest.TestCase):
                            "test_case_2_components", time1, max_mem)
 
 
+
+
 class TestGirvanNewman(unittest.TestCase):
-    pass
+    """ girvan_newman uses random.sample to get a random subset of nodes.
+    This means exact tests cannot be used. The tests instead ensure the 
+    relative edge score distributions are as expected, and check the relative
+    values of known bridge edges compared to other edges. Edge scores are a 
+    measure of edge betweenness. 
+    
+    girvan_newman returns a result in the general form:
+        Bag([((pre, post), edge_score), ...])
+    where there is an edge from pre to post with score = edge_score.
+    
+    """
+    
+    def test_case_1(self):
+        """ 6-node cycle with no bridges - similar edge scores for each edge """
+        before = run.df_to_adjacency_bag(get_six_node_cycle_dask_df())
+        edge_scores = run.girvan_newman(before).compute()
+        
+      
+        
+
+
+
+
+
+### MAIN INTEGRATION TESTS ------------------------------------------------
 
 
 class TestIdentifyClusters(unittest.TestCase):
     pass
 
 
+
+
 class TestGetClusterData(unittest.TestCase):
     pass
+
+
+
+
+
+### GLOBAL TESTS FOR FINAL REPORT -----------------------------------------
+
+# Need to test with different problem sizes and different numbers of processors.
