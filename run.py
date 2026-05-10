@@ -297,7 +297,7 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
 
 ### CLUSTER IDENTIFICATION - PRUNE ----------------------------------------
 
-def prune(df: ddf.DataFrame) -> ddf.DataFrame:
+def prune(adjacency_bag: db.Bag) -> db.Bag:
     """ Iteratively remove degree 1 edges from a dask dataframe 
     
     A degree 1 edge is defined here as an edge associated with at least one
@@ -306,9 +306,8 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
     edges to themselves. Synapse count and directionality are not considered.
     
     """
-    grouped_edges = edge_df_to_tuple(df)
-    deg1_nodes = list(map(lambda tup: tup[0], 
-                          filter(lambda tup: len(tup[1]) == 1, grouped_edges)))
+    deg1_nodes = adjacency_bag.filter( # Get degree 1 nodes (deg 0 not present)
+        lambda node_adj: len(node_adj[1] == 1)).map(lambda tup: tup[0]).compute()
     
     # Queue all degree 1 nodes
     # This is a bit hacky (using private vars) but avoids a for loop
@@ -317,7 +316,7 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
     with deg1_queue.mutex: # with queue lock
         deg1_queue.queue.extend(deg1_nodes) # Add all nodes at once
         
-    # Iteratively prune away degree 1 nodes from edge_bag_dict
+    # Iteratively prune away degree 1 nodes
     while not deg1_queue.empty():
         deg1_node = deg1_queue.get()
         deg1_node_in_tree = len(list(
