@@ -425,7 +425,7 @@ def calculate_edge_scores(start_node, child_parent_rels, num_shortest_paths,
     
     """
     to_score = leaves
-    edge_scores = []
+    edge_scores = db.from_sequence([])
     
     def credit(node):
         """ Rule 1: leaves get credit = 1. Rule 2: other nodes get credit = 1 + 
@@ -439,21 +439,23 @@ def calculate_edge_scores(start_node, child_parent_rels, num_shortest_paths,
         """ Rule 3: A DAG edge e entering node Z from the level above is given a
         share of the credit of Z proportional to the fraction of shortest
         paths from the root to Z that go through e.
-        Returns the node's parents.
         """
         node, credit = node_w_credit
         parents = db.from_sequence(all_child_parent_rels[node])
         total_num_shortest_paths_to_parents = parents.map(
             lambda parent: num_shortest_paths[parent])
-        edge_credits = parents.map(
+        node_edge_scores = parents.map(
             lambda parent: ((parent, node), 
                             credit * num_shortest_paths[parent] / 
                             total_num_shortest_paths_to_parents))
-        return edge_credits
+        return node_edge_scores
         
     while to_score.count().compute() > 0:
         nodes_w_credits = to_score.map(credit)
-        to_score = process_nodes.map(nodes_w_credits).flatten()
+        new_edge_scores = process_nodes.map(nodes_w_credits).flatten()
+        edge_scores = db.concat([edge_scores, new_edge_scores])
+        to_score = nodes_w_credits.map( # to_score = parents
+            lambda node_w_c: all_child_parent_rels[node_w_c[0]]).flatten()
         
     return edge_scores
 
@@ -462,7 +464,8 @@ def get_edge_scores(start_node, component):
     """ Return dict of Girvan Newman edge scores starting at start_node.
     df should only contain pre, post, and syn_count cols """
     child_parent_rels, state, leaves, num_shortest_paths = pbfs(start_node, component)
-    edge_scores = calculate_edge_scores(start_node, child_parent_rels, num_shortest_paths, leaves, component)
+    edge_scores = calculate_edge_scores(start_node, child_parent_rels, 
+                                        num_shortest_paths, leaves, component)
     return edge_scores
 
 
@@ -473,27 +476,21 @@ def girvan_newman(component):
     component_nodes = get_all_nodes(component).compute()
     random_nodes = db.from_sequence(
         random.sample(component_nodes, len(component_nodes)/4))
-    score_dicts = random_nodes.map(get_edge_scores, component)
     
-    # Sum edge scores
-    #def score_dict_to_tuples(score_dict):
-        #""" Score dict contains edge scores for each edge """
-        #score_tuples = []
-        #for edge, score in score_dict.items():
-            #score_tuples.append((edge, score))
-        #return db.from_sequence(score_tuples)
-    #score_tuples = score_dicts.map(score_dict_to_tuples).flatten()
-    #scores = score_tuples.foldby(
-        #key = lambda edge_score: edge_score[0],
-        #binop = lambda accum, edge_score: accum + edge_score[1],
-        #initial = 0,
-        #combine = lambda accum1, accum2: accum1 + accum2,
-        #combine_initial = 0
-    #)
+    # Bag([((pre, post), edge_score), ...])    
+    all_edge_scores = random_nodes.map(get_edge_scores, component).flatten()
     
-    # Used sample size = quarter # nodes in df -> factor = 0.5
-    factor = 0.5
-    standardised_scores = scores.map(lambda edge_score: (edge_score[0], edge_score[1]/factor))
+    # Sum edge scores and divide by factor
+    factor = 0.5 # Used sample size = quarter # nodes in df -> factor = 0.5
+    scores = all_edge_scores.foldby(
+        key = lambda edge_score: edge_score[0],
+        binop = lambda accum, edge_score: accum + edge_score[1],
+        initial = 0,
+        combine = lambda accum1, accum2: accum1 + accum2,
+        combine_initial = 0
+    )
+    standardised_scores = scores.map(
+        lambda edge_score: (edge_score[0], edge_score[1]/factor))
     return standardised_scores
 
 
