@@ -92,8 +92,8 @@ def df_to_adjacency_bag(df, undirect=True):
     # where all the pre values within an entry are equal. Edges are currently
     # represented by indices.
     grouped_as_bag = grouped.to_bag()
-    adjacency_bag = grouped_as_bag.map(
-        lambda entry: (entry[0][0], db.from_sequence((zip(entry[1], entry[2])))))
+    adjacency_bag = grouped_as_bag.map( # Possible memory issue here?
+        lambda entry: (entry[0][0], list(zip(entry[1], entry[2]))))
     return adjacency_bag.persist()
 
 
@@ -113,7 +113,6 @@ class Layer():
     
     
     def is_empty(self):
-        print(f"self.nodes = {self.nodes.compute()}")
         return self.nodes.count().compute() == 0
 
     
@@ -124,22 +123,14 @@ class Layer():
         If a node is a leaf, then none of its neighbours will be in all_children.
         """
         child_ids = all_children.compute()
-        simple_adjacencies = adjacencies.map( # Remove weight eg Bag([(a, [b,c]), ...])
+        no_weights = adjacencies.map(
             lambda node_adjacency: (node_adjacency[0], 
-                                    node_adjacency[1].map(lambda tup: tup[0])))
-        node_children = simple_adjacencies.map(
-            lambda node_adjacency: (node_adjacency[0], 
-                                    node_adjacency[1].filter(
-                                        lambda nnode: nnode in child_ids)))
-        num_children = node_children.map(
-            lambda node_adjacency: (node_adjacency[0], node_adjacency[1].count()))
-        leaf_nodes = num_children.filter(lambda node_count: node_count[1] == 0)
-        
-        #print(node_children.compute())
-        print(leaf_nodes.compute())
-        #print(leaves.compute())
-        leaves = db.concat([leaves, leaf_nodes])
-        return leaves
+                                    list(map(lambda tup: tup[0], node_adjacency[1]))))
+        leaf_nodes = no_weights.filter(
+            lambda node_adjacency: len(list(filter(
+                lambda node: node in child_ids, node_adjacency[1]))) == 0)
+        leaf_nodes = leaf_nodes.map(lambda tup: tup[0])
+        return leaf_nodes
            
         
     def attach_neighbour_i(self, neighbour_bag, nodes):
@@ -161,9 +152,10 @@ class Layer():
         child_adjacencies = adjacency_bag.filter(
             lambda node_adjacency: node_adjacency[0] in child_ids)
         child_parent_rels = child_adjacencies.map(
-            lambda node_adjacency: (node_adjacency[0], 
-                                    node_adjacency[1].filter(
-                                        lambda tup: tup[0] in parent_ids)))
+            lambda node_adjacency: (
+                node_adjacency[0], 
+                filter(lambda tup: tup[0] in parent_ids, node_adjacency[1])
+            ))
         return child_parent_rels
         
     
@@ -179,8 +171,10 @@ class Layer():
         """
         global CLIENT
         out_layer = Layer()
+        layer_nodes = self.nodes.compute()
+        
         adjacencies = adjacency_bag.filter( # Get adjacencies for this layer's nodes
-            lambda node_adjacency: node_adjacency[0] in self.nodes.compute()).persist()
+            lambda node_adjacency: node_adjacency[0] in layer_nodes).persist()
                 
         # Mark this layer's nodes as processed. The child-parent rel section
         # relies on parents being marked as P.
@@ -188,14 +182,12 @@ class Layer():
             lambda node_adjacency: node_to_i[node_adjacency[0]]).compute()
         state[processed_is] = "P"        
 
-        # Discover undiscovered children and add them to next layer out_layer
-        children_bags = adjacencies.map(lambda tup: tup[1]).compute()
-        all_children = db.concat(children_bags).map(
-            lambda tup: tup[0]).distinct().filter(
-                lambda node_id: state[node_to_i[node_id]] != "P").persist()
-        
-        leaves = self.update_leaves(adjacencies, leaves, state, node_to_i, all_children).persist()
-        
+        # Get the children nodes of this layer
+        all_children = adjacencies.map(
+            lambda tup: tup[1]).flatten().map(
+                lambda tup: tup[0]).distinct().filter(
+                    lambda node_id: state[node_to_i[node_id]] != "P").persist()
+        # Discover child nodes and compute child-parent relationships
         if all_children.count().compute() > 0:
             out_layer.insert(all_children)
             undiscovered_is = all_children.map(
@@ -205,9 +197,12 @@ class Layer():
                 adjacency_bag, adjacencies, state, node_to_i, all_children)
             all_child_parent_rels = db.concat([all_child_parent_rels, child_parent_rels]).persist()
         
+        # Compute leaf nodes (those with no child nodes)
+        leaf_nodes = self.update_leaves(adjacencies, leaves, state, node_to_i, all_children)
+        leaves = db.concat([leaves, leaf_nodes]).persist()
+        
         # Free memory
-        CLIENT.cancel([adjacencies, self.nodes])
-        print(f"out_layer nodes = {out_layer.nodes.compute()}")
+        #CLIENT.cancel([adjacencies, self.nodes])
         return (out_layer, leaves, all_child_parent_rels)
         
 
@@ -245,11 +240,11 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
             lambda node_adjacency: node_adjacency[0]).compute())
     leaves, n = db.from_sequence([]), len(nodes)
     if not type(state) is np.array:
-        state = np.full(n, "U", dtype="<U1")        
-    start_node_index = np.where(nodes == start_node)[0][0]
+        state = np.full(n, "U", dtype="<U1")
+    node_to_i = {node: i for i, node in enumerate(nodes)}        
+    start_node_index = node_to_i[start_node]
     state[start_node_index] = "D"
-    node_to_i = {node: i for i, node in enumerate(nodes)}
-    all_child_parent_rels = db.from_sequence([(start_node, db.from_sequence([]))])
+    all_child_parent_rels = db.from_sequence([(start_node, [])])
     layer_0 = Layer()
     start_node_as_bag = db.from_sequence([start_node])
     layer_0.insert(start_node_as_bag)

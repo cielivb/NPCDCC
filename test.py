@@ -61,7 +61,7 @@ def report_test_result(outfile, test, time1, max_mem, comp_time, comp_max_mem):
 
 ### UNIT TESTS ------------------------------------------------------------
 
-@unittest.skip("Passing as of 8/5/26")
+#@unittest.skip("Passing as of 8/5/26")
 class TestDfToAdjacencyBag(unittest.TestCase):
     
     OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test-df-to-adjacency-bag.txt")
@@ -389,7 +389,6 @@ class TestPBFS(unittest.TestCase):
         
         parents_bag, state, leaves = run.pbfs(start_node, adjacency_bag)
         leaves = leaves.compute()
-        print(leaves)
         
         parent_adj = process_computed_adjacency_bag(parents_bag.compute())
         self.assertEqual(parent_adj, exp_parent_adj)
@@ -410,10 +409,11 @@ class TestPBFS(unittest.TestCase):
         exp_parent_adj = process_computed_adjacency_bag(exp_parent_adj)
         
         parents_bag, state, leaves = run.pbfs(start_node, adjacency_bag)
+        leaves = leaves.compute()
         
         parent_adj = process_computed_adjacency_bag(parents_bag.compute())
         self.assertEqual(parent_adj, exp_parent_adj)
-        self.assertEqual(state, exp_state)
+        assert (state == exp_state).all()
         self.assertTrue(len(leaves) == 2)
         self.assertTrue(exp_leaves == set(leaves))
         del adjacency_bag
@@ -432,10 +432,11 @@ class TestPBFS(unittest.TestCase):
         exp_parent_adj = process_computed_adjacency_bag(exp_parent_adj)
         
         parents_bag, state, leaves = run.pbfs(start_node, adjacency_bag)
+        leaves = leaves.compute()
         
         parent_adj = process_computed_adjacency_bag(parents_bag.compute())
         self.assertEqual(parent_adj, exp_parent_adj)
-        self.assertEqual(state, exp_state)
+        assert (state == exp_state).all()
         self.assertTrue(len(leaves) == 6)
         self.assertTrue(exp_leaves == set(leaves))
         del adjacency_bag
@@ -458,6 +459,7 @@ class TestPBFS(unittest.TestCase):
         start_time = time()
         parents_bag, state, leaves = run.pbfs(start_node, adjacency_bag)
         time1 = time() - start_time
+        leaves = leaves.compute()
         
         # Do assertions
         parent_adj = process_computed_adjacency_bag(parents_bag.compute())

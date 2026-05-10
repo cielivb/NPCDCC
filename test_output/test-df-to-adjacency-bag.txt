@@ -7,3 +7,7 @@
 2026-05-08 18:19:40 - test_case_3_undirect_2_components - 1.185732126235962 - 158.15234375 - None - None
 2026-05-08 21:03:17 - test_case_3_undirect_2_components - 5.233691215515137 - 157.6484375 - None - None
 2026-05-08 21:22:43 - test_case_3_undirect_2_components - 5.838480234146118 - 158.0 - None - None
+2026-05-10 13:16:55 - test_case_3_undirect_2_components - 1.5044450759887695 - 171.73046875 - None - None
+2026-05-10 13:17:25 - test_case_3_undirect_2_components - 2.686195135116577 - 172.86328125 - None - None
+2026-05-10 13:18:13 - test_case_3_undirect_2_components - 2.690807342529297 - 172.60546875 - None - None
+2026-05-10 13:25:42 - test_case_3_undirect_2_components - 2.6622602939605713 - 172.8046875 - None - None
