@@ -386,29 +386,24 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
     to process the longest 'chain'.
 
     """
-    deg1_node_adjs = adjacency_bag.filter( # Get degree 1 nodes (deg 0 not present)
-        lambda node_adj: len(node_adj[1]) == 1)
-    
-    while deg1_node_adjs.count().compute() > 0:
+    while True:
+        deg1_node_adjs = adjacency_bag.filter(
+            lambda node_adj: len(node_adj[1]) == 1)
         deg1_nodes = deg1_node_adjs.map(
-            lambda node_adj: node_adj[1][0][0]).compute()
+            lambda node_adj: node_adj[0]).compute()
+        if len(deg1_nodes) == 0:
+            break
         
         # Remove edge from deg1 node to neighbour
         adjacency_bag = adjacency_bag.map(
-            lambda node_adj: cut_deg1_edge(node_adj, node_adj[0] in deg1_nodes))
+            lambda node_adj: cut_deg1_edge(node_adj, node_adj[0] in deg1_nodes)).filter(
+                lambda node_adj: len(node_adj[1]) > 0).persist()
         
         # Remove edge from neighbours to deg1 nodes
-        neighbours = deg1_nodes_adj.map(
-            lambda node_adjacency: node_adjacency[1][0][0])        
         adjacency_bag = adjacency_bag.map(
-            lambda node_adj: remove_deg_1_nodes(node_adj, deg1_nodes))
-        
-        # Get fresh degree 1 nodes
-        deg1_node_adjs = adjacency_bag.filter( # Get degree 1 nodes (deg 0 not present)
-            lambda node_adj: len(node_adj[1] == 1))
-        deg1_nodes = deg1_node_adjs.map(
-            lambda node_adj: node_adj[1][0][0]).compute()
-        
+            lambda node_adj: remove_deg_1_nodes(node_adj, deg1_nodes)).persist()
+    
+    print(adjacency_bag.compute())
     return adjacency_bag
 
 

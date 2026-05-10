@@ -18,6 +18,7 @@ import run
 
 TEST_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "test_output")
 TIMESTAMP = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+NUM_CPUS_AVAIL = os.cpu_count()
 
 
 def get_six_node_cycle_dask_df():
@@ -57,9 +58,9 @@ def process_computed_adjacency_bag(result):
     return very_sorted_result
 
 
-def report_test_result(outfile, test, time1, max_mem, comp_time, comp_max_mem):
-    global TIMESTAMP
-    line = f"{TIMESTAMP} - {test} - {time1} - {max_mem} - {comp_time} - {comp_max_mem}\n"
+def report_test_result(outfile, test, time1, max_mem):
+    global TIMESTAMP, NUM_CPUS_AVAIL
+    line = f"{TIMESTAMP} - {NUM_CPUS_AVAIL} - {test} - {time1} - {max_mem}\n"
     with open(outfile, 'a') as file:
         file.write(line)
 
@@ -128,17 +129,15 @@ class TestDfToAdjacencyBag(unittest.TestCase):
         max_mem = max(memory_usage((run.df_to_adjacency_bag, (df,))))
         report_test_result(TestDfToAdjacencyBag.OUTFILE, 
                            "test_case_3_undirect_2_components",
-                           time1, max_mem, None, None)
+                           time1, max_mem)
 
 
 class TestPrune(unittest.TestCase):
-    """ OBSOLETE - bfs_components no longer takes dataframes """    
     
     OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test-prune.txt")
     
     def test_base_case(self):
         """ A graph with no degree 1 edges returns itself """
-        d = {"pre": [0,1,3,3,5,0], "post": [1,2,2,4,4,5]}
         before = run.df_to_adjacency_bag(get_six_node_cycle_dask_df())
         expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
         
@@ -153,136 +152,113 @@ class TestPrune(unittest.TestCase):
         # Get max memory usage
         max_mem = max(memory_usage((run.prune, (before,))))
         report_test_result(TestPrune.OUTFILE, "test_base_case", 
-                           time1, max_mem, None, None)
+                           time1, max_mem)
         
     def test_single_incoming_deg1_edge(self):
-        d_b = {"pre": [0,1,3,3,5,0,6], "post": [1,2,2,4,4,5,0]}
-        d_a = {"pre": [0,1,3,3,5,0], "post": [1,2,2,4,4,5]}        
-        df_before = ddf.from_pandas(pd.DataFrame(data=d_b))
-        df_after = pd.DataFrame(data=d_a).sort_values(by=["pre","post"])
-        df_after = df_after.reset_index(drop=True)
-        result = run.prune(df_before).compute()
-        result = result.sort_values(by=["pre","post"]).reset_index(drop=True)        
-        assert_frame_equal(result, df_after)
+        d_b = {"pre": [0,1,3,3,5,0,6], "post": [1,2,2,4,4,5,0],
+               "syn_count": [2,4,6,7,3,8,21], "misc": [1,2,3,4,5,6,7]}
+        before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
+        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
+        result = run.prune(before).compute()
+        self.assertEqual(result, expected)
         
     def test_single_outgoing_deg1_edge(self):
-        d_b = {"pre": [0,1,3,3,5,0,0], "post": [1,2,2,4,4,5,6]}
-        d_a = {"pre": [0,1,3,3,5,0], "post": [1,2,2,4,4,5]}        
-        df_before = ddf.from_pandas(pd.DataFrame(data=d_b))
-        df_after = pd.DataFrame(data=d_a).sort_values(by=["pre","post"])
-        df_after = df_after.reset_index(drop=True)        
-        result = run.prune(df_before).compute()
-        result = result.sort_values(by=["pre","post"]).reset_index(drop=True)        
-        assert_frame_equal(result, df_after)
+        d_b = {"pre": [0,1,3,3,5,0,0], "post": [1,2,2,4,4,5,6],
+               "syn_count": [2,4,6,7,3,8,21], "misc": [1,2,3,4,5,6,7]}
+        before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
+        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
+        result = run.prune(before).compute()
+        self.assertEqual(result, expected)
         
     def test_two_deg1_edges_both_incoming(self):
-        d_b = {"pre": [0,1,3,3,5,0,6,7], "post": [1,2,2,4,4,5,0,4]}        
-        d_a = {"pre": [0,1,3,3,5,0], "post": [1,2,2,4,4,5]}
-        df_before = ddf.from_pandas(pd.DataFrame(data=d_b))
-        df_after = pd.DataFrame(data=d_a).sort_values(by=["pre","post"])
-        df_after = df_after.reset_index(drop=True)        
-        result = run.prune(df_before).compute()
-        result = result.sort_values(by=["pre","post"]).reset_index(drop=True)        
-        assert_frame_equal(result, df_after)
+        d_b = {"pre": [0,1,3,3,5,0,6,7], "post": [1,2,2,4,4,5,0,4],
+               "syn_count": [2,4,6,7,3,8,21,21], "misc": [1,2,3,4,5,6,7,8]}        
+        before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
+        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
+        result = run.prune(before).compute()
+        self.assertEqual(result, expected)
     
     def test_two_deg1_edges_both_outgoing(self):
-        d_b = {"pre": [0,1,3,3,5,0,0,4], "post": [1,2,2,4,4,5,6,7]}        
-        d_a = {"pre": [0,1,3,3,5,0], "post": [1,2,2,4,4,5]}
-        df_before = ddf.from_pandas(pd.DataFrame(data=d_b))
-        df_after = pd.DataFrame(data=d_a).sort_values(by=["pre","post"])
-        df_after = df_after.reset_index(drop=True)        
-        result = run.prune(df_before).compute()
-        result = result.sort_values(by=["pre","post"]).reset_index(drop=True)        
-        assert_frame_equal(result, df_after)
+        d_b = {"pre": [0,1,3,3,5,0,0,4], "post": [1,2,2,4,4,5,6,7],
+               "syn_count": [2,4,6,7,3,8,21,21], "misc": [1,2,3,4,5,6,7,8]}        
+        before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
+        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
+        result = run.prune(before).compute()
+        self.assertEqual(result, expected)
     
     def test_two_deg1_edges_one_in_one_out(self):
-        d_b = {"pre": [0,1,3,3,5,0,6,4], "post": [1,2,2,4,4,5,0,7]}        
-        d_a = {"pre": [0,1,3,3,5,0], "post": [1,2,2,4,4,5]}
-        df_before = ddf.from_pandas(pd.DataFrame(data=d_b))
-        df_after = pd.DataFrame(data=d_a).sort_values(by=["pre","post"])
-        df_after = df_after.reset_index(drop=True)        
-        result = run.prune(df_before).compute()
-        result = result.sort_values(by=["pre","post"]).reset_index(drop=True)        
-        assert_frame_equal(result, df_after)
+        d_b = {"pre": [0,1,3,3,5,0,6,4], "post": [1,2,2,4,4,5,0,7],
+               "syn_count": [2,4,6,7,3,8,21,21], "misc": [1,2,3,4,5,6,7,8]}        
+        before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
+        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
+        result = run.prune(before).compute()
+        self.assertEqual(result, expected)
     
     def test_two_deg1_edges_one_out_one_in(self):
-        d_b = {"pre": [0,1,3,3,5,0,0,7], "post": [1,2,2,4,4,5,6,4]}        
-        d_a = {"pre": [0,1,3,3,5,0], "post": [1,2,2,4,4,5]}
-        df_before = ddf.from_pandas(pd.DataFrame(data=d_b))
-        df_after = pd.DataFrame(data=d_a).sort_values(by=["pre","post"])
-        df_after = df_after.reset_index(drop=True)        
-        result = run.prune(df_before).compute()
-        result = result.sort_values(by=["pre","post"]).reset_index(drop=True)        
-        assert_frame_equal(result, df_after)
+        d_b = {"pre": [0,1,3,3,5,0,0,7], "post": [1,2,2,4,4,5,6,4],
+               "syn_count": [2,4,6,7,3,8,21,21], "misc": [1,2,3,4,5,6,7,8]}        
+        before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
+        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
+        result = run.prune(before).compute()
+        self.assertEqual(result, expected)
         
     def test_two_deg1_edges_both_incoming_2(self):
-        d_b = {"pre": [0,1,3,3,5,0,6,7], "post": [1,2,2,4,4,5,0,0]}
-        d_a = {"pre": [0,1,3,3,5,0], "post": [1,2,2,4,4,5]} 
-        df_before = ddf.from_pandas(pd.DataFrame(data=d_b))
-        df_after = pd.DataFrame(data=d_a).sort_values(by=["pre","post"])
-        df_after = df_after.reset_index(drop=True)        
-        result = run.prune(df_before).compute()
-        result = result.sort_values(by=["pre","post"]).reset_index(drop=True)        
-        assert_frame_equal(result, df_after)
+        d_b = {"pre": [0,1,3,3,5,0,6,7], "post": [1,2,2,4,4,5,0,0],
+               "syn_count": [2,4,6,7,3,8,21,21], "misc": [1,2,3,4,5,6,7,8]}
+        before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
+        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
+        result = run.prune(before).compute()
+        self.assertEqual(result, expected)
     
     def test_two_deg1_edges_both_outgoing_2(self):
-        d_b = {"pre": [0,1,3,3,5,0,0,0], "post": [1,2,2,4,4,5,6,7]}
-        d_a = {"pre": [0,1,3,3,5,0], "post": [1,2,2,4,4,5]}
-        df_before = ddf.from_pandas(pd.DataFrame(data=d_b))
-        df_after = pd.DataFrame(data=d_a).sort_values(by=["pre","post"])
-        df_after = df_after.reset_index(drop=True)        
-        result = run.prune(df_before).compute()
-        result = result.sort_values(by=["pre","post"]).reset_index(drop=True)        
-        assert_frame_equal(result, df_after)
+        d_b = {"pre": [0,1,3,3,5,0,0,0], "post": [1,2,2,4,4,5,6,7],
+               "syn_count": [2,4,6,7,3,8,21,21], "misc": [1,2,3,4,5,6,7,8]}
+        before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
+        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
+        result = run.prune(before).compute()
+        self.assertEqual(result, expected)
     
     def test_two_deg1_edges_one_in_one_out_2(self):
-        d_b = {"pre": [0,1,3,3,5,0,0,7], "post": [1,2,2,4,4,5,6,0]}
-        d_a = {"pre": [0,1,3,3,5,0], "post": [1,2,2,4,4,5]}
-        df_before = ddf.from_pandas(pd.DataFrame(data=d_b))
-        df_after = pd.DataFrame(data=d_a).sort_values(by=["pre","post"])
-        df_after = df_after.reset_index(drop=True)        
-        result = run.prune(df_before).compute()
-        result = result.sort_values(by=["pre","post"]).reset_index(drop=True)        
-        assert_frame_equal(result, df_after)
+        d_b = {"pre": [0,1,3,3,5,0,0,7], "post": [1,2,2,4,4,5,6,0],
+               "syn_count": [2,4,6,7,3,8,21,21], "misc": [1,2,3,4,5,6,7,8]}
+        before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
+        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
+        result = run.prune(before).compute()
+        self.assertEqual(result, expected)
     
     def test_two_deg1_edges_one_out_one_in_2(self):
-        d_b = {"pre": [0,1,3,3,5,0,6,0], "post": [1,2,2,4,4,5,0,7]}
-        d_a = {"pre": [0,1,3,3,5,0], "post": [1,2,2,4,4,5]}
-        df_before = ddf.from_pandas(pd.DataFrame(data=d_b))
-        df_after = pd.DataFrame(data=d_a).sort_values(by=["pre","post"])
-        df_after = df_after.reset_index(drop=True)        
-        result = run.prune(df_before).compute()
-        result = result.sort_values(by=["pre","post"]).reset_index(drop=True)        
-        assert_frame_equal(result, df_after)
+        d_b = {"pre": [0,1,3,3,5,0,6,0], "post": [1,2,2,4,4,5,0,7],
+               "syn_count": [2,6,3,8,7,4,21,21], "misc": [1,2,3,4,5,6,7,8]}
+        before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
+        expected = process_computed_adjacency_bag(
+            run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute())
+        result = process_computed_adjacency_bag(run.prune(before).compute())
+        self.assertEqual(result, expected)
     
     def test_combo_case(self):
         d_b = {"pre": [0,1,3,3,5,0,0,6,7,9,9,10,1,13,14,
                        15,15,17,18,18,20,4,21,22,24,25], 
                "post": [1,2,2,4,4,5,6,7,8,8,10,11,12,1,2,
-                        3,16,16,4,19,19,21,22,23,23,24]}        
-        d_a = {"pre": [0,1,3,3,5,0], "post": [1,2,2,4,4,5]}
-        df_before = ddf.from_pandas(pd.DataFrame(data=d_b))
-        df_after = pd.DataFrame(data=d_a).sort_values(by=["pre","post"])
-        
+                        3,16,16,4,19,19,21,22,23,23,24],
+               "syn_count": [2,4,6,7,3,8,21,38,1,69,78,254,3,1,18,
+                             2,5,3,23,21,1,2,21532,2,35,10], 
+               "misc": [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+                        16,17,18,19,20,21,22,23,24,25,26]}
+        before = run.df_to_adjacency_bag(ddf.from_pandas(pd.DataFrame(data=d_b)))
+        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()      
+
         # Get time to run
         start_time = time()
-        result_before_compute = run.prune(df_before)
+        result_before_compute = run.prune(before).compute()
         time1 = time() - start_time
-        comp_start_time = time()
-        result = result_before_compute.compute()
-        time2 = time() - comp_start_time
         
         # Check test passed
-        df_after = df_after.reset_index(drop=True)        
-        result = run.prune(df_before).compute()
-        result = result.sort_values(by=["pre","post"]).reset_index(drop=True)
-        assert_frame_equal(result, df_after)
+        self.assertEqual(result, expected)
         
         # Get max memory usage
-        max_mem = max(memory_usage((run.prune, (df_before,))))
-        comp_max_mem = max(memory_usage((lambda: result_before_compute.compute(),)))
+        max_mem = max(memory_usage((run.prune, (before,))))
         report_test_result(TestPrune.OUTFILE, "test_combo_case", 
-                           time1, max_mem, time2, comp_max_mem)        
+                           time1, max_mem)        
 
 
 class TestGetUpperThreshold(unittest.TestCase):
@@ -396,7 +372,7 @@ class TestPBFS(unittest.TestCase):
         # Get memory usage and report results
         max_mem = max(memory_usage((run.pbfs, (start_node, adjacency_bag))))
         report_test_result(TestPBFS.OUTFILE, "test_case_4",
-                           time1, max_mem, None, None)
+                           time1, max_mem)
         del adjacency_bag
         
         
@@ -456,7 +432,7 @@ class TestGetComponentAdjacencyBags(unittest.TestCase):
         # Get memory usage and report results
         max_mem = max(memory_usage((run.get_component_adjacency_bags, (df,))))
         report_test_result(TestGetComponentAdjacencyBags.OUTFILE, 
-                           "test_case_2_components", time1, max_mem, None, None)
+                           "test_case_2_components", time1, max_mem)
 
 
 class TestGirvanNewman(unittest.TestCase):
