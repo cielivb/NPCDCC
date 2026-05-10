@@ -35,58 +35,341 @@ TODO
 
 import dask
 import numpy as np
+import os
 import random
+from collections import Counter
 from collections import defaultdict
 from dask import bag as db
 from dask import dataframe as ddf
-from queue import Queue
+from dask.distributed import Client
+
+CLIENT = None # Assigned properly at bottom of script
+MIN_CLUSTER_SIZE = 30
+MAD_K = 3.5
+
+ROOT_DIR = os.path.dirname(__file__)
+
 
 
 ### CLUSTER IDENTIFICATION - HELPER FUNCTIONS -----------------------------
 
-def edge_df_to_tuple(df: ddf.DataFrame, undirect=True) -> list[tuple[int,list[int]]]:
-    """ Used in prune() and bfs_components() """
-    edge_bag = df[["pre","post"]].to_bag()
-    if undirect:
-        # Add (b,a) for every (a,b) in set to the set (makes it undirected)
-        edge_bag = edge_bag.map(lambda edge: [edge, (edge[1], edge[0])])
-        edge_bag = edge_bag.flatten().distinct()
+def df_to_adjacency_bag(df, undirect=True):
+    """ Convert dataframe edges into adjacency list/bag of edges with weights.
     
-    # Create list of tuples where tup[0] is node id, and tup[1] is list of 
-    # neighbour nodes. This makes it easy to track retained edges and/or degree. 
-    # Computing here saves many repeated computations during the iterative while 
-    # in the prune function, but sacrifices some RAM.
-    grouped_edges = edge_bag.foldby(key = lambda edge: edge[0],
-                                    binop = lambda accum, edge: accum + [edge[1]],
-                                    initial = [],
-                                    combine = lambda accum1, accum2: accum1 + accum2,
-                                    combine_initial = []).compute()
-    return grouped_edges
-
-
-def grouped_edge_tuples_to_df(tuple_iter, original_df: ddf.DataFrame):
-    """ Merge compact tuple edge representation with original dataframe 
+    Return an adjacency list for the dataframe as a dask bag of the form
+        db.from_sequence([(a, [(b, 3)]), (b: [(a, 3)])])
+    if undirected, otherwise
+        db.from_sequence([(a, []), (b, [(a, 3)])])
+    where the edge from b->a (or b->a and a->b in the undirected version) has
+    weight 3.
     
-    Tuple edges are expanded into one tuple per edge format. Then for every
-    edge in the original dataframe, if that edge is present in expanded tuple
-    format, that edge in the original dataframe is retained in a new dataframe,
-    which is then returned.
+    Weight represents the number of synpases between two neurons a and b.
+    
+    For the DATA301 project, only the undirected version is required, but I
+    have included the option for directed should I choose to extend the 
+    project (I have not tested with the directed version).
+    
     """
-    # Get iterable of expanded tuples (one tuple per edge)
-    def expand(tup):
-        """ e.g., edge_data = (0, [1, 5]) -> [(0,1), (0,5)] """
-        return list(map(lambda target: (tup[0], target), tup[1]))
-    new_edge_bag = db.from_sequence(tuple_iter).map(lambda tup: expand(tup)).flatten()
+    if undirect: # Add (b,a,w) for every (a,b,w)
+        edge_bag = df[["pre", "post", "syn_count"]].to_bag()        
+        edge_bag = edge_bag.map(lambda edge: [edge, (edge[1], edge[0], edge[2])])
+        edge_bag = edge_bag.flatten().distinct()
+        adj_df = edge_bag.to_dataframe(
+            meta = {"pre": int, "post": int, "syn_count": int})
+    else:
+        adj_df = df
+        
+    # grouped is of the general form
+    # pre    post      syn_count
+    # 0      [1, 5]    [2, 4]
+    # where there is an edge of weight 2 between 0 and 1,
+    # an edge of weight 4 between 0 and 5, etc
+    grouped = adj_df.groupby("pre").agg({"pre": list, "post": list, "syn_count": list})
     
-    # Intersect remaining edges with original dataframe
-    new_edge_df = new_edge_bag.to_dataframe(meta={"pre": int, "post": int})
-    new_df = new_edge_df.merge(original_df, on=["pre","post"], how="inner")
-    return new_df
+    # Each entry of form ([pre, pre, ...], [post, post, ...], [syn_count, syn_count, ...])
+    # where all the pre values within an entry are equal. Edges are currently
+    # represented by indices.
+    grouped_as_bag = grouped.to_bag()
+    adjacency_bag = grouped_as_bag.map( # Possible memory issue here?
+        lambda entry: (entry[0][0], list(zip(entry[1], entry[2]))))
+    return adjacency_bag.persist()
+
+
+def get_all_nodes(adjacency_bag):
+    """ Return bag of all nodes in graph represented by bag """
+    main_nodes = adjacency_bag.map(lambda node_adj: node_adj[0])
+    nnodes = adjacency_bag.map(
+        lambda node_adj: node_adj[1]).flatten().map(lambda tup: tup[0])
+    nodes = db.concat([main_nodes, nnodes])
+    return nodes
+
+
+def get_num_nodes(adjacency_bag):
+    """ Return the number of nodes in the graph represented by bag """
+    return get_all_nodes(adjacency_bag).count().compute()
+
+
+def log_removed_edges(removed_edges):
+    """ Log removed edges in a temp file. These edges can be analysed to address
+    the research question in a similar manner as the clusters. """
+    pass # TODO
+
+
+
+
+### PARALLEL BFS ----------------------------------------------------------
+
+class Layer():
+    """ Represents a layer d of nodes at depth d of parallel BFS """
+    
+    def __init__(self):
+        self.nodes = db.from_sequence([])
+    
+    
+    def insert(self, node_bag: db.Bag):
+        self.nodes = node_bag.persist() # bag of int nodes in layer e.g., bag([1,2,...])
+    
+    
+    def is_empty(self):
+        return self.nodes.count().compute() == 0
+
+    
+    def update_leaves(self, adjacencies, leaves, state, node_to_i):
+        """ Add leaf nodes in adjacencies to leaves bag. 
+        Leaf nodes are those with no children, i.e., none of their neighbours
+        are undiscovered.
+        """
+        # TODO - this func is a slight bottleneck - fix it if time allows        
+        no_weights = adjacencies.map(
+            lambda node_adjacency: (node_adjacency[0], 
+                                    list(map(lambda tup: tup[0], node_adjacency[1]))))
+        neighbour_states = no_weights.map(
+            lambda node_adjacency: (node_adjacency[0],
+                                    list(map(
+                                        lambda nnode: state[node_to_i[nnode]],
+                                        node_adjacency[1])))).persist()
+        del no_weights
+        leaf_nodes = neighbour_states.filter(
+            lambda tup: Counter(tup[1])["P"] == len(tup[1])).map(
+                lambda tup: tup[0]).persist()
+        del neighbour_states
+        leaves = db.concat([leaves, leaf_nodes]).persist()  
+        del leaf_nodes
+        return leaves
+
+    
+    def get_child_parent_rels(self, adjacency_bag, adjacencies, state, node_to_i, all_children, all_child_parent_rels):
+        """ Record parentage for each child 
+        The child node's parents are those nodes in the child's adjacencies
+        where the states of those nodes are 'P'."""
+        # TODO - this func is a slight bottleneck - fix it if time allows
+        global CLIENT
+        child_ids = all_children.compute()
+        child_adjacencies = adjacency_bag.filter(
+            lambda node_adjacency: node_adjacency[0] in child_ids).persist()
+        del child_ids
+        parent_ids = adjacencies.map(
+            lambda node_adjacency: node_adjacency[0]).filter(
+                lambda node_id: state[node_to_i[node_id]] == "P").compute()
+        child_parent_rels = child_adjacencies.map(
+            lambda node_adjacency: (
+                node_adjacency[0], 
+                filter(lambda tup: tup[0] in parent_ids, node_adjacency[1])
+            )).persist()
+        del parent_ids, child_adjacencies
+        all_child_parent_rels = db.concat([all_child_parent_rels, 
+                                           child_parent_rels]).persist()
+        del child_parent_rels
+        return all_child_parent_rels
+        
+    
+    def process(self, adjacency_bag, state, node_to_i, all_child_parent_rels, leaves):
+        """ Check all neighbours of self.nodes for those that should be added
+        to the next layer out_layer. Updates state, all_child_parent_rels, and
+        leaves as required. Returns out_layer. 
+        
+        adjacency_bag is of the form:
+            Bag([(a, [(b, 3)]), (b: [(a, 3), (c, 2)], ...]))
+        where the edge from b->a and a->b has weight 3 (i.e., 3 synapses).
+        """
+        print("Setting up layer processing ...")
+        # Set-up layer processing
+        out_layer = Layer()
+        layer_nodes = self.nodes.compute()
+        adjacencies = adjacency_bag.filter( # Get adjacencies for this layer's nodes
+            lambda node_adjacency: node_adjacency[0] in layer_nodes).persist()
+        del layer_nodes
+        print("Set up layer processing")
+        
+        print("Marking this layer's nodes as processed ...")
+        # Mark this layer's nodes as processed. The child-parent rel and leaf
+        # computation sections rely on parents being marked as P.
+        processed_is = adjacencies.map( # Get this layer's node's indices
+            lambda node_adjacency: node_to_i[node_adjacency[0]]).compute()
+        state[processed_is] = "P"
+        del processed_is
+        print("Marked as processed")
+        
+        print("Getting leaf nodes ...")
+        # Get leaf nodes (those with no child nodes)
+        leaves = self.update_leaves(adjacencies, leaves, state, node_to_i)
+        print("Leaf nodes retrieved")
+
+        print("Getting children nodes ...")
+        # Get the children nodes of this layer
+        all_children = adjacencies.map(
+            lambda tup: tup[1]).flatten().map(
+                lambda tup: tup[0]).distinct().filter(
+                    lambda node_id: state[node_to_i[node_id]] != "P").persist()
+        print("Children nodes retrieved")
+        
+        # Discover child nodes and compute child-parent relationships
+        if all_children.count().compute() > 0:
+            print("Inserting children into next layer ...")
+            out_layer.insert(all_children)
+            print("Children inserted into next layer")
+            print("Marking children as discovered ...")
+            undiscovered_is = all_children.map(
+                lambda child_id: node_to_i[child_id]).compute()
+            state[undiscovered_is] = "D"
+            del undiscovered_is
+            print("Children marked as discovered")
+            print("Getting child-parent relationships ...")
+            all_child_parent_rels = self.get_child_parent_rels(
+                adjacency_bag, adjacencies, state, node_to_i, all_children, all_child_parent_rels)
+            print("Relationships retrieved")
+        
+        print("Returning PBFS data ...")
+        return (out_layer, leaves, all_child_parent_rels)
+        
+
+
+def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
+    """ Returns child_parent_rels bag, state array, leaves bag, and 
+    num_shortest_paths bag.
+    
+    The numpy arrays nodes and state will be automatically computed from the
+    adjacency bag if not supplied. state is not required to complete the bfs
+    search, however, the caller (e.g., get_component_adjacency_bags()) may 
+    wish to validate the status of each node after the search is complete.
+    
+    adjacency_bag has the general form
+        db.from_sequence([(c, [(a, w), (b, w)]), (d, [(c, w)])])
+    where a and b are parents of c, c is the only parent of d, and w is the
+    edge weight or number of synapses along that edge.
+
+    The bag of leaves contains nodes that do not have any children.
+    
+    The num_shortest_paths bag is of the general form
+        db.from_sequence([(node1, num_paths), (node2, num_paths), ...])
+    where num_paths is the number of shortest paths from start_node to node1 etc
+    
+    The original PBFS inspiration comes from the logic behind 'Bags' and 'Pennants'
+    described at https://dl.acm.org/doi/epdf/10.1145/1810479.1810534. This is
+    a simplified daskified implementation of their PBFS. What they term a 'bag'
+    is here a 'Layer', which represents all the nodes at some leve/depth d in the 
+    BFS tree.
+    
+    """
+    # Create nodes and state arrays if not supplied
+    supplied_nodes = nodes
+    if not type(nodes) is np.ndarray:
+        nodes = np.array(adjacency_bag.map(
+            lambda node_adjacency: node_adjacency[0]).compute())
+    if not type(state) is np.ndarray:
+        state = np.full(len(nodes), "U", dtype="<U1")
+    
+    # Create look-up dict node_to_i and initialise state array.
+    # node_to_i has key = node, value = corresponding index in state array.
+    node_to_i = {node: i for i, node in enumerate(nodes)} 
+    start_node_index = node_to_i[start_node]
+    state[start_node_index] = "D"
+    
+    # The nodes array is no longer required for this function. If nodes was not
+    # originally supplied, delete the nodes array. Don't delete the nodes 
+    # array if it was supplied to avoid interfering with other functions.
+    if not type(supplied_nodes) is np.ndarray:
+        del nodes, supplied_nodes
+    
+    # Create empty leaves and all_child_parent_rels bags
+    leaves = db.from_sequence([])
+    all_child_parent_rels = db.from_sequence([(start_node, [])])
+    
+    # Initialise current layer (depth/level = 0)
+    current_layer = Layer()
+    current_layer.insert(db.from_sequence([start_node]))
+
+    
+    # Process each layer until max tree depth reached
+    while not current_layer.is_empty():
+        next_layer, leaves, all_child_parent_rels = current_layer.process(
+            adjacency_bag, state, node_to_i, all_child_parent_rels, leaves)
+        current_layer = next_layer
+
+    return (all_child_parent_rels, state, leaves)
+
+
+def get_component_adjacency_bags(df: ddf.DataFrame, undirected=True):
+    """ Return a dask bag of adjacency lists/bags for each component in df.
+   
+    For each component in the graph represented in df, return the 
+    adjacency list of the component containing each edge and their 
+    weights. This is done by performing iteratively performing parallel BFS to 
+    identify nodes belonging to different components. Only one component can
+    be discovered at a time.
+    
+    Parent-child relationships require a start node, which is outside the
+    scope of this function. See the bfs_search function.
+
+    """
+    big_adjacency_bag = df_to_adjacency_bag(df, undirected)
+    nodes = np.array(big_adjacency_bag.map(
+        lambda node_adjacency: node_adjacency[0]).compute())
+    state = np.full(len(nodes), "U", "<U1") # nodes indices map to state indices
+    components = [] # Will later be a dask bag of adjacency bags (one per component)
+    
+    # Iterate until all nodes are assigned to a component. Must find one
+    # component at a time.
+    for node_index in range(len(nodes)):
+        if state[node_index] == "U":
+            prev_state = state.copy()
+            start_node = nodes[node_index]            
+            
+            all_child_parent_rels, state, leaves = pbfs(start_node, 
+                                                        big_adjacency_bag,
+                                                        state, nodes)
+            del all_child_parent_rels, leaves
+            
+            # Add new component
+            diff_indices = np.where(state != prev_state)[0]
+            component_nodes = nodes[diff_indices]
+            component_adj = big_adjacency_bag.filter(
+                lambda node_adjacency: node_adjacency[0] in component_nodes)
+            components = components + [component_adj.persist()]
+    
+    return db.from_sequence(components)
+
+
 
 
 ### CLUSTER IDENTIFICATION - PRUNE ----------------------------------------
 
-def prune(df: ddf.DataFrame) -> ddf.DataFrame:
+def cut_deg1_edge(node_adj, should_cut: bool):
+    """ Change node adjacency list to empty list if should cut. 
+    This effectively makes the node a degree 0 node. """
+    if should_cut:
+        node_adj = (node_adj[0], [])
+    return node_adj
+
+
+def remove_deg_1_nodes(node_adj, deg1_nodes):
+    """ Remove edges from node to nodes in degree 1 nodes """
+    neighbours = list(filter(
+        lambda tup: tup[0] not in deg1_nodes, node_adj[1]))
+    return (node_adj[0], neighbours)
+
+
+def prune(adjacency_bag: db.Bag) -> db.Bag:
     """ Iteratively remove degree 1 edges from a dask dataframe 
     
     A degree 1 edge is defined here as an edge associated with at least one
@@ -94,244 +377,205 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
     edges to one and only one other node. No nodes in the dataset will have 
     edges to themselves. Synapse count and directionality are not considered.
     
+    Adjacency bag format:
+            db.from_sequence([(a, [(b, 3)]), (b: [(a, 3)])])
+            
+    The naive approach would be to take away one edge at a time. This parallel
+    version improves performance by finding all degree 1 edges initially, and
+    pruning each 'chain' in parallel. The time to complete is the time it takes
+    to process the longest 'chain'.
+
     """
-    grouped_edges = edge_df_to_tuple(df)
-    deg1_nodes = list(map(lambda tup: tup[0], 
-                          filter(lambda tup: len(tup[1]) == 1, grouped_edges)))
+    deg1_nodes = adjacency_bag.filter(
+        lambda node_adj: len(node_adj[1]) == 1).map(
+            lambda node_adj: node_adj[0]).compute()
     
-    # Queue all degree 1 nodes
-    # This is a bit hacky (using private vars) but avoids a for loop
-    # Idea from https://www.py4u.org/blog/python-putting-list-items-in-a-queue/#3-better-code-practices-for-optimization
-    deg1_queue = Queue()        
-    with deg1_queue.mutex: # with queue lock
-        deg1_queue.queue.extend(deg1_nodes) # Add all nodes at once
+    while True:
+        if len(deg1_nodes) == 0:
+            break
         
-    # Iteratively prune away degree 1 nodes from edge_bag_dict
-    while not deg1_queue.empty():
-        deg1_node = deg1_queue.get()
-        deg1_node_in_tree = len(list(
-            filter(lambda tup: tup[0] == deg1_node, grouped_edges))) == 1
-        if not deg1_node_in_tree: continue
-        neighbour = list(map(lambda tup: tup[1], 
-                             filter(lambda tup: tup[0] == deg1_node, grouped_edges)))[0][0]
+        # Remove edge from deg1 node to neighbour
+        adjacency_bag = adjacency_bag.map(
+            lambda node_adj: cut_deg1_edge(node_adj, node_adj[0] in deg1_nodes)).filter(
+                lambda node_adj: len(node_adj[1]) > 0).persist()
         
-        # Remove deg1 node from neighbour's connections 
-        # (i.e.,remove neighbour -> deg1 edge)
-        neighbour_neighbours = list(map(lambda tup: tup[1], 
-                                        filter(lambda tup: tup[0] == neighbour, grouped_edges)))[0]
-        neighbour_neighbours.remove(deg1_node)
-        # If neighbour is now deg1, add neighbour to deg1 queue
-        if len(neighbour_neighbours) == 1:
-            deg1_queue.put(neighbour)
-            
-        # Remove deg1 node key from dict (remove deg1 -> neighbour edge)
-        deg1_tuple = list(filter(lambda tup: tup[0] == deg1_node, grouped_edges))[0]
-        grouped_edges.remove(deg1_tuple)
-                
-    return grouped_edge_tuples_to_df(grouped_edges, df)
-
-
-### CLUSTER IDENTIFICATION - BFS COMPONENT SEARCH ------------------------=
-
-def bfs_loop(grouped_edges, nodes, queue, state):
-    """ Discover a component """
-    while not queue.empty():
-        node = queue.get()
-        node_index = np.where(nodes == node)[0][0]
-        node_neighbours = grouped_edges[node_index][1]
-        for neighbour in node_neighbours:
-            neighbour_index = np.where(nodes == neighbour)[0][0]
-            if state[neighbour_index] == "U":
-                state[neighbour_index] == "D"
-                queue.put(neighbour)
-        state[node_index] = "P"
-
-
-def bfs_components(df: ddf.DataFrame, min_size=30) -> db.Bag:
-    """ Use BFS to return components of df as DataFrames in a Bag """
-    grouped_edges = edge_df_to_tuple(df)
-    n = len(grouped_edges)
-    state = np.full(n, "U", dtype="<U1")
-    queue = Queue()
-    components = None # Will later be a dask bag of dask dataframe/s
+        # Remove edge from neighbours to deg1 nodes
+        adjacency_bag = adjacency_bag.map(
+            lambda node_adj: remove_deg_1_nodes(node_adj, deg1_nodes)).persist()
     
-    # Iterate through each node in grouped_edges to get components via BFS
-    nodes = np.fromiter(map(lambda tup: tup[0], grouped_edges), dtype=int)
-    for node_index in range(n):
-        
-        if state[node_index] == "U":
-            prev_state = state.copy()
-            state[node_index] == "D"
-            queue.put(node_index)
-            
-            bfs_loop(grouped_edges, nodes, queue, state) # Discover component
-            
-            # Add new component if large enough
-            diff_indices = np.where(state != prev_state)[0]
-            if len(diff_indices) < min_size:
-                continue
-            component_edges = filter(lambda tup: grouped_edges.index(tup) in diff_indices,
-                                     grouped_edges)
-            component_df = grouped_edge_tuples_to_df(component_edges, df)
-            if not components:
-                components = db.from_sequence([component_df])
-            else:
-                components = db.concat([components, db.from_sequence([component_df])])
-                
-    return components
+    return adjacency_bag
+
+
+
 
 
 ### CLUSTER IDENTIFICATION - GIRVAN NEWMAN --------------------------------
 
-def bfs_search(start_node, grouped_edges) -> list:
-    """ Create parent array via BFS starting at start node """
-    n = len(grouped_edges)
-    parents = defaultdict(set) # key is node, vals are parents
-    state = np.full(n, "U", dtype="<U1")
-    queue = Queue()
-    nodes = np.fromiter(map(lambda tup: tup[0], grouped_edges), dtype=int)
-    start_node_index = np.where(nodes == start_node)[0][0]
-    state[start_node_index] = "D"
-    queue.put(start_node)
-    
-    while not queue.empty():
-        node = queue.get()
-        node_index = np.where(nodes == node)[0][0]
-        node_neighbours = grouped_edges[node_index][1]
-        for neighbour in node_neighbours:
-            neighbour_index = np.where(nodes == neighbour)[0][0]
-            if state[neighbour_index] in ["U", "D"]:
-                state[neighbour_index] = "D"
-                parents[neighbour].add(node)
-                queue.put(neighbour)
-        state[node_index] = "P"
-    
-    return parents
 
-
-def get_num_shortest_paths(start_node: int, parents: dict, 
-                           df: ddf.DataFrame, grouped_edges) -> dict:
-    """ Label each node with number of shortest paths to it from start_node. 
-    Accounts for number of synapses.
+def calculate_edge_scores(start_node, child_parent_rels, num_shortest_paths, 
+                          leaves, component):
+    """ Return Bag of tuples Bag([((pre, post), edge_score), ...])
+    Edge scoring rules are detailed on page 365 of MMDS Chapter 10 
+    
+    The num_shortest_paths bag is of the general form
+        db.from_sequence([(node1, num_paths), (node2, num_paths), ...])
+    where num_paths is the number of shortest paths from start_node to node1 etc
+    
     """
-    state = np.full(len(parents), "U", dtype="<U1")
-    queue = Queue()
-    leaves = []
-    num_shortest_paths = {start_node: 1}
+    to_score = leaves
+    edge_scores = db.from_sequence([])
     
-    nodes = np.fromiter(map(lambda tup: tup[0], grouped_edges), dtype=int)    
-    start_node_index = np.where(nodes == start_node)[0][0]
-    first_children = grouped_edges[start_node_index][1]
-    for child in first_children:
-        queue.put(child)
+    def credit(node):
+        """ Rule 1: leaves get credit = 1. Rule 2: other nodes get credit = 1 + 
+        sum of credits of the DAG edges from that node to its children """
+        credit = 1 + edge_scores.filter(
+            lambda entry: entry[0][0] == node).map(
+                lambda entry: entry[1]).sum()
+        return (node, credit)
     
-    while not queue.empty():
-        node = queue.get()
+    def process_nodes(node_w_credit):
+        """ Rule 3: A DAG edge e entering node Z from the level above is given a
+        share of the credit of Z proportional to the fraction of shortest
+        paths from the root to Z that go through e.
+        """
+        node, credit = node_w_credit
+        parents = db.from_sequence(all_child_parent_rels[node])
+        total_num_shortest_paths_to_parents = parents.map(
+            lambda parent: num_shortest_paths[parent])
+        node_edge_scores = parents.map(
+            lambda parent: ((parent, node), 
+                            credit * num_shortest_paths[parent] / 
+                            total_num_shortest_paths_to_parents))
+        return node_edge_scores
         
-        # Get number of shortest paths to node
-        num_paths_to_node = 0
-        for parent in parents[node]:
-            num_synapses_to_parent = ...
-            num_paths += num_shortest_paths[parent] * num_synapses_to_parent
-        num_shortest_paths[node] = num_paths_to_node
+    while to_score.count().compute() > 0:
+        nodes_w_credits = to_score.map(credit)
+        new_edge_scores = process_nodes.map(nodes_w_credits).flatten()
+        edge_scores = db.concat([edge_scores, new_edge_scores])
+        to_score = nodes_w_credits.map( # to_score = parents
+            lambda node_w_c: all_child_parent_rels[node_w_c[0]]).flatten()
         
-        # Add node's children to queue
-        node_index = np.where(nodes == node)[0][0]
-        children = grouped_edges[node_index][1]
-        if len(children) == 0:
-            leaves.append(node)
-        for child in children:
-            queue.put(child)
-    
-    return (num_shortest_paths, leaves)
-
-
-def calculate_edge_scores(start_node: int, parents: list, 
-                          num_shortest_paths: dict, grouped_edges: list, leaves: list):
-    """ Edge scoring rules are detailed on page 365 of MMDS Chapter 10 """
-    nodes = np.fromiter(map(lambda tup: tup[0], grouped_edges), dtype=int) 
-    nodes_to_score, edge_scores = Queue(), dict()
-    with nodes_to_score.mutex: # with queue lock
-        nodes_to_score.queue.extend(leaves) # Add all leaves at once
-        
-    while not nodes_to_score.empty():
-        node = nodes_to_score.get()
-        node_index = np.where(nodes == node)[0][0]
-        
-        if node in leaves:
-            node_credit = 1 # Rule 1
-        else:
-            # Rule 2
-            children = grouped_edges[node_index][1]
-            child_edge_credits = 0
-            for child in children:
-                child_edge_credits += edge_scores[(node, child)]
-            node_credit = 1 + child_edge_credits
-            
-        # Rule 3
-        node_parents = parents[node_index]
-        total_num_shortest_paths_to_parents = 0
-        for parent in node_parents:
-            total_num_shortest_paths_to_parents += num_shortest_paths[parent]
-        for parent in node_parents:
-            edge_credit = node_credit * num_shortest_paths[parent] / total_num_shortest_paths_to_parents
-            edge_scores[(parent, node)] = edge_credit
-            nodes_to_score.put(parent)
-    
     return edge_scores
 
 
-def get_edge_scores(start_node, grouped_edges, df):
+def get_edge_scores(start_node, component):
     """ Return dict of Girvan Newman edge scores starting at start_node.
     df should only contain pre, post, and syn_count cols """
-    parents = bfs_search(start_node, grouped_edges)
-    num_shortest_paths, leaves = get_num_shortest_paths(start_node, parents, df, grouped_edges)
-    edge_scores = calculate_edge_scores(start_node, parents, num_shortest_paths, grouped_edges, leaves)
+    child_parent_rels, state, leaves, num_shortest_paths = pbfs(start_node, component)
+    edge_scores = calculate_edge_scores(start_node, child_parent_rels, 
+                                        num_shortest_paths, leaves, component)
     return edge_scores
 
 
-def girvan_newman(grouped_edges, df):
-    # Choose random subset of nodes. 
-    # For now, using sample size = half the number of nodes in the df.
-    nodes = db.concat([df["pre"].unique().to_bag(), 
-                       df["post"].unique().to_bag]).unique().compute()
-    random_nodes = db.from_sequence(random.sample(nodes, len(nodes)/2))
+def girvan_newman(component):
+    """ Set up and do the edge-score calculation phase of Girvan-Newman on a 
+    single component """
+    # Map random subset of nodes to get_edge_scores.
+    # For now, using sample size = quarter the number of nodes in the df.
+    component_nodes = get_all_nodes(component).compute()
+    random_nodes = db.from_sequence(
+        random.sample(component_nodes, len(component_nodes)/4))
     
-    # Map random subset of nodes to get_edge_scores()
-    score_dicts = random_nodes.map(get_edge_scores, grouped_edges, df)
-    # Sum edge scores and divide by a factor (e.g., 2 if using all nodes)
-    def score_dict_to_tuples(score_dict):
-        """ Score dict contains edge scores for each edge """
-        score_tuples = []
-        for edge, score in score_dict.items():
-            score_tuples.append((edge, score))
-        return db.from_sequence(score_tuples)
-    score_tuples = score_dicts.map(score_dict_to_tuples).flatten()
-    scores = score_tuples.foldby(
+    # Bag([((pre, post), edge_score), ...])    
+    all_edge_scores = random_nodes.map(get_edge_scores, component).flatten()
+    
+    # Sum edge scores and divide by factor
+    factor = 0.5 # Used sample size = quarter # nodes in df -> factor = 0.5
+    scores = all_edge_scores.foldby(
         key = lambda edge_score: edge_score[0],
         binop = lambda accum, edge_score: accum + edge_score[1],
         initial = 0,
         combine = lambda accum1, accum2: accum1 + accum2,
         combine_initial = 0
     )
-    # Used sample size = half # nodes in df -> factor = 1
-    factor = 1
-    standardised_scores = scores.map(lambda edge_score: (edge_score[0], edge_score[1]/factor))
+    standardised_scores = scores.map(
+        lambda edge_score: (edge_score[0], edge_score[1]/factor))
     return standardised_scores
+
+
+
+
+### CLUSTER IDENTIFICATION - DECOMPOSITION --------------------------------
+
+def get_upper_threshold(edge_scores, k):
+    """ Calculate MAD-based upper threshold.
+    edge_scores of form Bag([((pre, post), edge_score), ...])
+    """
+    global MAD_K
+    if not k:
+        k = MAD_K
+    scores = np.array(edge_scores.map(lambda tup: tup[1]).compute())
+    median_score = np.median(scores)
+    print(f"median score = {median_score}")
+    mad = np.median(np.absolute(scores - median_score))
+    print(f"mad = {mad}")
+    upper_threshold = median_score + k * mad
+    return upper_threshold
+
+
+def chop(component, edge_scores, upper_threshold):
+    """ Remove outlier edges from component. 
+    Return updated adjacency bag and bag of edges removed.
+    """
+    pass # TODO
+
+
 
 
 ### CLUSTER IDENTIFICATION - IDENTIFY CLUSTERS ----------------------------
 
-def identify_clusters(df: ddf.DataFrame, is_pruned=True):
-    if not is_pruned:
-        df = prune(df)
-    grouped_edges = edge_df_to_tuple(df)
-    gn_scores = girvan_newman(grouped_edges, df)
-    upper_score_threshold = get_upper_threshold(gn_scores)
-    new_df = filter_df(df, edge_scores, upper_score_threshold)
-    new_components = bfs_components(new_df)
-    new_clusters = db.Bag()
-    for component in new_components():
-        cluster = prune(component)
-        new_clusters = db.concat([new_clusters, cluster])
-    return new_clusters
+def process_component(component):
+    """ Returns a bag of components and whether processing should continue.
+    Bag([(component1_bag, _continue), (component2_bag, _continue), ...])
+    where component1, component2, ... are components derived from component.
+        
+    If _continue is true, then the caller function should apply another round
+    of girvan newman on the components. continue = False occurs when no more
+    edges are removed from the input component (i.e., the component is a 
+    cluster).
+    
+    Takes a bag called component representing the edges of a component.
+    """
+    global MIN_CLUSTER_SIZE
+    edge_scores = girvan_newman(component)
+    upper_score_threshold = get_upper_threshold(edge_scores)
+    new_adj_bag, removed_edges = chop(component, edge_scores, upper_score_threshold)
+    log_removed_edges(removed_edges)
+    if get_num_nodes(new_adj_bag).compute() < MIN_CLUSTER_SIZE:
+        return (None, False) # Cluster/component too small
+    if removed_edges.count().compute() == 0:
+        return (new_bag, False) # Cluster found! Don't continue processing.    
+    
+
+def recurse(component):
+    component_bag, _continue = component
+    if not _continue:
+        return (component_bag, False)
+    return identify_clusters(adjacency_bags = component_bag)
+
+
+def identify_clusters(df=None, adjacency_bags=None):
+    global MIN_CLUSTER_SIZE, CLIENT
+    
+    # Clean and filter
+    if df: adjacency_bags = get_component_adjacency_bags(df)
+    adjacency_bags = adjacency_bags.map(prune)
+    adjacency_bags = adjacency_bags.filter(
+        lambda adj_bag: adj_bag.count >= MIN_CLUSTER_SIZE)
+    
+    # Bag([(component1_bag, continue), (component2_bag, continue), ...])
+    components = adjacency_bags.map(process_component).flatten()
+    components = components.map(lambda component: recurse(component))
+    
+    # Filter and map components to include only bags
+    clusters = components.filter(
+        lambda component: component[0] is not None).map(
+            lambda component: component[0])
+    return clusters
+
+
+
+### -----------------------------------------------------------------------
+
+if __name__ == "__main__":
+    CLIENT = Client()
