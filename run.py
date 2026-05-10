@@ -259,7 +259,6 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
         nodes = np.array(adjacency_bag.map(
             lambda node_adjacency: node_adjacency[0]).compute())
     if not type(state) is np.ndarray:
-        print(f"State {state} not a numpy array - {type(state)}")
         state = np.full(len(nodes), "U", dtype="<U1")
     
     # Create look-up dict node_to_i and initialise state array.
@@ -285,12 +284,52 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
     
     # Process each layer until max tree depth reached
     while not current_layer.is_empty():
-        print(f"Processing Layer {current_layer.nodes.compute()}")
         next_layer, leaves, all_child_parent_rels = current_layer.process(
             adjacency_bag, state, node_to_i, all_child_parent_rels, leaves)
         current_layer = next_layer
 
     return (all_child_parent_rels, state, leaves)
+
+
+def get_component_adjacency_bags(df: ddf.DataFrame, undirected=True):
+    """ Return a dask bag of adjacency lists/bags for each component in df.
+   
+    For each component in the graph represented in df, return the 
+    adjacency list of the component containing each edge and their 
+    weights. This is done by performing iteratively performing parallel BFS to 
+    identify nodes belonging to different components. Only one component can
+    be discovered at a time.
+    
+    Parent-child relationships require a start node, which is outside the
+    scope of this function. See the bfs_search function.
+
+    """
+    big_adjacency_bag = df_to_adjacency_bag(df, undirected)
+    nodes = np.array(big_adjacency_bag.map(
+        lambda node_adjacency: node_adjacency[0]).compute())
+    state = np.full(len(nodes), "U", "<U1") # nodes indices map to state indices
+    components = [] # Will later be a dask bag of adjacency bags (one per component)
+    
+    # Iterate until all nodes are assigned to a component. Must find one
+    # component at a time.
+    for node_index in range(len(nodes)):
+        if state[node_index] == "U":
+            prev_state = state.copy()
+            start_node = nodes[node_index]            
+            
+            all_child_parent_rels, state, leaves = pbfs(start_node, 
+                                                        big_adjacency_bag,
+                                                        state, nodes)
+            del all_child_parent_rels, leaves
+            
+            # Add new component
+            diff_indices = np.where(state != prev_state)[0]
+            component_nodes = nodes[diff_indices]
+            component_adj = big_adjacency_bag.filter(
+                lambda node_adjacency: node_adjacency[0] in component_nodes)
+            components = components + [component_adj.persist()]
+    
+    return db.from_sequence(components)
 
 
 
@@ -354,58 +393,6 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
         
     return adjacency_bag
 
-
-### CLUSTER IDENTIFICATION - BFS TREE -------------------------------------
-
-def get_component_adjacency_bags(df: ddf.DataFrame, undirected=True):
-    """ Return a dask bag of adjacency lists/bags for each component in df.
-   
-    For each component in the graph represented in df, return the 
-    adjacency list of the component containing each edge and their 
-    weights. This is done by performing iteratively performing parallel BFS to 
-    identify nodes belonging to different components. Only one component can
-    be discovered at a time.
-    
-    Parent-child relationships require a start node, which is outside the
-    scope of this function. See the bfs_search function.
-
-    """
-    print("Starting get_component_adjacency_bags")
-    big_adjacency_bag = df_to_adjacency_bag(df, undirected)
-    nodes = np.array(big_adjacency_bag.map(
-        lambda node_adjacency: node_adjacency[0]).compute())
-    state = np.full(len(nodes), "U", "<U1") # nodes indices map to state indices
-    components = [] # Will later be a dask bag of adjacency bags (one per component)
-    print(f"Initialisation complete - nodes = {nodes}")
-    
-    # Iterate until all nodes are assigned to a component. Must find one
-    # component at a time.
-    for node_index in range(len(nodes)):
-        print(f"Reached node_index {node_index} of {len(nodes)}")
-        print(f"\tState = {state}")
-        if state[node_index] == "U":
-            prev_state = state.copy()
-            start_node = nodes[node_index]            
-            
-            print("Running PBFS ...")
-            all_child_parent_rels, state, leaves = pbfs(start_node, 
-                                                        big_adjacency_bag,
-                                                        state, nodes)
-            print(f"PBFS complete - {state}")
-            del all_child_parent_rels, leaves
-            
-            # Add new component
-            print("Adding new component ...")
-            diff_indices = np.where(state != prev_state)[0]
-            component_nodes = nodes[diff_indices]
-            component_adj = big_adjacency_bag.filter(
-                lambda node_adjacency: node_adjacency[0] in component_nodes)
-            components = components + [component_adj.persist()]
-            print(f"Component appended: {component_adj}")
-            print(f"Components: {components}")
-    
-    print("Finishing get_component_adjacency_bags")
-    return db.from_sequence(components)
 
 
 
@@ -524,30 +511,57 @@ def girvan_newman(grouped_edges, df):
     return standardised_scores
 
 
+
+
 ### CLUSTER IDENTIFICATION - IDENTIFY CLUSTERS ----------------------------
+
+def process_component(component):
+    """ Returns a bag of components and whether processing should continue.
+    Bag([(component1_bag, _continue), (component2_bag, _continue), ...])
+    where component1, component2, ... are components derived from component.
+        
+    If _continue is true, then the caller function should apply another round
+    of girvan newman on the components. continue = False occurs when no more
+    edges are removed from the input component (i.e., the component is a 
+    cluster).
+    
+    Takes a bag called component representing the edges of a component.
+    """
+    global MIN_CLUSTER_SIZE
+    edge_scores = girvan_newman(adjacency_bags)
+    upper_score_threshold = get_upper_threshold(gn_scores)
+    new_bag, num_edges_removed = chop(component, edge_scores, upper_score_threshold)
+    if get_num_nodes(new_bag).compute() < MIN_CLUSTER_SIZE:
+        return (None, False) # Cluster/component too small
+    if num_edges_removed == 0:
+        return (new_bag, False) # Cluster found! Don't continue processing.    
+    
+
+def recurse(component):
+    component_bag, _continue = component
+    if not _continue:
+        return (component_bag, False)
+    return identify_clusters(adjacency_bags = component_bag)
+
 
 def identify_clusters(df=None, adjacency_bags=None):
     global MIN_CLUSTER_SIZE, CLIENT
+    
     # Clean and filter
     if df: adjacency_bags = get_component_adjacency_bags(df)
     adjacency_bags = adjacency_bags.map(prune)
     adjacency_bags = adjacency_bags.filter(
         lambda adj_bag: adj_bag.count >= MIN_CLUSTER_SIZE)
-    if adjacency_bags.count == 0:
-        return # Base case - no large enough components, don't process further
     
-    # Partition adjacency bags into further components
-    edge_scores = girvan_newman(adjacency_bags)
-    upper_score_threshold = get_upper_threshold(gn_scores)
-    new_df, num_edges_removed = chop_df(df, edge_scores, upper_score_threshold)
-    if num_edges_removed == 0:
-        if new_df.shape[0].compute() >= MIN_CLUSTER_SIZE:
-            return df # Cluster found!
-        return # No edges removed, but the cluster is too small to report.
+    # Bag([(component1_bag, continue), (component2_bag, continue), ...])
+    components = adjacency_bags.map(process_component).flatten()
+    components = components.map(lambda component: recurse(component))
     
-    new_components = component_adjacency_bags(new_df)
-    clusters = CLIENT.map(identify_clusters, adjacency_bags=new_components)
-    return clusters # Caller will have to wait for result then flatten.
+    # Filter and map components to include only bags
+    clusters = components.filter(
+        lambda component: component[0] is not None).map(
+            lambda component: component[0])
+    return clusters
 
 
 
