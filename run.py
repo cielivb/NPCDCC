@@ -37,6 +37,7 @@ import dask
 import numpy as np
 import os
 import random
+from collections import Counter
 from collections import defaultdict
 from dask import bag as db
 from dask import dataframe as ddf
@@ -116,20 +117,22 @@ class Layer():
         return self.nodes.count().compute() == 0
 
     
-    def update_leaves(self, adjacencies, leaves, state, node_to_i, all_children):
+    def update_leaves(self, adjacencies, leaves, state, node_to_i):
         """ Add leaf nodes in adjacencies to leaves bag. 
         Leaf nodes are those with no children, i.e., none of their neighbours
-        in adjacencies are undiscovered.
-        If a node is a leaf, then none of its neighbours will be in all_children.
+        are undiscovered.
         """
-        child_ids = all_children.compute()
         no_weights = adjacencies.map(
             lambda node_adjacency: (node_adjacency[0], 
                                     list(map(lambda tup: tup[0], node_adjacency[1]))))
-        leaf_nodes = no_weights.filter(
-            lambda node_adjacency: len(list(filter(
-                lambda node: node in child_ids, node_adjacency[1]))) == 0)
-        leaf_nodes = leaf_nodes.map(lambda tup: tup[0])
+        neighbour_states = no_weights.map(
+            lambda node_adjacency: (node_adjacency[0],
+                                    list(map(
+                                        lambda nnode: state[node_to_i[nnode]],
+                                        node_adjacency[1]))))
+        leaf_nodes = neighbour_states.filter(
+            lambda tup: Counter(tup[1])["P"] == len(tup[1])).map(
+                lambda tup: tup[0])
         return leaf_nodes
            
         
@@ -180,7 +183,11 @@ class Layer():
         # relies on parents being marked as P.
         processed_is = adjacencies.map( # Get this layer's node's indices
             lambda node_adjacency: node_to_i[node_adjacency[0]]).compute()
-        state[processed_is] = "P"        
+        state[processed_is] = "P"
+        
+        # Compute leaf nodes (those with no child nodes)
+        leaf_nodes = self.update_leaves(adjacencies, leaves, state, node_to_i)
+        leaves = db.concat([leaves, leaf_nodes]).persist()        
 
         # Get the children nodes of this layer
         all_children = adjacencies.map(
@@ -196,10 +203,6 @@ class Layer():
             child_parent_rels = self.get_child_parent_rels(
                 adjacency_bag, adjacencies, state, node_to_i, all_children)
             all_child_parent_rels = db.concat([all_child_parent_rels, child_parent_rels]).persist()
-        
-        # Compute leaf nodes (those with no child nodes)
-        leaf_nodes = self.update_leaves(adjacencies, leaves, state, node_to_i, all_children)
-        leaves = db.concat([leaves, leaf_nodes]).persist()
         
         # Free memory
         #CLIENT.cancel([adjacencies, self.nodes])
