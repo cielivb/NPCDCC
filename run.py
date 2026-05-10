@@ -42,8 +42,6 @@ from collections import defaultdict
 from dask import bag as db
 from dask import dataframe as ddf
 from dask.distributed import Client
-from queue import Queue
-from threading import Lock
 
 CLIENT = None # Assigned properly at bottom of script
 MIN_CLUSTER_SIZE = 30
@@ -109,6 +107,12 @@ def get_all_nodes(adjacency_bag):
 def get_num_nodes(adjacency_bag):
     """ Return the number of nodes in the graph represented by bag """
     return get_all_nodes(adjacency_bag).count().compute()
+
+
+def log_removed_edges(removed_edges):
+    """ Log removed edges in a temp file. These edges can be analysed to address
+    the research question in a similar manner as the clusters. """
+    pass # TODO
 
 
 
@@ -496,6 +500,25 @@ def girvan_newman(component):
 
 
 
+### CLUSTER IDENTIFICATION - DECOMPOSITION --------------------------------
+
+def get_upper_threshold(edge_scores):
+    """ Calculate MAD-based upper threshold.
+    edge_scores of form Bag([((pre, post), edge_score), ...])
+    """
+    global MAD_K
+    pass # TODO
+
+
+def chop(component, edge_scores, upper_threshold):
+    """ Remove outlier edges from component. 
+    Return updated adjacency bag and bag of edges removed.
+    """
+    pass # TODO
+
+
+
+
 ### CLUSTER IDENTIFICATION - IDENTIFY CLUSTERS ----------------------------
 
 def process_component(component):
@@ -512,11 +535,12 @@ def process_component(component):
     """
     global MIN_CLUSTER_SIZE
     edge_scores = girvan_newman(component)
-    upper_score_threshold = get_upper_threshold(gn_scores)
-    new_adj_bag, num_edges_removed = chop(component, edge_scores, upper_score_threshold)
+    upper_score_threshold = get_upper_threshold(edge_scores)
+    new_adj_bag, removed_edges = chop(component, edge_scores, upper_score_threshold)
+    log_removed_edges(removed_edges)
     if get_num_nodes(new_adj_bag).compute() < MIN_CLUSTER_SIZE:
         return (None, False) # Cluster/component too small
-    if num_edges_removed == 0:
+    if removed_edges.count().compute() == 0:
         return (new_bag, False) # Cluster found! Don't continue processing.    
     
 
