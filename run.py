@@ -97,6 +97,20 @@ def df_to_adjacency_bag(df, undirect=True):
     return adjacency_bag.persist()
 
 
+def get_all_nodes(adjacency_bag):
+    """ Return bag of all nodes in graph represented by bag """
+    main_nodes = adjacency_bag.map(lambda node_adj: node_adj[0])
+    nnodes = adjacency_bag.map(
+        lambda node_adj: node_adj[1]).flatten().map(lambda tup: tup[0])
+    nodes = db.concat([main_nodes, nnodes])
+    return nodes
+
+
+def get_num_nodes(adjacency_bag):
+    """ Return the number of nodes in the graph represented by bag """
+    return get_all_nodes(adjacency_bag).count().compute()
+
+
 
 
 ### PARALLEL BFS ----------------------------------------------------------
@@ -227,7 +241,7 @@ class Layer():
 
 
 def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
-    """ Return parents dask bag and a set of leaves. 
+    """ Returns child_parent_rels bag, state array, and leaves bag
     
     The numpy arrays nodes and state will be automatically computed from the
     adjacency bag if not supplied. state is not required to complete the bfs
@@ -250,8 +264,6 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
     is here a 'Layer', which represents all the nodes at some leve/depth d in the 
     BFS tree.
     
-    Returns parents_bag, state, and leaves
-
     """
     # Create nodes and state arrays if not supplied
     supplied_nodes = nodes
@@ -400,8 +412,7 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
 ### CLUSTER IDENTIFICATION - GIRVAN NEWMAN --------------------------------
 
 
-def get_num_shortest_paths(start_node: int, parents: dict, 
-                           df: ddf.DataFrame, grouped_edges) -> dict:
+def get_num_shortest_paths(start_node, child_parent_rels, component) -> dict:
     """ Label each node with number of shortest paths to it from start_node. 
     Accounts for number of synapses.
     """
@@ -472,41 +483,42 @@ def calculate_edge_scores(start_node: int, parents: list,
     return edge_scores
 
 
-def get_edge_scores(start_node, grouped_edges, df):
+def get_edge_scores(start_node, component):
     """ Return dict of Girvan Newman edge scores starting at start_node.
     df should only contain pre, post, and syn_count cols """
-    parents = bfs_search(start_node, grouped_edges)
-    num_shortest_paths, leaves = get_num_shortest_paths(start_node, parents, df, grouped_edges)
-    edge_scores = calculate_edge_scores(start_node, parents, num_shortest_paths, grouped_edges, leaves)
+    child_parent_rels, state, leaves = pbfs(start_node, component)
+    num_shortest_paths = get_num_shortest_paths(start_node, child_parent_rels, component)
+    edge_scores = calculate_edge_scores(start_node, child_parent_rels, num_shortest_paths, leaves, component)
     return edge_scores
 
 
-def girvan_newman(grouped_edges, df):
-    # Choose random subset of nodes. 
-    # For now, using sample size = half the number of nodes in the df.
-    nodes = db.concat([df["pre"].unique().to_bag(), 
-                       df["post"].unique().to_bag]).unique().compute()
-    random_nodes = db.from_sequence(random.sample(nodes, len(nodes)/2))
+def girvan_newman(component):
+    """ Set up and do the edge-score calculation phase of Girvan-Newman """
+    # Map random subset of nodes to get_edge_scores.
+    # For now, using sample size = quarter the number of nodes in the df.
+    component_nodes = get_all_nodes(component).compute()
+    random_nodes = db.from_sequence(
+        random.sample(component_nodes, len(component_nodes)/4))
+    score_dicts = random_nodes.map(get_edge_scores, component)
     
-    # Map random subset of nodes to get_edge_scores()
-    score_dicts = random_nodes.map(get_edge_scores, grouped_edges, df)
-    # Sum edge scores and divide by a factor (e.g., 2 if using all nodes)
-    def score_dict_to_tuples(score_dict):
-        """ Score dict contains edge scores for each edge """
-        score_tuples = []
-        for edge, score in score_dict.items():
-            score_tuples.append((edge, score))
-        return db.from_sequence(score_tuples)
-    score_tuples = score_dicts.map(score_dict_to_tuples).flatten()
-    scores = score_tuples.foldby(
-        key = lambda edge_score: edge_score[0],
-        binop = lambda accum, edge_score: accum + edge_score[1],
-        initial = 0,
-        combine = lambda accum1, accum2: accum1 + accum2,
-        combine_initial = 0
-    )
-    # Used sample size = half # nodes in df -> factor = 1
-    factor = 1
+    # Sum edge scores
+    #def score_dict_to_tuples(score_dict):
+        #""" Score dict contains edge scores for each edge """
+        #score_tuples = []
+        #for edge, score in score_dict.items():
+            #score_tuples.append((edge, score))
+        #return db.from_sequence(score_tuples)
+    #score_tuples = score_dicts.map(score_dict_to_tuples).flatten()
+    #scores = score_tuples.foldby(
+        #key = lambda edge_score: edge_score[0],
+        #binop = lambda accum, edge_score: accum + edge_score[1],
+        #initial = 0,
+        #combine = lambda accum1, accum2: accum1 + accum2,
+        #combine_initial = 0
+    #)
+    
+    # Used sample size = quarter # nodes in df -> factor = 0.5
+    factor = 0.5
     standardised_scores = scores.map(lambda edge_score: (edge_score[0], edge_score[1]/factor))
     return standardised_scores
 
@@ -528,10 +540,10 @@ def process_component(component):
     Takes a bag called component representing the edges of a component.
     """
     global MIN_CLUSTER_SIZE
-    edge_scores = girvan_newman(adjacency_bags)
+    edge_scores = girvan_newman(component)
     upper_score_threshold = get_upper_threshold(gn_scores)
-    new_bag, num_edges_removed = chop(component, edge_scores, upper_score_threshold)
-    if get_num_nodes(new_bag).compute() < MIN_CLUSTER_SIZE:
+    new_adj_bag, num_edges_removed = chop(component, edge_scores, upper_score_threshold)
+    if get_num_nodes(new_adj_bag).compute() < MIN_CLUSTER_SIZE:
         return (None, False) # Cluster/component too small
     if num_edges_removed == 0:
         return (new_bag, False) # Cluster found! Don't continue processing.    
