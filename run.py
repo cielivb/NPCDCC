@@ -241,22 +241,24 @@ class Layer():
 
 
 def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
-    """ Returns child_parent_rels bag, state array, and leaves bag
+    """ Returns child_parent_rels bag, state array, leaves bag, and 
+    num_shortest_paths bag.
     
     The numpy arrays nodes and state will be automatically computed from the
     adjacency bag if not supplied. state is not required to complete the bfs
     search, however, the caller (e.g., get_component_adjacency_bags()) may 
     wish to validate the status of each node after the search is complete.
     
-    Indices in parents_bag correspond to indices in nodes (or more generally, 
-    to indices in adjacency_bag, although that cannot be indexed). 
-    
-    parents_bag has the general form
+    adjacency_bag has the general form
         db.from_sequence([(c, [(a, w), (b, w)]), (d, [(c, w)])])
     where a and b are parents of c, c is the only parent of d, and w is the
     edge weight or number of synapses along that edge.
 
-    The set of leaves contains nodes that do not have any children.
+    The bag of leaves contains nodes that do not have any children.
+    
+    The num_shortest_paths bag is of the general form
+        db.from_sequence([(node1, num_paths), (node2, num_paths), ...])
+    where num_paths is the number of shortest paths from start_node to node1 etc
     
     The original PBFS inspiration comes from the logic behind 'Bags' and 'Pennants'
     described at https://dl.acm.org/doi/epdf/10.1145/1810479.1810534. This is
@@ -412,82 +414,54 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
 ### CLUSTER IDENTIFICATION - GIRVAN NEWMAN --------------------------------
 
 
-def get_num_shortest_paths(start_node, child_parent_rels, component) -> dict:
-    """ Label each node with number of shortest paths to it from start_node. 
-    Accounts for number of synapses.
+def calculate_edge_scores(start_node, child_parent_rels, num_shortest_paths, 
+                          leaves, component):
+    """ Return Bag of tuples Bag([((pre, post), edge_score), ...])
+    Edge scoring rules are detailed on page 365 of MMDS Chapter 10 
+    
+    The num_shortest_paths bag is of the general form
+        db.from_sequence([(node1, num_paths), (node2, num_paths), ...])
+    where num_paths is the number of shortest paths from start_node to node1 etc
+    
     """
-    state = np.full(len(parents), "U", dtype="<U1")
-    queue = Queue()
-    leaves = []
-    num_shortest_paths = {start_node: 1}
+    to_score = leaves
+    edge_scores = []
     
-    nodes = np.fromiter(map(lambda tup: tup[0], grouped_edges), dtype=int)    
-    start_node_index = np.where(nodes == start_node)[0][0]
-    first_children = grouped_edges[start_node_index][1]
-    for child in first_children:
-        queue.put(child)
+    def credit(node):
+        """ Rule 1: leaves get credit = 1. Rule 2: other nodes get credit = 1 + 
+        sum of credits of the DAG edges from that node to its children """
+        credit = 1 + edge_scores.filter(
+            lambda entry: entry[0][0] == node).map(
+                lambda entry: entry[1]).sum()
+        return (node, credit)
     
-    while not queue.empty():
-        node = queue.get()
+    def process_nodes(node_w_credit):
+        """ Rule 3: A DAG edge e entering node Z from the level above is given a
+        share of the credit of Z proportional to the fraction of shortest
+        paths from the root to Z that go through e.
+        Returns the node's parents.
+        """
+        node, credit = node_w_credit
+        parents = db.from_sequence(all_child_parent_rels[node])
+        total_num_shortest_paths_to_parents = parents.map(
+            lambda parent: num_shortest_paths[parent])
+        edge_credits = parents.map(
+            lambda parent: ((parent, node), 
+                            credit * num_shortest_paths[parent] / 
+                            total_num_shortest_paths_to_parents))
+        return edge_credits
         
-        # Get number of shortest paths to node
-        num_paths_to_node = 0
-        for parent in parents[node]:
-            num_synapses_to_parent = ...
-            num_paths += num_shortest_paths[parent] * num_synapses_to_parent
-        num_shortest_paths[node] = num_paths_to_node
+    while to_score.count().compute() > 0:
+        nodes_w_credits = to_score.map(credit)
+        to_score = process_nodes.map(nodes_w_credits).flatten()
         
-        # Add node's children to queue
-        node_index = np.where(nodes == node)[0][0]
-        children = grouped_edges[node_index][1]
-        if len(children) == 0:
-            leaves.append(node)
-        for child in children:
-            queue.put(child)
-    
-    return (num_shortest_paths, leaves)
-
-
-def calculate_edge_scores(start_node: int, parents: list, 
-                          num_shortest_paths: dict, grouped_edges: list, leaves: list):
-    """ Edge scoring rules are detailed on page 365 of MMDS Chapter 10 """
-    nodes = np.fromiter(map(lambda tup: tup[0], grouped_edges), dtype=int) 
-    nodes_to_score, edge_scores = Queue(), dict()
-    with nodes_to_score.mutex: # with queue lock
-        nodes_to_score.queue.extend(leaves) # Add all leaves at once
-        
-    while not nodes_to_score.empty():
-        node = nodes_to_score.get()
-        node_index = np.where(nodes == node)[0][0]
-        
-        if node in leaves:
-            node_credit = 1 # Rule 1
-        else:
-            # Rule 2
-            children = grouped_edges[node_index][1]
-            child_edge_credits = 0
-            for child in children:
-                child_edge_credits += edge_scores[(node, child)]
-            node_credit = 1 + child_edge_credits
-            
-        # Rule 3
-        node_parents = parents[node_index]
-        total_num_shortest_paths_to_parents = 0
-        for parent in node_parents:
-            total_num_shortest_paths_to_parents += num_shortest_paths[parent]
-        for parent in node_parents:
-            edge_credit = node_credit * num_shortest_paths[parent] / total_num_shortest_paths_to_parents
-            edge_scores[(parent, node)] = edge_credit
-            nodes_to_score.put(parent)
-    
     return edge_scores
 
 
 def get_edge_scores(start_node, component):
     """ Return dict of Girvan Newman edge scores starting at start_node.
     df should only contain pre, post, and syn_count cols """
-    child_parent_rels, state, leaves = pbfs(start_node, component)
-    num_shortest_paths = get_num_shortest_paths(start_node, child_parent_rels, component)
+    child_parent_rels, state, leaves, num_shortest_paths = pbfs(start_node, component)
     edge_scores = calculate_edge_scores(start_node, child_parent_rels, num_shortest_paths, leaves, component)
     return edge_scores
 
