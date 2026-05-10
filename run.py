@@ -121,6 +121,7 @@ class Layer():
         Leaf nodes are those with no children, i.e., none of their neighbours
         are undiscovered.
         """
+        # TODO - this func is a slight bottleneck - fix it if time allows        
         no_weights = adjacencies.map(
             lambda node_adjacency: (node_adjacency[0], 
                                     list(map(lambda tup: tup[0], node_adjacency[1]))))
@@ -143,6 +144,7 @@ class Layer():
         """ Record parentage for each child 
         The child node's parents are those nodes in the child's adjacencies
         where the states of those nodes are 'P'."""
+        # TODO - this func is a slight bottleneck - fix it if time allows
         global CLIENT
         child_ids = all_children.compute()
         child_adjacencies = adjacency_bag.filter(
@@ -172,39 +174,54 @@ class Layer():
             Bag([(a, [(b, 3)]), (b: [(a, 3), (c, 2)], ...]))
         where the edge from b->a and a->b has weight 3 (i.e., 3 synapses).
         """
+        print("Setting up layer processing ...")
         # Set-up layer processing
         out_layer = Layer()
         layer_nodes = self.nodes.compute()
         adjacencies = adjacency_bag.filter( # Get adjacencies for this layer's nodes
             lambda node_adjacency: node_adjacency[0] in layer_nodes).persist()
         del layer_nodes
-                
+        print("Set up layer processing")
+        
+        print("Marking this layer's nodes as processed ...")
         # Mark this layer's nodes as processed. The child-parent rel and leaf
         # computation sections rely on parents being marked as P.
         processed_is = adjacencies.map( # Get this layer's node's indices
             lambda node_adjacency: node_to_i[node_adjacency[0]]).compute()
         state[processed_is] = "P"
         del processed_is
+        print("Marked as processed")
         
+        print("Getting leaf nodes ...")
         # Get leaf nodes (those with no child nodes)
         leaves = self.update_leaves(adjacencies, leaves, state, node_to_i)
+        print("Leaf nodes retrieved")
 
+        print("Getting children nodes ...")
         # Get the children nodes of this layer
         all_children = adjacencies.map(
             lambda tup: tup[1]).flatten().map(
                 lambda tup: tup[0]).distinct().filter(
                     lambda node_id: state[node_to_i[node_id]] != "P").persist()
+        print("Children nodes retrieved")
         
         # Discover child nodes and compute child-parent relationships
         if all_children.count().compute() > 0:
+            print("Inserting children into next layer ...")
             out_layer.insert(all_children)
+            print("Children inserted into next layer")
+            print("Marking children as discovered ...")
             undiscovered_is = all_children.map(
                 lambda child_id: node_to_i[child_id]).compute()
             state[undiscovered_is] = "D"
             del undiscovered_is
+            print("Children marked as discovered")
+            print("Getting child-parent relationships ...")
             all_child_parent_rels = self.get_child_parent_rels(
                 adjacency_bag, adjacencies, state, node_to_i, all_children, all_child_parent_rels)
+            print("Relationships retrieved")
         
+        print("Returning PBFS data ...")
         return (out_layer, leaves, all_child_parent_rels)
         
 
@@ -238,10 +255,11 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
     """
     # Create nodes and state arrays if not supplied
     supplied_nodes = nodes
-    if not type(nodes) is np.array:
+    if not type(nodes) is np.ndarray:
         nodes = np.array(adjacency_bag.map(
             lambda node_adjacency: node_adjacency[0]).compute())
-    if not type(state) is np.array:
+    if not type(state) is np.ndarray:
+        print(f"State {state} not a numpy array - {type(state)}")
         state = np.full(len(nodes), "U", dtype="<U1")
     
     # Create look-up dict node_to_i and initialise state array.
@@ -253,7 +271,7 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
     # The nodes array is no longer required for this function. If nodes was not
     # originally supplied, delete the nodes array. Don't delete the nodes 
     # array if it was supplied to avoid interfering with other functions.
-    if not supplied_nodes:
+    if not type(supplied_nodes) is np.ndarray:
         del nodes, supplied_nodes
     
     # Create empty leaves and all_child_parent_rels bags
@@ -264,8 +282,10 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
     current_layer = Layer()
     current_layer.insert(db.from_sequence([start_node]))
 
+    
     # Process each layer until max tree depth reached
     while not current_layer.is_empty():
+        print(f"Processing Layer {current_layer.nodes.compute()}")
         next_layer, leaves, all_child_parent_rels = current_layer.process(
             adjacency_bag, state, node_to_i, all_child_parent_rels, leaves)
         current_layer = next_layer
@@ -337,32 +357,41 @@ def get_component_adjacency_bags(df: ddf.DataFrame, undirected=True):
     scope of this function. See the bfs_search function.
 
     """
-    big_adjacency_bag = df_to_adjacency_bag(df)
-    nodes = big_adjacency_bag.map(
-        lambda node_adjacency: node_adjacency[0]).compute() # numpy array
+    print("Starting get_component_adjacency_bags")
+    big_adjacency_bag = df_to_adjacency_bag(df, undirected)
+    nodes = np.array(big_adjacency_bag.map(
+        lambda node_adjacency: node_adjacency[0]).compute())
     state = np.full(len(nodes), "U", "<U1") # nodes indices map to state indices
-    components = None # Will be a dask bag of adjacency bags (one per component)
+    components = [] # Will later be a dask bag of adjacency bags (one per component)
+    print(f"Initialisation complete - nodes = {nodes}")
     
     # Iterate until all nodes are assigned to a component. Must find one
     # component at a time.
     for node_index in range(len(nodes)):
+        print(f"Reached node_index {node_index} of {len(nodes)}")
+        print(f"\tState = {state}")
         if state[node_index] == "U":
             prev_state = state.copy()
-            node = nodes[node_index]            
-            state[node_index] = "D"
+            start_node = nodes[node_index]            
             
-            pbfs(node, big_adjacency_bag, nodes, state)
+            print("Running PBFS ...")
+            all_child_parent_rels, state, leaves = pbfs(start_node, 
+                                                        big_adjacency_bag,
+                                                        state, nodes)
+            print(f"PBFS complete - {state}")
+            del all_child_parent_rels, leaves
             
             # Add new component
+            print("Adding new component ...")
             diff_indices = np.where(state != prev_state)[0]
             component_nodes = nodes[diff_indices]
             component_adj = big_adjacency_bag.filter(
                 lambda node_adjacency: node_adjacency[0] in component_nodes)
-            if not components:
-                components = [component_adj]
-            else:
-                components = components.append(component_adj)
+            components = components + [component_adj.persist()]
+            print(f"Component appended: {component_adj}")
+            print(f"Components: {components.compute()}")
     
+    print("Finishing get_component_adjacency_bags")
     return db.from_sequence(components)
 
 

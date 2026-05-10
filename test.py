@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import unittest
 
+from dask import bag as db
 from dask import dataframe as ddf
 from dask.distributed import Client
 from datetime import datetime
@@ -442,10 +443,10 @@ class TestGetComponentAdjacencyBags(unittest.TestCase):
         time1 = time() - start_time
         
         # Run assertions
-        self.assertInstance(result, db.Bag)
+        self.assertIsInstance(result, db.Bag)
         components = result.compute()
         self.assertTrue(len(components) == 2)
-        self.assertInstance(components[0], db.Bag)
+        self.assertIsInstance(components[0], db.Bag)
         c1, c2 = components[0].compute(), components[1].compute()
         c1 = process_computed_adjacency_bag(c1)
         c2 = process_computed_adjacency_bag(c2)
