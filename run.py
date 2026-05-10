@@ -129,37 +129,39 @@ class Layer():
             lambda node_adjacency: (node_adjacency[0],
                                     list(map(
                                         lambda nnode: state[node_to_i[nnode]],
-                                        node_adjacency[1]))))
+                                        node_adjacency[1])))).persist()
+        del no_weights
         leaf_nodes = neighbour_states.filter(
             lambda tup: Counter(tup[1])["P"] == len(tup[1])).map(
-                lambda tup: tup[0])
-        return leaf_nodes
-           
-        
-    def attach_neighbour_i(self, neighbour_bag, nodes):
-        """ For each tuple in neighbour_bag, append the index of the node.
-        neighbour_bag e.g., Bag([(b, 3), (c, 4), ...]) """
-        neighbour_bag = neighbour_bag.map(
-            lambda tup: (tup[0], tup[1], np.where(nodes == tup[0])[0][0]))
-        return neighbour_bag    
+                lambda tup: tup[0]).persist()
+        del neighbour_states
+        leaves = db.concat([leaves, leaf_nodes]).persist()  
+        del leaf_nodes
+        return leaves
+
     
-    
-    def get_child_parent_rels(self, adjacency_bag, adjacencies, state, node_to_i, all_children):
+    def get_child_parent_rels(self, adjacency_bag, adjacencies, state, node_to_i, all_children, all_child_parent_rels):
         """ Record parentage for each child 
         The child node's parents are those nodes in the child's adjacencies
         where the states of those nodes are 'P'."""
+        global CLIENT
         child_ids = all_children.compute()
+        child_adjacencies = adjacency_bag.filter(
+            lambda node_adjacency: node_adjacency[0] in child_ids).persist()
+        del child_ids
         parent_ids = adjacencies.map(
             lambda node_adjacency: node_adjacency[0]).filter(
                 lambda node_id: state[node_to_i[node_id]] == "P").compute()
-        child_adjacencies = adjacency_bag.filter(
-            lambda node_adjacency: node_adjacency[0] in child_ids)
         child_parent_rels = child_adjacencies.map(
             lambda node_adjacency: (
                 node_adjacency[0], 
                 filter(lambda tup: tup[0] in parent_ids, node_adjacency[1])
-            ))
-        return child_parent_rels
+            )).persist()
+        del parent_ids, child_adjacencies
+        all_child_parent_rels = db.concat([all_child_parent_rels, 
+                                           child_parent_rels]).persist()
+        del child_parent_rels
+        return all_child_parent_rels
         
     
     def process(self, adjacency_bag, nodes, state, leaves, all_child_parent_rels, node_to_i):
@@ -173,39 +175,40 @@ class Layer():
         
         """
         global CLIENT
+        # Set-up layer processing
         out_layer = Layer()
         layer_nodes = self.nodes.compute()
-        
         adjacencies = adjacency_bag.filter( # Get adjacencies for this layer's nodes
             lambda node_adjacency: node_adjacency[0] in layer_nodes).persist()
+        del layer_nodes
                 
-        # Mark this layer's nodes as processed. The child-parent rel section
-        # relies on parents being marked as P.
+        # Mark this layer's nodes as processed. The child-parent rel and leaf
+        # computation sections rely on parents being marked as P.
         processed_is = adjacencies.map( # Get this layer's node's indices
             lambda node_adjacency: node_to_i[node_adjacency[0]]).compute()
         state[processed_is] = "P"
+        del processed_is
         
-        # Compute leaf nodes (those with no child nodes)
-        leaf_nodes = self.update_leaves(adjacencies, leaves, state, node_to_i)
-        leaves = db.concat([leaves, leaf_nodes]).persist()        
+        # Get leaf nodes (those with no child nodes)
+        leaves = self.update_leaves(adjacencies, leaves, state, node_to_i)
 
         # Get the children nodes of this layer
         all_children = adjacencies.map(
             lambda tup: tup[1]).flatten().map(
                 lambda tup: tup[0]).distinct().filter(
                     lambda node_id: state[node_to_i[node_id]] != "P").persist()
+        
         # Discover child nodes and compute child-parent relationships
         if all_children.count().compute() > 0:
             out_layer.insert(all_children)
             undiscovered_is = all_children.map(
                 lambda child_id: node_to_i[child_id]).compute()
             state[undiscovered_is] = "D"
-            child_parent_rels = self.get_child_parent_rels(
-                adjacency_bag, adjacencies, state, node_to_i, all_children)
-            all_child_parent_rels = db.concat([all_child_parent_rels, child_parent_rels]).persist()
+            del undiscovered_is
+            all_child_parent_rels = self.get_child_parent_rels(
+                adjacency_bag, adjacencies, state, node_to_i, all_children, all_child_parent_rels)
         
         # Free memory
-        #CLIENT.cancel([adjacencies, self.nodes])
         return (out_layer, leaves, all_child_parent_rels)
         
 
