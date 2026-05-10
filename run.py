@@ -50,7 +50,6 @@ MIN_CLUSTER_SIZE = 30
 MAD_K = 3.5
 
 ROOT_DIR = os.path.dirname(__file__)
-TEMP_CPR_CSV = os.path.join(ROOT_DIR, "temp", "child_parent_rel.csv")
 
 
 
@@ -164,17 +163,15 @@ class Layer():
         return all_child_parent_rels
         
     
-    def process(self, adjacency_bag, nodes, state, leaves, all_child_parent_rels, node_to_i):
-        """ Check all neighbours of vertices for those that should be added
-        to the next layer out_layer. Updates parents_dict, leaves, and state
-        as required. Returns out_layer. 
+    def process(self, adjacency_bag, state, node_to_i, all_child_parent_rels, leaves):
+        """ Check all neighbours of self.nodes for those that should be added
+        to the next layer out_layer. Updates state, all_child_parent_rels, and
+        leaves as required. Returns out_layer. 
         
         adjacency_bag is of the form:
-            Bag([(a, Bag([(b, 3)])), (b: Bag([(a, 3), (c, 2)]), ...]))
-        where the edge from b->a and a->b has weight 3 (i.e., 3 synapses). 
-        
+            Bag([(a, [(b, 3)]), (b: [(a, 3), (c, 2)], ...]))
+        where the edge from b->a and a->b has weight 3 (i.e., 3 synapses).
         """
-        global CLIENT
         # Set-up layer processing
         out_layer = Layer()
         layer_nodes = self.nodes.compute()
@@ -208,7 +205,6 @@ class Layer():
             all_child_parent_rels = self.get_child_parent_rels(
                 adjacency_bag, adjacencies, state, node_to_i, all_children, all_child_parent_rels)
         
-        # Free memory
         return (out_layer, leaves, all_child_parent_rels)
         
 
@@ -240,25 +236,38 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
     Returns parents_bag, state, and leaves
 
     """
-    global TEMP_CPR_CSV
+    # Create nodes and state arrays if not supplied
+    supplied_nodes = nodes
     if not type(nodes) is np.array:
-        nodes = np.array(adjacency_bag.map( # TODO: is there a better way?
+        nodes = np.array(adjacency_bag.map(
             lambda node_adjacency: node_adjacency[0]).compute())
-    leaves, n = db.from_sequence([]), len(nodes)
     if not type(state) is np.array:
-        state = np.full(n, "U", dtype="<U1")
-    node_to_i = {node: i for i, node in enumerate(nodes)}        
+        state = np.full(len(nodes), "U", dtype="<U1")
+    
+    # Create look-up dict node_to_i and initialise state array.
+    # node_to_i has key = node, value = corresponding index in state array.
+    node_to_i = {node: i for i, node in enumerate(nodes)} 
     start_node_index = node_to_i[start_node]
     state[start_node_index] = "D"
+    
+    # The nodes array is no longer required for this function. If nodes was not
+    # originally supplied, delete the nodes array. Don't delete the nodes 
+    # array if it was supplied to avoid interfering with other functions.
+    if not supplied_nodes:
+        del nodes, supplied_nodes
+    
+    # Create empty leaves and all_child_parent_rels bags
+    leaves = db.from_sequence([])
     all_child_parent_rels = db.from_sequence([(start_node, [])])
-    layer_0 = Layer()
-    start_node_as_bag = db.from_sequence([start_node])
-    layer_0.insert(start_node_as_bag)
-    current_layer = layer_0
+    
+    # Initialise current layer (depth/level = 0)
+    current_layer = Layer()
+    current_layer.insert(db.from_sequence([start_node]))
 
+    # Process each layer until max tree depth reached
     while not current_layer.is_empty():
         next_layer, leaves, all_child_parent_rels = current_layer.process(
-            adjacency_bag, nodes, state, leaves, all_child_parent_rels, node_to_i)
+            adjacency_bag, state, node_to_i, all_child_parent_rels, leaves)
         current_layer = next_layer
 
     return (all_child_parent_rels, state, leaves)
