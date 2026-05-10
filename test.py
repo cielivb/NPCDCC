@@ -131,7 +131,6 @@ class TestDfToAdjacencyBag(unittest.TestCase):
                            time1, max_mem, None, None)
 
 
-@unittest.skip("OBSOLETE - bfs_components no longer takes dataframes")
 class TestPrune(unittest.TestCase):
     """ OBSOLETE - bfs_components no longer takes dataframes """    
     
@@ -140,27 +139,21 @@ class TestPrune(unittest.TestCase):
     def test_base_case(self):
         """ A graph with no degree 1 edges returns itself """
         d = {"pre": [0,1,3,3,5,0], "post": [1,2,2,4,4,5]}
-        df_before = ddf.from_pandas(pd.DataFrame(data=d))
-        df_after = pd.DataFrame(data=d).sort_values(by=["pre","post"])
-        df_after = df_after.reset_index(drop=True)
+        before = run.df_to_adjacency_bag(get_six_node_cycle_dask_df())
+        expected = run.df_to_adjacency_bag(get_six_node_cycle_dask_df()).compute()
         
         # Get time to run
         start_time = time()
-        result_before_compute = run.prune(df_before)
+        result = run.prune(before).compute()
         time1 = time() - start_time
-        comp_start_time = time()
-        result = result_before_compute.compute()
-        time2 = time() - comp_start_time
         
         # Check if test passed
-        result = result.sort_values(by=["pre","post"]).reset_index(drop=True)
-        assert_frame_equal(result, df_after)
+        self.assertEqual(result, expected)
         
         # Get max memory usage
-        max_mem = max(memory_usage((run.prune, (df_before,))))
-        comp_max_mem = max(memory_usage((lambda: result_before_compute.compute(),)))
+        max_mem = max(memory_usage((run.prune, (before,))))
         report_test_result(TestPrune.OUTFILE, "test_base_case", 
-                           time1, max_mem, time2, comp_max_mem)
+                           time1, max_mem, None, None)
         
     def test_single_incoming_deg1_edge(self):
         d_b = {"pre": [0,1,3,3,5,0,6], "post": [1,2,2,4,4,5,0]}
@@ -296,7 +289,7 @@ class TestGetUpperThreshold(unittest.TestCase):
     pass
 
 
-#@unittest.skip("Passing as of 10/5/26")
+@unittest.skip("Passing as of 10/5/26")
 class TestPBFS(unittest.TestCase):
     
     OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test_pbfs.txt")

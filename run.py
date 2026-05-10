@@ -297,6 +297,21 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
 
 ### CLUSTER IDENTIFICATION - PRUNE ----------------------------------------
 
+def cut_deg1_edge(node_adj, should_cut: bool):
+    """ Change node adjacency list to empty list if should cut. 
+    This effectively makes the node a degree 0 node. """
+    if should_cut:
+        node_adj = (node_adj[0], [])
+    return node_adj
+
+
+def remove_deg_1_nodes(node_adj, deg1_nodes):
+    """ Remove edges from node to nodes in degree 1 nodes """
+    neighbours = list(filter(
+        lambda tup: tup[0] not in deg1_nodes, node_adj[1]))
+    return (node_adj[0], neighbours)
+
+
 def prune(adjacency_bag: db.Bag) -> db.Bag:
     """ Iteratively remove degree 1 edges from a dask dataframe 
     
@@ -307,30 +322,37 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
     
     Adjacency bag format:
             db.from_sequence([(a, [(b, 3)]), (b: [(a, 3)])])
+            
+    The naive approach would be to take away one edge at a time. This parallel
+    version improves performance by finding all degree 1 edges initially, and
+    pruning each 'chain' in parallel. The time to complete is the time it takes
+    to process the longest 'chain'.
 
     """
     deg1_node_adjs = adjacency_bag.filter( # Get degree 1 nodes (deg 0 not present)
-        lambda node_adj: len(node_adj[1] == 1))
-    
-    def cut_deg1_edge(node_adj, should_cut: bool):
-        """ Change node adjacency list to empty list if should cut. 
-        This effectively makes the node a degree 0 node. """
-        if should_cut:
-            node_adj = (node_adj[0], [])
-        return node_adj
+        lambda node_adj: len(node_adj[1]) == 1)
     
     while deg1_node_adjs.count().compute() > 0:
         deg1_nodes = deg1_node_adjs.map(
             lambda node_adj: node_adj[1][0][0]).compute()
-        neighbours = deg1_nodes_adj.map(
-            lambda node_adjacency: node_adjacency[1][0][0])
         
         # Remove edge from deg1 node to neighbour
         adjacency_bag = adjacency_bag.map(
             lambda node_adj: cut_deg1_edge(node_adj, node_adj[0] in deg1_nodes))
-        # Remove edge from neighbour to deg1 node
         
-
+        # Remove edge from neighbours to deg1 nodes
+        neighbours = deg1_nodes_adj.map(
+            lambda node_adjacency: node_adjacency[1][0][0])        
+        adjacency_bag = adjacency_bag.map(
+            lambda node_adj: remove_deg_1_nodes(node_adj, deg1_nodes))
+        
+        # Get fresh degree 1 nodes
+        deg1_node_adjs = adjacency_bag.filter( # Get degree 1 nodes (deg 0 not present)
+            lambda node_adj: len(node_adj[1] == 1))
+        deg1_nodes = deg1_node_adjs.map(
+            lambda node_adj: node_adj[1][0][0]).compute()
+        
+    return adjacency_bag
 
 
 ### CLUSTER IDENTIFICATION - BFS TREE -------------------------------------
