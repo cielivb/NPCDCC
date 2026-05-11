@@ -478,14 +478,14 @@ def calculate_edge_scores(start_node, child_parent_rels, num_shortest_paths,
     num_sp = dict(num_shortest_paths.compute()) # Quick look-up
     to_score = leaves
     edge_scores = db.from_sequence([])
+    all_child_parent_rels = dict(child_parent_rels.compute())
     
     def credit(node):
         """ Rule 1: leaves get credit = 1. Rule 2: other nodes get credit = 1 + 
         sum of credits of the DAG edges from that node to its children """
-        #credit = 1 + edge_scores.filter(
-            #lambda entry: entry[0][0] == node).map(
-                #lambda entry: entry[1]).sum().compute()
-        credit = 1 + sum()
+        credit = 1 + edge_scores.filter(
+            lambda entry: entry[0][0] == node).map(
+                lambda entry: entry[1]).sum().compute()
         return (node, credit)
     
     def process_nodes(node_w_credit):
@@ -496,14 +496,15 @@ def calculate_edge_scores(start_node, child_parent_rels, num_shortest_paths,
         node, credit = node_w_credit
         parents = db.from_sequence(all_child_parent_rels[node])
         total_num_shortest_paths_to_parents = parents.map(
-            lambda parent: num_shortest_paths[parent])
+            lambda parent: num_shortest_paths[parent[0]])
         node_edge_scores = parents.map(
-            lambda parent: ((parent, node), 
-                            credit * num_shortest_paths[parent] / 
+            lambda parent: ((parent[0], node), 
+                            credit * num_shortest_paths[parent[0]] / 
                             total_num_shortest_paths_to_parents))
         return node_edge_scores
         
     while to_score.count().compute() > 0:
+        print(f"Nodes to score = {to_score.compute()}")
         nodes_w_credits = to_score.map(credit)
         new_edge_scores = nodes_w_credits.map(process_nodes).flatten()
         edge_scores = db.concat([edge_scores, new_edge_scores])
