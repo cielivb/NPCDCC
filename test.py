@@ -367,7 +367,7 @@ class TestPBFS(unittest.TestCase):
         
         # Time it
         start_time = time()
-        parents_bag, state, leaves, num_sps = run.pbfs(start_node, adjacency_bag)
+        parents_bag, children_bag, state, leaves, num_sps = run.pbfs(start_node, adjacency_bag)
         time1 = time() - start_time
         leaves = leaves.compute()
         num_sps = num_sps.compute()
