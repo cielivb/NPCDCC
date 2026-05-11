@@ -171,28 +171,39 @@ class Layer():
         child_ids = set(all_children.compute())
         cp_rels = defaultdict(list)
         
-        def process_children(neighbour_nodes, parent):
-            """ Add child-parent rels and return list of children neighbours """
-            child_neighbours = list(filter(
-                lambda tup: tup[0] in child_ids, neighbour_nodes))
-            for child, syn_count in child_neighbours:
-                cp_rels[child].append((parent, syn_count))
-            return child_neighbours
+        def get_children(neighbour_nodes, parent):
+            """ Return list of children neighbours """
+            return list(filter(lambda tup: tup[0] in child_ids, neighbour_nodes))
         
-        # A parent-child relationship exists where there is an edge from a 
-        # parent to a neighbour who is a member of child_ids
-        parent_child_adjs = adjacencies.map(
-            lambda adj: (adj[0], process_children(adj[1], adj[0]))).persist()
+        # Get parent-child relationships
+        parent_child_adjs = dict(adjacencies.map(
+            lambda adj: (adj[0], get_children(adj[1], adj[0]))).compute())
+        print(parent_child_adjs)
         
-        # Process child-parent relationships dict cp_rels - remove any
-        # duplicates that may have appeared
-        child_parent_adjs = db.from_sequence(cp_rels.items()).distinct()
-        child_parent_adjs = child_parent_adjs.map(
-            lambda tup: (tup[0], list(set(tup[1])))).persist()
+        def is_child(parent, child):
+            """ Return True if child is child of parent """
+            try:
+                parent_children = parent_child_adjs[parent]
+            except KeyError:
+                return False
+            return True if child in parent_children else False
+        
+        def get_parents(neighbour_nodes, child):
+            """ Return list of parent neighbours """
+            # An entry pre-exists in parent_child_adjs for child-parent pairs.
+            return(list(filter(lambda tup: is_child(tup[0], child), neighbour_nodes)))
+                
+        # Get child-parent relationships
+        child_adjs = adjacencies.filter(lambda adj: adj[0] in child_ids)
+        child_parent_adjs = child_adjs.map(
+            lambda adj: (adj[0], get_parents(adj[1], adj[0])))
         
         # Add new adjacencies to existing adjacency bags
+        parent_child_adjs_bag = db.from_sequence(parent_child_adjs.items())
         all_child_parent_rels = db.concat([all_child_parent_rels, child_parent_adjs])
-        all_parent_child_rels = db.concat([all_parent_child_rels, parent_child_adjs])
+        all_parent_child_rels = db.concat([all_parent_child_rels, parent_child_adjs_bag])
+        print(child_parent_adjs.compute())
+        print(all_child_parent_rels.compute())        
         return (all_child_parent_rels, all_parent_child_rels)
 
 
@@ -210,6 +221,7 @@ class Layer():
         
         # Create quick look-up child-to-parents dict
         children = all_children.compute()
+        print(all_child_to_parent_rels.compute())
         get_parents = dict(all_child_to_parent_rels.filter(
             lambda child_adj: child_adj[0] in children).compute())
         del children
@@ -262,6 +274,12 @@ class Layer():
             state[undiscovered_is] = "D"
             del undiscovered_is
         
+        # Mark this layer's nodes as processed - required for child-parent rels
+        processed_is = adjacencies.map( # Get this layer's node's indices
+            lambda node_adjacency: node_to_i[node_adjacency[0]]).compute()
+        state[processed_is] = "P"
+        del processed_is
+        
         # Update child-parent and parent-child relationships
         all_child_parent_rels, all_parent_child_rels = self.get_child_parent_rels(
             adjacency_bag, adjacencies, state, node_to_i, all_children, all_child_parent_rels, all_parent_child_rels)
@@ -272,12 +290,6 @@ class Layer():
         # Update number of shortest paths to each node from start node
         num_shortest_paths = self.update_num_shortest_paths(
             all_children, all_child_parent_rels, num_shortest_paths)
-        
-        # Mark this layer's nodes as processed
-        processed_is = adjacencies.map( # Get this layer's node's indices
-            lambda node_adjacency: node_to_i[node_adjacency[0]]).compute()
-        state[processed_is] = "P"
-        del processed_is
 
         return (out_layer, leaves, all_child_parent_rels, all_parent_child_rels, num_shortest_paths)
         
