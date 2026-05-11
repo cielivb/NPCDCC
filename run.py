@@ -146,58 +146,52 @@ class Layer():
         return self.nodes.count().compute() == 0
 
     
-    def update_leaves(self, adjacencies, all_parent_child_rels, leaves):
-        """ A main node in adjacencies is a leaf if no children are recorded
-        for that node in all_parent_child_rels """
-        pc_dict = dict(all_parent_child_rels.compute())
-        
-        def has_children(node):
-            """ Return True if at least one neighbour is a child """
-            children = pc_dict[node]
-            return False if not children else True
-            
-        leaf_nodes = adjacencies.map(
-            lambda adj: (adj[0], has_children(adj[0]))).filter(
-                lambda tup: not tup[1]).map(lambda tup: tup[0])
-        leaves = db.concat([leaves, leaf_nodes]).persist()
+    def update_leaves(self, adjacencies, leaves, state, node_to_i):
+        """ Add leaf nodes in adjacencies to leaves bag. 
+        Leaf nodes are those with no children, i.e., none of their neighbours
+        are undiscovered.
+        """
+        # TODO - this func is a slight bottleneck - fix it if time allows        
+        no_weights = adjacencies.map(
+            lambda node_adjacency: (node_adjacency[0], 
+                                    list(map(lambda tup: tup[0], node_adjacency[1]))))
+        neighbour_states = no_weights.map(
+            lambda node_adjacency: (node_adjacency[0],
+                                    list(map(
+                                        lambda nnode: state[node_to_i[nnode]],
+                                        node_adjacency[1])))).persist()
+        del no_weights
+        leaf_nodes = neighbour_states.filter(
+            lambda tup: Counter(tup[1])["P"] == len(tup[1])).map(
+                lambda tup: tup[0]).persist()
+        del neighbour_states
+        leaves = db.concat([leaves, leaf_nodes]).persist()  
+        del leaf_nodes
         return leaves
 
     
-    def get_child_parent_rels(self, adjacency_bag, adjacencies, state, node_to_i, 
-                              all_children, all_child_parent_rels, all_parent_child_rels):
+    def get_child_parent_rels(self, adjacency_bag, adjacencies, state, node_to_i, all_children, all_child_parent_rels):
         """ Record parentage for each child 
         The child node's parents are those nodes in the child's adjacencies
         where the states of those nodes are 'P'."""
-        # TODO
+        # TODO - this func is a slight bottleneck - fix it if time allows
         child_ids = all_children.compute()
-        parent_ids = adjacencies.map(
-            lambda node_adjacency: node_adjacency[0]).compute()
-        
-        # Update child-parent relationships
         child_adjacencies = adjacency_bag.filter(
-            lambda node_adjacency: node_adjacency[0] in child_ids)
+            lambda node_adjacency: node_adjacency[0] in child_ids).persist()
+        del child_ids
+        parent_ids = adjacencies.map(
+            lambda node_adjacency: node_adjacency[0]).filter(
+                lambda node_id: state[node_to_i[node_id]] == "P").compute()
         child_parent_rels = child_adjacencies.map(
             lambda node_adjacency: (
                 node_adjacency[0], 
                 list(filter(lambda tup: tup[0] in parent_ids, node_adjacency[1]))
-            )
-        ).persist()
-        all_child_parent_rels = db.concat(
-            [all_child_parent_rels, child_parent_rels])
-        
-        # Update parent-child relationships
-        parent_child_rels = adjacencies.map(
-            lambda node_adj: (
-                node_adj[0], 
-                list(filter(lambda tup: tup[0] in child_ids, node_adj[1]))
-            )
-        ).persist()
-        all_parent_child_rels = db.concat(
-            [all_parent_child_rels, parent_child_rels])
-        
-        #print(all_parent_child_rels.compute(), len(all_parent_child_rels.dask))
-        print(all_child_parent_rels.compute(), len(all_child_parent_rels.dask))
-        return (all_child_parent_rels, all_parent_child_rels)
+            )).persist()
+        del parent_ids, child_adjacencies
+        all_child_parent_rels = db.concat([all_child_parent_rels, 
+                                           child_parent_rels])
+        del child_parent_rels
+        return all_child_parent_rels
 
 
     def update_num_shortest_paths(self, all_children, all_child_to_parent_rels, num_shortest_paths):
@@ -214,7 +208,6 @@ class Layer():
         
         # Create quick look-up child-to-parents dict
         children = all_children.compute()
-        print(all_child_to_parent_rels.compute())
         get_parents = dict(all_child_to_parent_rels.filter(
             lambda child_adj: child_adj[0] in children).compute())
         del children
@@ -237,7 +230,7 @@ class Layer():
         
     
     def process(self, adjacency_bag, state, node_to_i, all_child_parent_rels, 
-                all_parent_child_rels, leaves, num_shortest_paths):
+                leaves, num_shortest_paths):
         """ Check all neighbours of self.nodes for those that should be added
         to the next layer out_layer. Updates state, all_child_parent_rels, and
         leaves as required. Returns out_layer. 
@@ -246,47 +239,59 @@ class Layer():
             Bag([(a, [(b, 3)]), (b: [(a, 3), (c, 2)], ...]))
         where the edge from b->a and a->b has weight 3 (i.e., 3 synapses).
         """
+        print("Setting up layer processing ...")
         # Set-up layer processing
         out_layer = Layer()
         layer_nodes = self.nodes.compute()
         adjacencies = adjacency_bag.filter( # Get adjacencies for this layer's nodes
             lambda node_adjacency: node_adjacency[0] in layer_nodes).persist()
         del layer_nodes
+        print("Set up layer processing")
+        
+        print("Marking this layer's nodes as processed ...")
+        # Mark this layer's nodes as processed. The child-parent rel and leaf
+        # computation sections rely on parents being marked as P.
+        processed_is = adjacencies.map( # Get this layer's node's indices
+            lambda node_adjacency: node_to_i[node_adjacency[0]]).compute()
+        state[processed_is] = "P"
+        del processed_is
+        print("Marked as processed")
+        
+        print("Getting leaf nodes ...")
+        # Get leaf nodes (those with no child nodes)
+        leaves = self.update_leaves(adjacencies, leaves, state, node_to_i)
+        print("Leaf nodes retrieved")
 
+        print("Getting children nodes ...")
         # Get the children nodes of this layer
         all_children = adjacencies.map(
             lambda tup: tup[1]).flatten().map(
                 lambda tup: tup[0]).distinct().filter(
                     lambda node_id: state[node_to_i[node_id]] != "P").persist()
+        print("Children nodes retrieved")
         
-        # Discover child nodes
+        # Discover child nodes and compute child-parent relationships
         if all_children.count().compute() > 0:
+            print("Inserting children into next layer ...")
             out_layer.insert(all_children)
+            print("Children inserted into next layer")
+            print("Marking children as discovered ...")
             undiscovered_is = all_children.map(
                 lambda child_id: node_to_i[child_id]).compute()
             state[undiscovered_is] = "D"
             del undiscovered_is
+            print("Children marked as discovered")
+            print("Getting child-parent relationships ...")
+            all_child_parent_rels = self.get_child_parent_rels(
+                adjacency_bag, adjacencies, state, node_to_i, all_children, all_child_parent_rels).persist()
+            print("Relationships retrieved")
+            print("Getting new shortest paths ...")
+            num_shortest_paths = self.update_num_shortest_paths(
+                all_children, all_child_parent_rels, num_shortest_paths).persist()
+            print("Shortest paths retrieved")
         
-        # Mark this layer's nodes as processed - required for child-parent rels
-        processed_is = adjacencies.map( # Get this layer's node's indices
-            lambda node_adjacency: node_to_i[node_adjacency[0]]).compute()
-        state[processed_is] = "P"
-        del processed_is
-        
-        # Update child-parent and parent-child relationships
-        all_child_parent_rels, all_parent_child_rels = self.get_child_parent_rels(
-            adjacency_bag, adjacencies, state, node_to_i, all_children, all_child_parent_rels, all_parent_child_rels)
-        #print(all_parent_child_rels.compute(), len(all_parent_child_rels.dask))
-        print(all_child_parent_rels.compute(), len(all_child_parent_rels.dask))        
-        
-        # Get leaf nodes (those with no child nodes)
-        leaves = self.update_leaves(adjacencies, all_parent_child_rels, leaves)
-        
-        # Update number of shortest paths to each node from start node
-        num_shortest_paths = self.update_num_shortest_paths(
-            all_children, all_child_parent_rels, num_shortest_paths)
-
-        return (out_layer, leaves, all_child_parent_rels, all_parent_child_rels, num_shortest_paths)
+        print("Returning PBFS data ...")
+        return (out_layer, leaves, all_child_parent_rels, num_shortest_paths)
         
 
 
@@ -340,7 +345,6 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
     # Create empty leaves and all_child_parent_rels bags
     leaves = db.from_sequence([])
     all_child_parent_rels = db.from_sequence([(start_node, [])])
-    all_parent_child_rels = db.from_sequence([])
     
     # Initialise num_shortest_paths bag
     num_shortest_paths = db.from_sequence([(start_node, 1)])
@@ -351,11 +355,11 @@ def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
 
     # Process each layer until max tree depth reached
     while not current_layer.is_empty():
-        next_layer, leaves, all_child_parent_rels, all_parent_child_rels, num_shortest_paths = current_layer.process(
-            adjacency_bag, state, node_to_i, all_child_parent_rels, all_parent_child_rels, leaves, num_shortest_paths)
+        next_layer, leaves, all_child_parent_rels, num_shortest_paths = current_layer.process(
+            adjacency_bag, state, node_to_i, all_child_parent_rels, leaves, num_shortest_paths)
         current_layer = next_layer
 
-    return (all_child_parent_rels, all_parent_child_rels, state, leaves, num_shortest_paths)
+    return (all_child_parent_rels, state, leaves, num_shortest_paths)
 
 
 def get_component_adjacency_bags(df: ddf.DataFrame, undirected=True):

@@ -367,13 +367,15 @@ class TestPBFS(unittest.TestCase):
         
         # Time it
         start_time = time()
-        parents_bag, children_bag, state, leaves, num_sps = run.pbfs(start_node, adjacency_bag)
+        parents_bag, state, leaves, num_sps = run.pbfs(start_node, adjacency_bag)
         time1 = time() - start_time
         leaves = leaves.compute()
         num_sps = num_sps.compute()
         
         # Do assertions
         parent_adj = process_computed_adjacency_bag(parents_bag.compute())
+        print(parent_adj)
+        print(exp_parent_adj)
         self.assertEqual(parent_adj, exp_parent_adj)
         self.assertEqual(18, len(state))
         self.assertEqual(12, np.sum(state == "P"))
