@@ -276,7 +276,7 @@ class TestPrune(unittest.TestCase):
 
 
 
-@unittest.skip("Passing as of 10/5/26")
+#@unittest.skip("Passing as of 10/5/26")
 class TestPBFS(unittest.TestCase):
     
     OUTFILE = os.path.join(TEST_OUTPUT_DIR, "test_pbfs.txt")
@@ -367,9 +367,10 @@ class TestPBFS(unittest.TestCase):
         
         # Time it
         start_time = time()
-        parents_bag, state, leaves = run.pbfs(start_node, adjacency_bag)
+        parents_bag, state, leaves, num_sps = run.pbfs(start_node, adjacency_bag)
         time1 = time() - start_time
         leaves = leaves.compute()
+        num_sps = num_sps.compute()
         
         # Do assertions
         parent_adj = process_computed_adjacency_bag(parents_bag.compute())
@@ -378,12 +379,14 @@ class TestPBFS(unittest.TestCase):
         self.assertEqual(12, np.sum(state == "P"))
         self.assertEqual(6, np.sum(state == "U"))
         self.assertTrue(len(leaves) == 6)
-        self.assertTrue(exp_leaves == set(leaves))       
+        self.assertTrue(exp_leaves == set(leaves))
+        self.assertTrue((22, 74) in num_sps)
+        self.assertTrue((21, 14) in num_sps)
         
         # Get memory usage and report results
-        max_mem = max(memory_usage((run.pbfs, (start_node, adjacency_bag))))
-        report_test_result(TestPBFS.OUTFILE, "test_case_4",
-                           time1, max_mem)
+        #max_mem = max(memory_usage((run.pbfs, (start_node, adjacency_bag))))
+        #report_test_result(TestPBFS.OUTFILE, "test_case_4",
+        #                   time1, max_mem)
         del adjacency_bag
         
         
