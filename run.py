@@ -168,42 +168,35 @@ class Layer():
         """ Record parentage for each child 
         The child node's parents are those nodes in the child's adjacencies
         where the states of those nodes are 'P'."""
-        child_ids = set(all_children.compute())
-        cp_rels = defaultdict(list)
+        # TODO
+        child_ids = all_children.compute()
+        parent_ids = adjacencies.map(
+            lambda node_adjacency: node_adjacency[0]).compute()
         
-        def get_children(neighbour_nodes, parent):
-            """ Return list of children neighbours """
-            return list(filter(lambda tup: tup[0] in child_ids, neighbour_nodes))
+        # Update child-parent relationships
+        child_adjacencies = adjacency_bag.filter(
+            lambda node_adjacency: node_adjacency[0] in child_ids)
+        child_parent_rels = child_adjacencies.map(
+            lambda node_adjacency: (
+                node_adjacency[0], 
+                list(filter(lambda tup: tup[0] in parent_ids, node_adjacency[1]))
+            )
+        ).persist()
+        all_child_parent_rels = db.concat(
+            [all_child_parent_rels, child_parent_rels])
         
-        # Get parent-child relationships
-        parent_child_adjs = dict(adjacencies.map(
-            lambda adj: (adj[0], get_children(adj[1], adj[0]))).compute())
-        print(parent_child_adjs)
+        # Update parent-child relationships
+        parent_child_rels = adjacencies.map(
+            lambda node_adj: (
+                node_adj[0], 
+                list(filter(lambda tup: tup[0] in child_ids, node_adj[1]))
+            )
+        ).persist()
+        all_parent_child_rels = db.concat(
+            [all_parent_child_rels, parent_child_rels])
         
-        def is_child(parent, child):
-            """ Return True if child is child of parent """
-            try:
-                parent_children = parent_child_adjs[parent]
-            except KeyError:
-                return False
-            return True if child in parent_children else False
-        
-        def get_parents(neighbour_nodes, child):
-            """ Return list of parent neighbours """
-            # An entry pre-exists in parent_child_adjs for child-parent pairs.
-            return(list(filter(lambda tup: is_child(tup[0], child), neighbour_nodes)))
-                
-        # Get child-parent relationships
-        child_adjs = adjacencies.filter(lambda adj: adj[0] in child_ids)
-        child_parent_adjs = child_adjs.map(
-            lambda adj: (adj[0], get_parents(adj[1], adj[0])))
-        
-        # Add new adjacencies to existing adjacency bags
-        parent_child_adjs_bag = db.from_sequence(parent_child_adjs.items())
-        all_child_parent_rels = db.concat([all_child_parent_rels, child_parent_adjs])
-        all_parent_child_rels = db.concat([all_parent_child_rels, parent_child_adjs_bag])
-        print(child_parent_adjs.compute())
-        print(all_child_parent_rels.compute())        
+        #print(all_parent_child_rels.compute(), len(all_parent_child_rels.dask))
+        print(all_child_parent_rels.compute(), len(all_child_parent_rels.dask))
         return (all_child_parent_rels, all_parent_child_rels)
 
 
@@ -283,6 +276,8 @@ class Layer():
         # Update child-parent and parent-child relationships
         all_child_parent_rels, all_parent_child_rels = self.get_child_parent_rels(
             adjacency_bag, adjacencies, state, node_to_i, all_children, all_child_parent_rels, all_parent_child_rels)
+        #print(all_parent_child_rels.compute(), len(all_parent_child_rels.dask))
+        print(all_child_parent_rels.compute(), len(all_child_parent_rels.dask))        
         
         # Get leaf nodes (those with no child nodes)
         leaves = self.update_leaves(adjacencies, all_parent_child_rels, leaves)
