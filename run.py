@@ -356,8 +356,9 @@ def update_num_sps_df(level_nodes: ddf.DataFrame, depth: int, cp_df: ddf.DataFra
 
 def get_children(level_nodes: ddf.DataFrame, pc_df: ddf.DataFrame) -> ddf.DataFrame:
     """ Get the children node ids of all nodes in level_nodes """
-    raise NotImplementedError
-
+    merged = level_nodes.merge(pc_df, left_on="node_id", right_on="parent", how="inner")
+    children = merged["child"].drop_duplicates().to_frame(name="node_id").persist()
+    return children
 
 
 def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
@@ -406,8 +407,7 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
             break
         depth += 1
     
-    #return (state, pc_df, cp_df, num_sps_df)
-    raise NotImplementedError
+    return (state, pc_df, cp_df, num_sps_df)
 
 
 def get_initial_edge_scores(start_node: int, component: ddf.DataFrame, 
