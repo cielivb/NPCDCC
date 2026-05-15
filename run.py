@@ -37,12 +37,102 @@ import argparse
 from dask import bag as db
 from dask import dataframe as ddf
 from dask.distributed import Client
+from time import sleep
 
 CLIENT = None # Assigned properly at bottom of script
 MIN_CLUSTER_SIZE = 30
 MAD_K = 3.5
 
 ROOT_DIR = os.path.dirname(__file__)
+
+
+######################## GENERIC HELPER FUNCTIONS ##############################
+
+def df_to_adjacency_bag(df, undirect=True):
+    """ Convert dataframe into adjacency list/bag of edges with synapse counts.
+    
+    Return an adjacency list for the dataframe as a dask bag of the form
+        db.from_sequence([(a, [(b, 3)]), (b: [(a, 3)])])
+    if undirected, otherwise
+        db.from_sequence([(a, []), (b, [(a, 3)])])
+    where the edge/neuronal connection from b->a (or b->a and a->b in the 
+    undirected version) involves 3 synapses.
+    
+    """
+    if undirect: # Add (b,a,w) for every (a,b,w)
+        edge_bag = df[["pre", "post", "syn_count"]].to_bag()        
+        edge_bag = edge_bag.map(lambda edge: [edge, (edge[1], edge[0], edge[2])])
+        edge_bag = edge_bag.flatten().distinct()
+        adj_df = edge_bag.to_dataframe(
+            meta = {"pre": int, "post": int, "syn_count": int})
+    else:
+        adj_df = df
+        
+    # grouped is of the general form
+    # pre    post      syn_count
+    # 0      [1, 5]    [2, 4]
+    # where there is an edge of weight 2 between 0 and 1,
+    # an edge of weight 4 between 0 and 5, etc
+    grouped = adj_df.groupby("pre").agg({"pre": list, "post": list, "syn_count": list})
+    
+    # Each entry of form ([pre, pre, ...], [post, post, ...], [syn_count, syn_count, ...])
+    # where all the pre values within an entry are equal. Edges are currently
+    # represented by indices.
+    grouped_as_bag = grouped.to_bag()
+    adjacency_bag = grouped_as_bag.map( # Possible memory issue here?
+        lambda entry: (entry[0][0], list(zip(entry[1], entry[2]))))
+    return adjacency_bag.persist()
+
+
+def adj_bag_to_adj_df(adj_bag: db.Bag) -> ddf.DataFrame:
+    """ Convert an adjacency bag to an adjacency dataframe. 
+    
+    An adjacency dataframe differs from the original dataframe in that it has
+    two columns - one for node ID, and the other for neighbours of that node.
+    
+    """
+    adj_df = adj_bag.to_dataframe(
+        meta = {"node_id": int, "neighbours": object}).persist()
+    return adj_df
+
+
+def adj_bag_to_df(adj_bag: db.Bag) -> ddf.DataFrame:
+    """ Convert an adjacency bag to an edge dataframe. 
+    
+    The returned dataframe will have three columns: pre, post, syn_count.
+    
+    adj_bag has the form [(pre, [(post1, syn_count), (post2, syn_count)], ...)]
+    
+    """
+    # Expand adj_bag to bag of tuples (pre, post, syn_count)
+    def expand(adj_tup):
+        pre, post_list = adj_tup[0], adj_tup[1]
+        expanded = list(map(lambda tup: (pre, tup[0], tup[1]), post_list))
+        return expanded
+    tuple_bag = adj_bag.map(expand).flatten()
+    
+    # Convert tuple_bag to dataframe
+    df = tuple_bag.to_dataframe(
+        meta = {"pre": int, "post": int, "syn_count": int}).persist()
+    return df
+
+
+def adj_df_to_adj_bag(adj_df: ddf.DataFrame) -> db.Bag:
+    """ Convert an adjacency dataframe to an adjacency bag.
+    
+    An adjacency dataframe differs from the original dataframe in that it has
+    two columns - one for node ID, and the other for neighbours of that node.
+
+    """
+    adj_bag = adj_df.to_bag().map(lambda tup: (tup[0], tup[1])).persist()
+    return adj_bag
+
+
+def get_num_nodes(df: ddf.DataFrame) -> int:
+    """ Compute the number of unique nodes present in a dataframe """
+    unique_pre = set(df["pre"].unique().compute())
+    unique_post = set(df["post"].unique().compute())
+    return len(unique_pre.union(unique_post))
 
 
 
@@ -62,11 +152,185 @@ def load_connectome() -> ddf.DataFrame:
 
 ############################ IDENTIFY CLUSTERS #################################
 
-def identify_clusters(connectome_df):
+
+### Pre-PBFS component preparation functions ------------------------------
+
+def get_component_adjacency_bags(df: ddf.DataFrame, undirected=True) -> db.Bag:
+    """ Return a dask bag of adjacency lists/bags for each component in df.
+   
+    For each component in the graph represented in df, return the 
+    adjacency list of the component containing each edge and their 
+    weights. This is done by performing iteratively performing parallel BFS to 
+    identify nodes belonging to different components. Only one component can
+    be discovered at a time.
+    
+    Parent-child relationships require a start node, which is outside the
+    scope of this function. See the bfs_search function.
+
+    """
+    big_adjacency_bag = df_to_adjacency_bag(df, undirected)
+    nodes = np.array(big_adjacency_bag.map(
+        lambda node_adjacency: node_adjacency[0]).compute())
+    state = np.full(len(nodes), "U", "<U1") # nodes indices map to state indices
+    components = [] # Will later be a dask bag of adjacency bags (one per component)
+    
+    # Iterate until all nodes are assigned to a component. Must find one
+    # component at a time.
+    for node_index in range(len(nodes)):
+        if state[node_index] == "U":
+            prev_state = state.copy()
+            start_node = nodes[node_index]            
+            
+            all_child_parent_rels, state, leaves = pbfs(start_node, 
+                                                        big_adjacency_bag,
+                                                        state)
+            del all_child_parent_rels, leaves
+            
+            # Add new component
+            diff_indices = np.where(state != prev_state)[0]
+            component_nodes = nodes[diff_indices]
+            component_adj = big_adjacency_bag.filter(
+                lambda node_adjacency: node_adjacency[0] in component_nodes)
+            components = components + [component_adj.persist()]
+    
+    return db.from_sequence(components)
+
+
+def prune(adjacency_bag: db.Bag) -> db.Bag:
+    """ Iteratively remove degree 1 edges from a dask dataframe 
+    
+    A degree 1 edge is defined here as an edge associated with at least one
+    degree 1 node, where a degree 1 node is a node connected by any number of 
+    edges to one and only one other node. No nodes in the dataset will have 
+    edges to themselves. Synapse count and directionality are not considered.
+    
+    Adjacency bag format:
+            db.from_sequence([(a, [(b, 3)]), (b: [(a, 3)])])
+            
+    The naive approach would be to take away one edge at a time. This parallel
+    version improves performance by finding all degree 1 edges initially, and
+    pruning each 'chain' in parallel. The time to complete is the time it takes
+    to process the longest 'chain'.
+
+    """
+    deg1_nodes = adjacency_bag.filter(
+        lambda node_adj: len(node_adj[1]) == 1).map(
+            lambda node_adj: node_adj[0]).compute()
+    
+    while True:
+        if len(deg1_nodes) == 0:
+            break
+        
+        # Remove edge from deg1 node to neighbour
+        adjacency_bag = adjacency_bag.map(
+            lambda node_adj: cut_deg1_edge(node_adj, node_adj[0] in deg1_nodes)).filter(
+                lambda node_adj: len(node_adj[1]) > 0).persist()
+        
+        # Remove edge from neighbours to deg1 nodes
+        adjacency_bag = adjacency_bag.map(
+            lambda node_adj: remove_deg_1_nodes(node_adj, deg1_nodes)).persist()
+    
+    return adjacency_bag
+
+
+### Calculating edge scores functions (includes PBFS & backtracking) ------
+
+def get_edge_scores(component: ddf.DataFrame):
+    pass
+
+
+### Chopping functions ----------------------------------------------------
+
+def get_upper_threshold(edge_scores, k):
+    """ Calculate MAD-based upper threshold.
+    edge_scores of form Bag([((pre, post), edge_score), ...])
+    """
+    global MAD_K
+    if not k:
+        k = MAD_K
+    scores = np.array(edge_scores.map(lambda tup: tup[1]).compute())
+    median_score = np.median(scores)
+    mad = np.median(np.absolute(scores - median_score))
+    upper_threshold = median_score + k * mad
+    return upper_threshold
+
+
+def chop(component, edge_scores, upper_score_threshold):
+    pass
+
+
+### Top-level cluster tagging/identification ------------------------------
+
+def modified_girvan_newman(component: ddf.DataFrame) -> tuple[ddf.Dataframe|None, bool]:
+    """ Remove linker edges from the component dataframe.
+    
+    Returns a bag of components and whether processing should continue.
+    Bag([(component1_df, _continue), (component2_df, _continue), ...])
+    where component1, component2, ... are components derived from component.
+        
+    If _continue is true, then the caller function should apply another round
+    of girvan newman on the subcomponents. continue = False occurs when no more
+    edges are removed from the input component (i.e., the component is a 
+    cluster), in which case the associated component dataframe is a cluster, or
+    when the associated component dataframe is too small, in which case None is
+    returned in place of the too-small component.
+    
+    """
+    global MIN_CLUSTER_SIZE
+    edge_scores = get_edge_scores(component)
+    upper_score_threshold = get_upper_threshold(edge_scores)
+    new_adj_df, removed_edges = chop(component, edge_scores, upper_score_threshold)
+    if get_num_nodes(new_adj_df).compute() < MIN_CLUSTER_SIZE:
+        return (None, False) # Cluster/component too small
+    if removed_edges.count().compute() == 0:
+        return (new_adj_df, False) # Cluster found! Don't continue processing.    
+    return (new_adj_df, True) # Further processing required
+    
+
+def process_raw_df(raw_df: ddf.DataFrame):
+    """ Split up raw_df and create futures mapping to modified GN """
+    global CLIENT, MIN_CLUSTER_SIZE
+    adj_bags = get_component_adjacency_bags(raw_df)
+    adj_bags = adj_bags.map(prune)
+    adj_bags = adj_bags.filter(
+        lambda adj_bag: adj_bag.count().compute() >= MIN_CLUSTER_SIZE)
+    component_dfs = adj_bags.map(adj_bag_to_df).compute() # List of dfs
+    new_futures = set()
+    for df in component_dfs:
+        new_futures.add(CLIENT.submit(modified_girvan_newman, df))
+    return new_futures
+
+
+def identify_clusters(connectome_df: ddf.DataFrame) -> list[ddf.DataFrame]:
+    """ Run modified Girvan Newman repeatedly to identify clusters """
+    future_set, cluster_dfs = set(), []
+    process_raw_df(connectome_df) # Start processing from the top
+    
+    # Check for new results in future set and create new futures as required
+    while len(future_list) > 0:
+        to_delete = set()
+        
+        # Process finished futures        
+        for future in future_set:
+            if future.done():
+                fresh_df, should_continue = future.result()
+                if should_continue:
+                    future_set.add(process_raw_df(fresh_df))
+                else:
+                    if fresh_df is not None:
+                        cluster_dfs.append(fresh_df)
+                to_delete.add(future)
+                
+        # Update future set then snooze
+        future_set -= to_delete
+        sleep(30)
+        
+    return cluster_dfs
+
+
+def tag_edges(cluster_dfs, connectome_df):
     """ Return connectome_df sorted by and tagged with cluster IDs """
     pass # TODO - implement
-
-
 
 
 ################################# ANALYSIS #####################################
