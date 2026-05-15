@@ -325,15 +325,39 @@ def update_pc_cp_dfs(level_nodes: ddf.DataFrame, comp_subset: ddf.DataFrame,
     return (pc_df, cp_df)
 
 
+def update_num_sps_df(level_nodes: ddf.DataFrame, depth: int, cp_df: ddf.DataFrame, 
+                      num_sps_df: ddf.DataFrame) -> ddf.DataFrame:
+    """ Update num_sps_df with the number of shortest paths to each node in level_nodes. 
+    num_sps_df has the columns : depth, node_id, num_sps
+    """
+    if depth == 0: # Root node - prefilled at start of PBFS
+        return num_sps_df
+    # Parent num sps will always be at depth one level above this level. Subset
+    # to the parent level to speed up scan (avoids scanning all levels).
+    all_parent_num_sps = num_sps_df[num_sps_df["depth"] == depth-1].persist()
+    
+    def get_num_sps(node_id: int) -> int:
+        """ Sum the total number of shortest paths from node_id to parents """
+        parents = cp_df[cp_df["child"] == node_id]["parent"] # parent node IDs
+        parent_num_sps = ddf.merge(left=parents, right=all_parent_num_sps,
+                                   left_on="parent", right_on="node_id", how="inner")
+        total = parent_num_sps["num_sps"].persist() # Should I compute or persist here? TODO
+        return total
+    
+    # Get this level's number of shortest paths
+    new_num_sps = level_nodes
+    new_num_sps["depth"] = depth
+    new_num_sps["num_sps"] = level_nodes["node_id"].map(get_num_sps).persist()
+    
+    # Update and return full num_sps_df dataframe
+    num_sps_df = ddf.concat([num_sps_df, new_num_sps]).persist()
+    return num_sps_df
+
+
 def get_children(level_nodes: ddf.DataFrame, pc_df: ddf.DataFrame) -> ddf.DataFrame:
     """ Get the children node ids of all nodes in level_nodes """
     raise NotImplementedError
 
-
-def update_num_sps_df(level_nodes: ddf.DataFrame, depth: int, cp_df: ddf.DataFrame, 
-                      num_sps_df: ddf.DataFrame) -> ddf.DataFrame:
-    """ Update num_sps_df with the number of shortest paths to each node in level_nodes """
-    raise NotImplementedError
 
 
 def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
@@ -355,26 +379,28 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
     cp_df = ddf.from_dict(
         {"child": [], "parent": [], "syn_count": []}, npartitions=1)
     num_sps_df = ddf.from_dict(
-        {"depth": [], "node_id": [], "num_sps": []}, npartitions=1)
+        {"depth": [0], "node_id": [start_node], "num_sps": [1]}, npartitions=1)
     num_sps_df = num_sps_df.set_index("depth", drop=False)    
 
     # Run PBFS
     while True:
-        # Update dataframes
+        # Update child-parent and parent-children relationship dataframes
         state = update_state_array(state, level_nodes, "D")
         comp_subset = get_component_subset(level_nodes, component)
         pc_df, cp_df = update_pc_cp_dfs(level_nodes, comp_subset, pc_df, cp_df)
-        children = get_children(level_nodes, pc_df)
-        num_sps_df = update_num_sps_df(level_nodes, depth, cp_df, num_sps_df)
-        update_state_array(state, level_nodes, "P")
         
         # Repartition and reindex pc_df and cp_df. Do it here because will be
         # reused in the next frontier, and I want fast lookups in the next
         # frontier as well!
         pc_df = pc_df.set_index("parent", drop=False)
-        cp_df = cp_df.set_index("child", drop=False) 
+        cp_df = cp_df.set_index("child", drop=False)         
+        
+        # Update number of shortest paths dataframe
+        num_sps_df = update_num_sps_df(level_nodes, depth, cp_df, num_sps_df)
+        update_state_array(state, level_nodes, "P")
         
         # Increase depth and change current nodes to child nodes
+        children = get_children(level_nodes, pc_df)        
         level_nodes = children
         if level_nodes.shape[0].compute() == 0:
             break
