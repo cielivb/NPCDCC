@@ -260,11 +260,44 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
 
 ### Calculating edge scores functions (includes PBFS & backtracking) ------
     
+def update_state_array(state: ddf.DataFrame, nodes_to_update: ddf.DataFrame, 
+                       new_status: str) -> ddf.DataFrame:
+    """ Update states of nodes_to_update in state dataframe to either D or P """
+    indexes_to_update = state.index.isin(nodes_to_update["node_id"])
+    state["state"] = state["state"].mask(indexes_to_update, new_status)
+    state = state.persist()
+    return state
+
+
+def get_component_subset(level_nodes: ddf.DataFrame, 
+                         component: ddf.DataFrame) -> ddf.DataFrame:
+    """ Get all edges from component involving any node in level_nodes """
+    raise NotImplementedError
+
+
+def update_pc_cp_dfs(level_nodes: ddf.DataFrame, comp_subset: ddf.DataFrame, 
+                     pc_df: ddf.DataFrame, 
+                     cp_def: ddf.DataFrame) -> tuple[ddf.DataFrame]:
+    """ Update parent-child and child-parent relationships with this levels data """
+    raise NotImplementedError
+
+
+def get_children(level_nodes: ddf.DataFrame, pc_df: ddf.DataFrame) -> ddf.DataFrame:
+    """ Get the children node ids of all nodes in level_nodes """
+    raise NotImplementedError
+
+
+def update_num_sps_df(level_nodes: ddf.DataFrame, depth: int, cp_df: ddf.DataFrame, 
+                      num_sps_df: ddf.DataFrame) -> ddf.DataFrame:
+    """ Update num_sps_df with the number of shortest paths to each node in level_nodes """
+    raise NotImplementedError
+
+
 def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
     """ Run a parallel breadth-first-search on component. 
     
-    Return state dataframe, pc_df (parent-child dataframe), and num_sps_df 
-    (number of shortest paths dataframe).
+    Return state dataframe, pc_df (parent-child dataframe), cp_df (child-parent
+    dataframe) and num_sps_df (number of shortest paths dataframe).
     
     The parallel component of this BFS involves processing an entire level/
     frontier at a time, rather than naively iterating over every node for
@@ -281,18 +314,23 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
     
     # Run PBFS
     while True:
-        # Mark current level's nodes as discovered in state array
-        # Get this level's edges from component
-        # Get this level's children
-        # Update pc_df with this level's parent-child relationships
-        # Update num_sps_df with the number of shortest paths to each node on this level
-        # Mark this level's nodes as processed in state array
+        # Update dataframes
+        state = update_state_array(state, level_nodes, "D")
+        comp_subset = get_component_subset(level_nodes, component)
+        pc_df, cp_df = update_pc_cp_dfs(level_nodes, comp_subset, pc_df, cp_df)
+        children = get_children(level_nodes, pc_df)
+        num_sps_df = update_num_sps_df(level_nodes, depth, cp_df, num_sps_df)
+        update_state_array(state, level_nodes, "P")
+        
+        # Repartition and reindex pc_df and cp_df
+        
         # Increase depth and change current nodes to child nodes
         level_nodes = children
         if level_nodes.shape[0].compute() == 0:
             break
         depth += 1
     
+    #return (state, pc_df, cp_df, num_sps_df)
     raise NotImplementedError
 
 
@@ -302,7 +340,7 @@ def get_initial_edge_scores(start_node: int, component: ddf.DataFrame,
     Return Bag of Girvan Newman edge scores starting at start_node, of general 
     form Bag of tuples Bag([((pre, post), edge_score), ...]) """   
     state = create_state_df(component)
-    state, pc_df, num_sps_df = pbfs(start_node, component, state)
+    state, pc_df, cp_df, num_sps_df = pbfs(start_node, component, state)
     
     # TODO - Implement PBFS backtrack to get initial edge scores
     raise NotImplementedError
