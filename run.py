@@ -133,7 +133,7 @@ def adj_df_to_adj_bag(adj_df: ddf.DataFrame) -> db.Bag:
 
 
 def get_all_nodes(df: ddf.DataFrame) -> db.Bag:
-    """ Return a list of every unique node in the dataframe """
+    """ Return a bag of every unique node in the dataframe """
     unique_pre = df["pre"].unique().to_bag().persist()
     unique_post = df["post"].unique().to_bag().persist()
     unique_nodes = db.concat([unique_pre, unique_post]).persist()
@@ -272,14 +272,57 @@ def update_state_array(state: ddf.DataFrame, nodes_to_update: ddf.DataFrame,
 def get_component_subset(level_nodes: ddf.DataFrame, 
                          component: ddf.DataFrame) -> ddf.DataFrame:
     """ Get all edges from component involving any node in level_nodes """
-    raise NotImplementedError
+    subset1 = component["pre"].isin(level_nodes["node_id"]).persist()
+    subset2 = component["post"].isin(level_nodes["node_id"]).persist()
+    subset = subset1.concat(subset2, interleave_partitions=True).persist()
+    subset = subset.drop_duplicates(subset=["pre","post"]).persist()
+    subset = subset.set_index("pre", drop=False).persist()
+    return subset
 
 
 def update_pc_cp_dfs(level_nodes: ddf.DataFrame, comp_subset: ddf.DataFrame, 
                      pc_df: ddf.DataFrame, 
-                     cp_def: ddf.DataFrame) -> tuple[ddf.DataFrame]:
+                     cp_df: ddf.DataFrame) -> tuple[ddf.DataFrame]:
     """ Update parent-child and child-parent relationships with this levels data """
-    raise NotImplementedError
+    
+    def process_nodes(node_id: int) -> tuple[ddf.DataFrame]:
+        """ Create dataframes of new pc and cp relationships """      
+        # Do a left join of neighbours to level_nodes then filter by nodes 
+        # present only on the left side (i.e., present in neighbours but not in
+        # level_nodes) to get all prospective parent and child neighbours.
+        all_neighbours = comp_subset[node_id]["post"]
+        merged = ddf.merge(left = all_neighbours, right = level_nodes,
+                           left_on = "post", right_on = "node_id",
+                           how = "left", indicator = True)
+        neighbours = merged[merged["_merge"] == "left_only"]["node_id"]
+        
+        # Add entries in new_cp_rels for every child-parent relationship, where
+        # node_id is the child
+        p_neighbours = ddf.merge(left = neighbours, right = pc_df, 
+                                 left_on="node_id", right_on="parent", how="inner")
+        new_cp_rels = p_neighbours[p_neighbours["child"] == node_id]
+        new_cp_rels = new_cp_rels[["child", "parent", "syn_count"]].persist()
+        
+        # Add entries in new_pc_rels for every parent-child relationship, where
+        # node_id is the parent. Child neighbours are those neighbours in 
+        # neighbours that are not parent neighbours.
+        merged2 = ddf.merge(left = neighbours, right = new_cp_rels,
+                                 left_on = "node_id", right_on = "parent",
+                                 how = "left", indicator = True)
+        c_neighbour_nodes = merged2[merged2["_merge"] == "left_only"]["node_id"]
+        c_neighbours = ddf.merge(left = c_neighbour_nodes, right = comp_subset,
+                                 left_on = "node_id", right_on = "child", how = "inner")
+        new_pc_rels = c_neighbours[c_neighbours["parent"] == node_id].persist()
+        return (new_pc_rels, new_cp_rels)
+        
+    new_dfs = level_nodes["node_id"].map(process_node)
+    new_pc_dfs = new_dfs.map(lambda tup: tup[0])
+    new_pc_df = ddf.concat(new_pc_dfs).persist()
+    new_cp_dfs = new_dfs.map(lambda tup: tup[1])
+    new_cp_df = ddf.concat(new_cp_dfs).persist()
+    pc_df = ddf.concat([pc_df, new_pc_df]).persist()
+    cp_df = ddf.concat([cp_df, new_cp_df]).persist()
+    return (pc_df, cp_df)
 
 
 def get_children(level_nodes: ddf.DataFrame, pc_df: ddf.DataFrame) -> ddf.DataFrame:
@@ -309,10 +352,12 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
     level_nodes = ddf.from_dict({"node_id": [start_node]}, npartitions=1)
     pc_df = ddf.from_dict(
         {"parent": [], "child": [], "syn_count": []}, npartitions=1)
+    cp_df = ddf.from_dict(
+        {"child": [], "parent": [], "syn_count": []}, npartitions=1)
     num_sps_df = ddf.from_dict(
         {"depth": [], "node_id": [], "num_sps": []}, npartitions=1)
-    num_sps_df = num_sps_df.set_index("depth", shuffle="tasks")    
-    
+    num_sps_df = num_sps_df.set_index("depth", drop=False)    
+
     # Run PBFS
     while True:
         # Update dataframes
@@ -326,8 +371,8 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
         # Repartition and reindex pc_df and cp_df. Do it here because will be
         # reused in the next frontier, and I want fast lookups in the next
         # frontier as well!
-        pc_df = pc_df.set_index("parent")
-        cp_df = cp_df.set_index("child") 
+        pc_df = pc_df.set_index("parent", drop=False)
+        cp_df = cp_df.set_index("child", drop=False) 
         
         # Increase depth and change current nodes to child nodes
         level_nodes = children
