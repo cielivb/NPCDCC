@@ -311,6 +311,7 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
         {"parent": [], "child": [], "syn_count": []}, npartitions=1)
     num_sps_df = ddf.from_dict(
         {"depth": [], "node_id": [], "num_sps": []}, npartitions=1)
+    num_sps_df = num_sps_df.set_index("depth", shuffle="tasks")    
     
     # Run PBFS
     while True:
@@ -322,7 +323,11 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
         num_sps_df = update_num_sps_df(level_nodes, depth, cp_df, num_sps_df)
         update_state_array(state, level_nodes, "P")
         
-        # Repartition and reindex pc_df and cp_df
+        # Repartition and reindex pc_df and cp_df. Do it here because will be
+        # reused in the next frontier, and I want fast lookups in the next
+        # frontier as well!
+        pc_df = pc_df.set_index("parent")
+        cp_df = cp_df.set_index("child") 
         
         # Increase depth and change current nodes to child nodes
         level_nodes = children
