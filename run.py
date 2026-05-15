@@ -46,6 +46,10 @@ MAD_K = 3.5
 ROOT_DIR = os.path.dirname(__file__)
 
 
+
+
+
+
 ######################## GENERIC HELPER FUNCTIONS ##############################
 
 def df_to_adjacency_bag(df, undirect=True):
@@ -128,11 +132,27 @@ def adj_df_to_adj_bag(adj_df: ddf.DataFrame) -> db.Bag:
     return adj_bag
 
 
+def get_all_nodes(df: ddf.DataFrame) -> db.Bag:
+    """ Return a list of every unique node in the dataframe """
+    unique_pre = df["pre"].unique().to_bag().persist()
+    unique_post = df["post"].unique().to_bag().persist()
+    unique_nodes = db.concat([unique_pre, unique_post]).persist()
+    return unique_nodes
+    
+    
 def get_num_nodes(df: ddf.DataFrame) -> int:
     """ Compute the number of unique nodes present in a dataframe """
-    unique_pre = set(df["pre"].unique().compute())
-    unique_post = set(df["post"].unique().compute())
-    return len(unique_pre.union(unique_post))
+    return get_all_nodes.count().compute()
+
+
+def create_state_df(component: ddf.DataFrame) -> ddf.DataFrame:
+    """ The state dataframe uses node ids as indexes to track state in PBFS """
+    state = get_all_nodes(component).to_frame(meta = {"node_id": int})
+    state["state"] = "U"
+    state = state.set_index("node_id", sort=True).persist()
+    return state
+
+
 
 
 
@@ -140,12 +160,15 @@ def get_num_nodes(df: ddf.DataFrame) -> int:
 
 def parse_args():
     """ Validate and store script arguments in global variables """
-    pass # TODO : implement
+    raise NotImplementedError # TODO : implement
 
 
 def load_connectome() -> ddf.DataFrame:
     """ Parse connectome feather file into dask dataframe """
-    pass # TODO: implement
+    raise NotImplementedError # TODO: implement
+
+
+
 
 
 
@@ -233,10 +256,93 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
     return adjacency_bag
 
 
-### Calculating edge scores functions (includes PBFS & backtracking) ------
 
-def get_edge_scores(component: ddf.DataFrame):
-    pass
+
+### Calculating edge scores functions (includes PBFS & backtracking) ------
+    
+def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
+    """ Run a parallel breadth-first-search on component. 
+    
+    Return state dataframe, pc_df (parent-child dataframe), and num_sps_df 
+    (number of shortest paths dataframe).
+    
+    The parallel component of this BFS involves processing an entire level/
+    frontier at a time, rather than naively iterating over every node for
+    every level.
+
+    """
+    # Set-up PBFS
+    depth = 0
+    level_nodes = ddf.from_dict({"node_id": [start_node]}, npartitions=1)
+    pc_df = ddf.from_dict(
+        {"parent": [], "child": [], "syn_count": []}, npartitions=1)
+    num_sps_df = ddf.from_dict(
+        {"depth": [], "node_id": [], "num_sps": []}, npartitions=1)
+    
+    # Run PBFS
+    while True:
+        # Mark current level's nodes as discovered in state array
+        # Get this level's edges from component
+        # Get this level's children
+        # Update pc_df with this level's parent-child relationships
+        # Update num_sps_df with the number of shortest paths to each node on this level
+        # Mark this level's nodes as processed in state array
+        # Increase depth and change current nodes to child nodes
+        level_nodes = children
+        if level_nodes.shape[0].compute() == 0:
+            break
+        depth += 1
+    
+    raise NotImplementedError
+
+
+def get_initial_edge_scores(start_node: int, component: ddf.DataFrame, 
+                            num_nodes: int) -> db.Bag:
+    """ Run one PBFS then one PBFS backtrack then collate edge scores.
+    Return Bag of Girvan Newman edge scores starting at start_node, of general 
+    form Bag of tuples Bag([((pre, post), edge_score), ...]) """   
+    state = create_state_df(component)
+    state, pc_df, num_sps_df = pbfs(start_node, component, state)
+    
+    # TODO - Implement PBFS backtrack to get initial edge scores
+    raise NotImplementedError
+
+
+def get_edge_scores(component: ddf.DataFrame) -> db.Bag:
+    """ Set up and do the edge-score calculation phase of Girvan-Newman. 
+    Output edge score bag should be of general form:
+    Bag([((pre, post), edge_score), ...])
+    """
+    # Get random subset of nodes. For now, using sample size = ~1/4 the number
+    # of nodes in component.
+    component_nodes = get_all_nodes(component)
+    num_nodes = component_nodes.count().compute()
+    random_nodes = db.random.sample(component_nodes, int(num_nodes/4))
+    
+    # Get list of bags containing initial edge scores from each start node
+    all_edge_score_bags_list = random_nodes.map(
+        lambda start_node: get_initial_edge_scores(start_node, component, num_nodes)).compute()
+    
+    # Concatenate all initial edge scores into one bag. There should be 
+    # duplicate entries for each edge. 
+    all_edge_scores = db.concat(all_edge_score_bags_list)
+    
+    # TODO - make the below preserve edge identity (pre, post), and ensure
+    # (a, b) and (b, a) scores are summed together as well
+    # Sum edge scores and divide by factor
+    #factor = 0.5 # Used sample size = quarter # nodes in df -> factor = 0.5
+    #scores = all_edge_scores.foldby(
+        #key = lambda edge_score: edge_score[0],
+        #binop = lambda accum, edge_score: accum + edge_score[1],
+        #initial = 0,
+        #combine = lambda accum1, accum2: accum1 + accum2,
+        #combine_initial = 0
+    #)
+    #standardised_scores = scores.map(
+        #lambda edge_score: (edge_score[0], edge_score[1]/factor))
+    #return standardised_scores
+    raise NotImplementedError
+
 
 
 ### Chopping functions ----------------------------------------------------
@@ -256,7 +362,9 @@ def get_upper_threshold(edge_scores, k):
 
 
 def chop(component, edge_scores, upper_score_threshold):
-    pass
+    raise NotImplementedError # TODO
+
+
 
 
 ### Top-level cluster tagging/identification ------------------------------
@@ -330,7 +438,12 @@ def identify_clusters(connectome_df: ddf.DataFrame) -> list[ddf.DataFrame]:
 
 def tag_edges(cluster_dfs, connectome_df):
     """ Return connectome_df sorted by and tagged with cluster IDs """
-    pass # TODO - implement
+    raise NotImplementedError # TODO - implement
+
+
+
+
+
 
 
 ################################# ANALYSIS #####################################
@@ -343,6 +456,10 @@ def do_stats(clusters):
 def make_graphs(clusters):
     """ Generate supporting graphs """
     pass # TODO - implement
+
+
+
+
 
 
 
