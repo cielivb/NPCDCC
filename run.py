@@ -277,12 +277,11 @@ def update_state_array(state: ddf.DataFrame, nodes_to_update: ddf.DataFrame,
 def get_component_subset(level_nodes: ddf.DataFrame, 
                          component: ddf.DataFrame) -> ddf.DataFrame:
     """ Get all edges from component involving any node in level_nodes """
-    subset1 = level_nodes.merge(component, left_on="node_id", 
-                                right_on="pre", how="inner")
-    subset2 = level_nodes.merge(component, left_on="node_id", 
-                                right_on="post", how="inner")
-    subset = ddf.concat([subset1, subset2]).drop_duplicates()
-    subset = subset.set_index("node_id", drop=False, sort=True)
+    # Select columns in component pre that match level_nodes node_id. 
+    subset_full = level_nodes.merge(component, left_on="node_id", 
+                                    right_on="pre", how="inner")
+    subset = subset_full[["pre", "post", "syn_count"]]
+    subset = subset.set_index("pre", drop=False, sort=True)
     return subset
 
 
@@ -292,16 +291,11 @@ def update_pc_cp_dfs(level_nodes: ddf.DataFrame, comp_subset: ddf.DataFrame,
     """ Update parent-child and child-parent relationships with this levels data """
     
     def process_node(node_id: int) -> tuple[ddf.DataFrame]:
-        """ Create dataframes of new pc and cp relationships """      
-        # Do a left join of neighbours to level_nodes then filter by nodes 
-        # present only on the left side (i.e., present in neighbours but not in
-        # level_nodes) to get all prospective parent and child neighbours.
-        all_neighbours = comp_subset.loc[node_id]["post"].to_frame("post").persist()
-        print(f"all neighbours = {all_neighbours}")
-        print(f" level nodes = {level_nodes}")
-        merged = all_neighbours.merge(level_nodes, left_on="post", right_on="node_id", 
-                                      how="left", indicator=True)
-        neighbours = merged[merged["_merge"] == "left_only"]["node_id"].persist()
+        """ Create dataframes of new pc and cp relationships """
+        neighbours = comp_subset.loc[node_id]["post"].to_frame("nnode_id").persist()
+        print(f"neighbours = \n{neighbours.head(5)}")
+        print(f"pc_df = \n{pc_df.head(5)}")
+        print(f"cp_df = \n{cp_df.head(5)}")
         
         # Add entries in new_cp_rels for every child-parent relationship, where
         # node_id is the child
