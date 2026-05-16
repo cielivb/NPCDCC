@@ -68,6 +68,7 @@ class TestPBFS(unittest.TestCase):
     def test_case_1(self):
         """ 1-component test with 4 levels """
         df = get_twelve_node_dask_df()
+        df = run.adj_bag_to_df(run.df_to_adjacency_bag(df)).persist() # Undirect df
         state = run.create_state_df(df).persist()
         start_node = 29
         

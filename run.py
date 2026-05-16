@@ -277,9 +277,12 @@ def update_state_array(state: ddf.DataFrame, nodes_to_update: ddf.DataFrame,
 def get_component_subset(level_nodes: ddf.DataFrame, 
                          component: ddf.DataFrame) -> ddf.DataFrame:
     """ Get all edges from component involving any node in level_nodes """
-    subset1 = level_nodes.merge(component, left_on="node_id", right_on="pre", how="inner")
-    subset2 = level_nodes.merge(component, left_on="node_id", right_on="post", how="inner")
+    subset1 = level_nodes.merge(component, left_on="node_id", 
+                                right_on="pre", how="inner")
+    subset2 = level_nodes.merge(component, left_on="node_id", 
+                                right_on="post", how="inner")
     subset = ddf.concat([subset1, subset2]).drop_duplicates()
+    subset = subset.set_index("node_id", drop=False, sort=True)
     return subset
 
 
@@ -288,15 +291,16 @@ def update_pc_cp_dfs(level_nodes: ddf.DataFrame, comp_subset: ddf.DataFrame,
                      cp_df: ddf.DataFrame) -> tuple[ddf.DataFrame]:
     """ Update parent-child and child-parent relationships with this levels data """
     
-    def process_nodes(node_id: int) -> tuple[ddf.DataFrame]:
+    def process_node(node_id: int) -> tuple[ddf.DataFrame]:
         """ Create dataframes of new pc and cp relationships """      
         # Do a left join of neighbours to level_nodes then filter by nodes 
         # present only on the left side (i.e., present in neighbours but not in
         # level_nodes) to get all prospective parent and child neighbours.
-        all_neighbours = comp_subset[node_id]["post"].persist()
-        merged = ddf.merge(left = all_neighbours, right = level_nodes,
-                           left_on = "post", right_on = "node_id",
-                           how = "left", indicator = True)
+        all_neighbours = comp_subset.loc[node_id]["post"].to_frame("post").persist()
+        print(f"all neighbours = {all_neighbours}")
+        print(f" level nodes = {level_nodes}")
+        merged = all_neighbours.merge(level_nodes, left_on="post", right_on="node_id", 
+                                      how="left", indicator=True)
         neighbours = merged[merged["_merge"] == "left_only"]["node_id"].persist()
         
         # Add entries in new_cp_rels for every child-parent relationship, where
@@ -318,13 +322,20 @@ def update_pc_cp_dfs(level_nodes: ddf.DataFrame, comp_subset: ddf.DataFrame,
         new_pc_rels = c_neighbours[c_neighbours["parent"] == node_id].persist()
         return (new_pc_rels, new_cp_rels)
         
-    new_dfs = level_nodes["node_id"].map(process_node).persist()
-    new_pc_dfs = new_dfs.map(lambda tup: tup[0]).persist()
-    new_pc_df = ddf.concat(new_pc_dfs).persist().persist()
-    new_cp_dfs = new_dfs.map(lambda tup: tup[1]).persist()
-    new_cp_df = ddf.concat(new_cp_dfs).persist()
+    new_dfs = level_nodes["node_id"].to_bag().map(process_node).persist()
+    print(1)
+    new_pc_dfs = new_dfs.map(lambda tup: tup[0]).compute() # List of new pc dask dfs
+    print(2)
+    new_pc_df = ddf.concat(new_pc_dfs)
+    print(3)
+    new_cp_dfs = new_dfs.map(lambda tup: tup[1]).compute()
+    print(4)
+    new_cp_df = ddf.concat(new_cp_dfs)
+    print(5)
     pc_df = ddf.concat([pc_df, new_pc_df]).persist()
+    print(6)
     cp_df = ddf.concat([cp_df, new_cp_df]).persist()
+    print(7)
     return (pc_df, cp_df)
 
 
