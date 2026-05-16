@@ -34,6 +34,8 @@ TODO
 """
 
 import argparse
+import dask
+import os
 from dask import bag as db
 from dask import dataframe as ddf
 from dask.distributed import Client
@@ -45,7 +47,7 @@ MAD_K = 3.5
 
 ROOT_DIR = os.path.dirname(__file__)
 
-
+dask.config.set({"dataframe.shuffle.method": "tasks"})
 
 
 
@@ -134,9 +136,9 @@ def adj_df_to_adj_bag(adj_df: ddf.DataFrame) -> db.Bag:
 
 def get_all_nodes(df: ddf.DataFrame) -> db.Bag:
     """ Return a bag of every unique node in the dataframe """
-    unique_pre = df["pre"].unique().to_bag().persist()
-    unique_post = df["post"].unique().to_bag().persist()
-    unique_nodes = db.concat([unique_pre, unique_post]).persist()
+    unique_pre = df["pre"].drop_duplicates().to_bag()
+    unique_post = df["post"].drop_duplicates().to_bag()
+    unique_nodes = db.concat([unique_pre, unique_post])
     return unique_nodes
     
     
@@ -147,9 +149,11 @@ def get_num_nodes(df: ddf.DataFrame) -> int:
 
 def create_state_df(component: ddf.DataFrame) -> ddf.DataFrame:
     """ The state dataframe uses node ids as indexes to track state in PBFS """
-    state = get_all_nodes(component).to_frame(meta = {"node_id": int})
+    nodes = get_all_nodes(component)
+    state = nodes.to_dataframe(meta = {"node_id": int})
     state["state"] = "U"
-    state = state.set_index("node_id", sort=True).persist()
+    state = state.set_index("node_id", sort=True)
+    print("Updated state")
     return state
 
 
@@ -263,7 +267,8 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
 def update_state_array(state: ddf.DataFrame, nodes_to_update: ddf.DataFrame, 
                        new_status: str) -> ddf.DataFrame:
     """ Update states of nodes_to_update in state dataframe to either D or P """
-    indexes_to_update = state.index.isin(nodes_to_update["node_id"])
+    indexes_to_update = state.merge(nodes_to_update, left_index=True,
+                                    right_on="node_id", how="inner")["node_id"]
     state["state"] = state["state"].mask(indexes_to_update, new_status)
     state = state.persist()
     return state
@@ -272,11 +277,9 @@ def update_state_array(state: ddf.DataFrame, nodes_to_update: ddf.DataFrame,
 def get_component_subset(level_nodes: ddf.DataFrame, 
                          component: ddf.DataFrame) -> ddf.DataFrame:
     """ Get all edges from component involving any node in level_nodes """
-    subset1 = component["pre"].isin(level_nodes["node_id"]).persist()
-    subset2 = component["post"].isin(level_nodes["node_id"]).persist()
-    subset = subset1.concat(subset2, interleave_partitions=True).persist()
-    subset = subset.drop_duplicates(subset=["pre","post"]).persist()
-    subset = subset.set_index("pre", drop=False).persist()
+    subset1 = level_nodes.merge(component, left_on="node_id", right_on="pre", how="inner")
+    subset2 = level_nodes.merge(component, left_on="node_id", right_on="post", how="inner")
+    subset = ddf.concat([subset1, subset2]).drop_duplicates()
     return subset
 
 
@@ -290,11 +293,11 @@ def update_pc_cp_dfs(level_nodes: ddf.DataFrame, comp_subset: ddf.DataFrame,
         # Do a left join of neighbours to level_nodes then filter by nodes 
         # present only on the left side (i.e., present in neighbours but not in
         # level_nodes) to get all prospective parent and child neighbours.
-        all_neighbours = comp_subset[node_id]["post"]
+        all_neighbours = comp_subset[node_id]["post"].persist()
         merged = ddf.merge(left = all_neighbours, right = level_nodes,
                            left_on = "post", right_on = "node_id",
                            how = "left", indicator = True)
-        neighbours = merged[merged["_merge"] == "left_only"]["node_id"]
+        neighbours = merged[merged["_merge"] == "left_only"]["node_id"].persist()
         
         # Add entries in new_cp_rels for every child-parent relationship, where
         # node_id is the child
@@ -315,10 +318,10 @@ def update_pc_cp_dfs(level_nodes: ddf.DataFrame, comp_subset: ddf.DataFrame,
         new_pc_rels = c_neighbours[c_neighbours["parent"] == node_id].persist()
         return (new_pc_rels, new_cp_rels)
         
-    new_dfs = level_nodes["node_id"].map(process_node)
-    new_pc_dfs = new_dfs.map(lambda tup: tup[0])
-    new_pc_df = ddf.concat(new_pc_dfs).persist()
-    new_cp_dfs = new_dfs.map(lambda tup: tup[1])
+    new_dfs = level_nodes["node_id"].map(process_node).persist()
+    new_pc_dfs = new_dfs.map(lambda tup: tup[0]).persist()
+    new_pc_df = ddf.concat(new_pc_dfs).persist().persist()
+    new_cp_dfs = new_dfs.map(lambda tup: tup[1]).persist()
     new_cp_df = ddf.concat(new_cp_dfs).persist()
     pc_df = ddf.concat([pc_df, new_pc_df]).persist()
     cp_df = ddf.concat([cp_df, new_cp_df]).persist()
@@ -379,14 +382,14 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
     """
     # Set-up PBFS
     depth = 0
-    level_nodes = ddf.from_dict({"node_id": [start_node]}, npartitions=1)
+    level_nodes = ddf.from_dict({"node_id": [start_node]}, npartitions=1).persist()
     pc_df = ddf.from_dict(
-        {"parent": [], "child": [], "syn_count": []}, npartitions=1)
+        {"parent": [], "child": [], "syn_count": []}, npartitions=1).persist()
     cp_df = ddf.from_dict(
-        {"child": [], "parent": [], "syn_count": []}, npartitions=1)
+        {"child": [], "parent": [], "syn_count": []}, npartitions=1).persist()
     num_sps_df = ddf.from_dict(
-        {"depth": [0], "node_id": [start_node], "num_sps": [1]}, npartitions=1)
-    num_sps_df = num_sps_df.set_index("depth", drop=False)    
+        {"depth": [0], "node_id": [start_node], "num_sps": [1]}, npartitions=1).persist()
+    num_sps_df = num_sps_df.set_index("depth", drop=False).persist()
 
     # Run PBFS
     while True:
@@ -398,8 +401,8 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
         # Repartition and reindex pc_df and cp_df. Do it here because will be
         # reused in the next frontier, and I want fast lookups in the next
         # frontier as well!
-        pc_df = pc_df.set_index("parent", drop=False)
-        cp_df = cp_df.set_index("child", drop=False)         
+        pc_df = pc_df.set_index("parent", drop=False).persist()
+        cp_df = cp_df.set_index("child", drop=False).persist()
         
         # Update number of shortest paths dataframe
         num_sps_df = update_num_sps_df(level_nodes, depth, cp_df, num_sps_df)
@@ -488,7 +491,7 @@ def chop(component, edge_scores, upper_score_threshold):
 
 ### Top-level cluster tagging/identification ------------------------------
 
-def modified_girvan_newman(component: ddf.DataFrame) -> tuple[ddf.Dataframe|None, bool]:
+def modified_girvan_newman(component: ddf.DataFrame) -> tuple[ddf.DataFrame|None, bool]:
     """ Remove linker edges from the component dataframe.
     
     Returns a bag of components and whether processing should continue.

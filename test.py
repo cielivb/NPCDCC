@@ -8,13 +8,14 @@ from dask import dataframe as ddf
 from dask.distributed import Client
 from pandas.testing import assert_frame_equal
 
+import run
 
 def get_six_node_cycle_dask_df():
     d = {"pre": [0,0,1,5,3,3],
          "post": [1,5,2,4,2,4],
          "syn_count": [2,4,6,7,3,8],
          "misc": [1,2,3,4,5,6]}
-    df = ddf.from_pandas(pd.DataFrame(data=d))
+    df = ddf.from_pandas(pd.DataFrame(data=d)).persist()
     return df
 
 
@@ -23,7 +24,7 @@ def get_twelve_node_dask_df():
          "post": [21,22,23,24,25,26,27,28,29,20,30,31,23,29,28,27,26,25,24],
          "syn_count": [7,5,2,1,1,2,3,4,3,2,1,2,1,2,2,3,2,2,2],
          "misc": [15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33]}
-    df = ddf.from_pandas(pd.DataFrame(data=d))
+    df = ddf.from_pandas(pd.DataFrame(data=d)).persist()
     return df
 
 
@@ -67,10 +68,10 @@ class TestPBFS(unittest.TestCase):
     def test_case_1(self):
         """ 1-component test with 4 levels """
         df = get_twelve_node_dask_df()
-        state = run.create_state_df(df)
+        state = run.create_state_df(df).persist()
         start_node = 29
         
-        state, pc_df, cp_df, num_sps = run.pbfs(start_node, state, df)      
+        state, pc_df, cp_df, num_sps = run.pbfs(start_node, df, state)      
         state = state.compute()
         pc_df = pc_df.compute()
         cp_df = pc_df.compute()
@@ -90,7 +91,7 @@ class TestPBFS(unittest.TestCase):
         state = run.create_state_df(df)
         start_node = 29
         
-        state, pc_df, cp_df, num_sps = run.pbfs(start_node, state, df)      
+        state, pc_df, cp_df, num_sps = run.pbfs(start_node, df, state)      
         state = state.compute()
         pc_df = pc_df.compute()
         cp_df = pc_df.compute()
