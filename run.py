@@ -338,6 +338,7 @@ def update_num_sps_df(level_nodes: ddf.DataFrame, depth: int, cp_df: ddf.DataFra
     
     def get_num_sps(node_id: int) -> int:
         """ Sum the total number of shortest paths from node_id to parents """
+        # TODO - FIX TO ACCOUNT FOR NUM SYNAPSES !!!
         parents = cp_df[cp_df["child"] == node_id]["parent"] # parent node IDs
         parent_num_sps = ddf.merge(left=parents, right=all_parent_num_sps,
                                    left_on="parent", right_on="node_id", how="inner")
