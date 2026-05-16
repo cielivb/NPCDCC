@@ -337,13 +337,17 @@ def update_num_sps_df(level_nodes: ddf.DataFrame, depth: int, cp_df: ddf.DataFra
     all_parent_num_sps = num_sps_df[num_sps_df["depth"] == depth-1].persist()
     
     def get_num_sps(node_id: int) -> int:
-        """ Sum the total number of shortest paths from node_id to parents """
-        # TODO - FIX TO ACCOUNT FOR NUM SYNAPSES !!!
-        parents = cp_df[cp_df["child"] == node_id]["parent"] # parent node IDs
-        parent_num_sps = ddf.merge(left=parents, right=all_parent_num_sps,
-                                   left_on="parent", right_on="node_id", how="inner")
-        total = parent_num_sps["num_sps"].persist() # Should I compute or persist here? TODO
-        return total
+        """ Sum the total number of shortest paths from node_id to parents. 
+        If an edge a->b has three synapses, then there are three shortest paths
+        from a->b. 
+        """
+        parent_data = cp_df[cp_df["child"] == node_id]
+        parent_data = ddf.merge(left=parent_data, right=all_parent_num_sps,
+                                left_on="parent", right_on="node_id", how="inner")
+        parent_data["parent_num_sps"] = parent_data["num_sps"]
+        parent_data["num_sps"] = parent_data["parent_num_sps"] * parent_data["syn_count"]
+        num_sps = parent_data["num_sps"].shape[0].persist()
+        return num_sps
     
     # Get this level's number of shortest paths
     new_num_sps = level_nodes
