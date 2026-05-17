@@ -469,12 +469,14 @@ def pbfs_backtrack(pc_df: ddf.DataFrame, cp_df: ddf.DataFrame,
                    num_sps: ddf.DataFrame) -> db.Bag:
     """ Iterate from the bottom of the PBFS tree upwards, assigning node credits
     and edge scores along the way. Return edge scores. """
+    # Set-up PBFS backtrack
     depth = num_sps["depth"].max().compute()
     edge_score_df = ddf.from_dict(
         {"depth":[],"parent":[],"child":[],"score":[]}, 
         meta={"depth":int,"parent":int,"child":int,"score":float}).persist()
     edge_score_df = edge_score_df.set_index("depth", drop=False, sort=True)    
     
+    # Run PBFS backtrack, accumulating edge scores
     while depth >= 0:
         level_num_sps = num_sps[num_sps["depth"] == depth].persist()
         parent_num_sps = num_sps[num_sps["depth"] == depth-1]
@@ -483,8 +485,13 @@ def pbfs_backtrack(pc_df: ddf.DataFrame, cp_df: ddf.DataFrame,
         edge_score_df = ddf.concat([edge_score_df, edge_scores])
         edge_score_df = edge_score_df.set_index("depth", drop=False, sort=True)
         depth -= 1
-
-    return pc_rels
+    
+    # Reformat edge_score_df such that the smaller node number is always node1
+    # and the larger node number is node2. This makes grouping easier later.
+    edge_score_df["node1"] = min(edge_score_df["parent"], edge_score_df["child"])
+    edge_score_df["node2"] = max(edge_score_df["parent"], edge_score_df["child"])
+    edge_score_df = edge_score_df[["node1", "node2", "score"]].persist()
+    return edge_score_df
 
 
 def get_initial_edge_scores(start_node: int, component: ddf.DataFrame, 
@@ -498,53 +505,50 @@ def get_initial_edge_scores(start_node: int, component: ddf.DataFrame,
     return init_edge_scores
 
 
-def get_edge_scores(component: ddf.DataFrame) -> db.Bag:
+def get_edge_scores(component: ddf.DataFrame) -> ddf.DataFrame:
     """ Set up and do the edge-score calculation phase of Girvan-Newman. 
-    Output edge score bag should be of general form:
-    Bag([((pre, post), edge_score), ...])
+    Output edge score df columns node1, node2, score
     """
     # Get random subset of nodes. For now, using sample size = ~1/4 the number
     # of nodes in component.
+    mult_factor = 0.25
     component_nodes = get_all_nodes(component)
     num_nodes = component_nodes.count().compute()
-    random_nodes = db.random.sample(component_nodes, int(num_nodes/4))
+    random_nodes = db.random.sample(component_nodes, int(mult_factor*num_nodes))
     
-    # Get list of bags containing initial edge scores from each start node
-    all_edge_score_bags_list = random_nodes.map(
-        lambda start_node: get_initial_edge_scores(start_node, component, num_nodes)).compute()
+    # Get delayed dataframe partitions of edge scores (can mush them up because 
+    # will all be concatenated anyways)
+    delayed_df_partitions = random_nodes.map(
+        lambda start_node: get_initial_edge_scores(start_node).to_delayed())
+    delayed_df_partitions = delayed_df_partitions.flatten().to_delayed()
     
-    # Concatenate all initial edge scores into one bag. There should be 
-    # duplicate entries for each edge. 
-    all_edge_scores = db.concat(all_edge_score_bags_list)
-    
-    # TODO - make the below preserve edge identity (pre, post), and ensure
-    # (a, b) and (b, a) scores are summed together as well
-    # Sum edge scores and divide by factor
-    #factor = 0.5 # Used sample size = quarter # nodes in df -> factor = 0.5
-    #scores = all_edge_scores.foldby(
-        #key = lambda edge_score: edge_score[0],
-        #binop = lambda accum, edge_score: accum + edge_score[1],
-        #initial = 0,
-        #combine = lambda accum1, accum2: accum1 + accum2,
-        #combine_initial = 0
-    #)
-    #standardised_scores = scores.map(
-        #lambda edge_score: (edge_score[0], edge_score[1]/factor))
-    #return standardised_scores
-    raise NotImplementedError
+    # Concatenate sub-dataframes into one big dataframe of ungrouped edge scores
+    sub_dfs = [ddf.from_delayed(_) for _ in delayed_df_partitions]
+    ungrouped = ddf.concat(sub_dfs)
+
+    # Group by (node1, node2) and sum edge scores then divide by appropriate
+    # factor (for now, factor = 0.5 because sample size = 0.25*num nodes in 
+    # component). Edge direction is already normalised so don't need to worry
+    # about accounting for node2->node1 edges.
+    div_factor = 0.5
+    edge_scores = ungrouped.groupby(["node1","node2"])["score"].sum()
+    edge_scores["score"] = edge_scores["score"] / div_factor
+    edge_scores = edge_scores.persist()
+    return edge_scores
 
 
 
 ### Chopping functions ----------------------------------------------------
 
-def get_upper_threshold(edge_scores, k):
+def get_upper_threshold(edge_scores: ddf.DataFrame, k:float|int|None) -> float:
     """ Calculate MAD-based upper threshold.
-    edge_scores of form Bag([((pre, post), edge_score), ...])
+    edge_scores is dataframe with columns node1, node2, score
     """
+    # TODO - reimplement w df edge_scores
     global MAD_K
     if not k:
         k = MAD_K
-    scores = np.array(edge_scores.map(lambda tup: tup[1]).compute())
+    scores = np.array(edge_scores.map(lambda tup: tup[1]).compute()) 
     median_score = np.median(scores)
     mad = np.median(np.absolute(scores - median_score))
     upper_threshold = median_score + k * mad
