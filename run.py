@@ -292,44 +292,41 @@ def update_pc_cp_dfs(level_nodes: ddf.DataFrame, comp_subset: ddf.DataFrame,
     
     def process_node(node_id: int) -> tuple[ddf.DataFrame]:
         """ Create dataframes of new pc and cp relationships """
-        neighbours = comp_subset.loc[node_id]["post"].to_frame("nnode_id").persist()
-        neighbours = neighbours.merge(state, left_on="nnode_id", 
-                                      right_index=True, how="inner")
-        print(f"node={node_id},neighbours={neighbours.head(10,npartitions=-1)}")
-        print(f"state={state.head(15,npartitions=-1)}")
+        # Get this node's neighbours. Neighbours on the same level as node will
+        # be marked as discovered (D). Parents of this node will be marked as P.
+        # Children of this node will be undiscovered (U)
+        neighbours = comp_subset.loc[node_id]
+        neighbours = neighbours.merge(state, left_on="post", 
+                                      right_index=True, how="inner").persist()
+        
         # Add entries to new_pc_rels for every parent-child relationship where
         # node_id is the parent
+        raw_parent_rels = neighbours[neighbours["state"] == "U"]
+        new_pc_rels = raw_parent_rels
+        new_pc_rels["child"] = new_pc_rels["post"]
+        new_pc_rels["parent"] = new_pc_rels["pre"]
+        new_pc_rels = new_pc_rels[["parent","child","syn_count"]].persist()
         
+        # Add entries to new_cp_rels for every child-parent relationship where
+        # node_id is the child
+        raw_child_rels = neighbours[neighbours["state"] == "P"]
+        new_cp_rels = raw_child_rels
+        new_cp_rels["parent"] = new_cp_rels["post"]
+        new_cp_rels["child"] = new_cp_rels["pre"]
+        new_cp_rels = new_cp_rels[["child","parent","syn_count"]].persist()
         
-        ## Add entries in new_cp_rels for every child-parent relationship, where
-        ## node_id is the child
-        #p_neighbours = neighbours.merge(pc_df, left_on="nnode_id", 
-                                        #right_index=True, how="inner")
-        #new_cp_rels = p_neighbours[p_neighbours["child"] == node_id]
-        #new_cp_rels = new_cp_rels[["child", "parent", "syn_count"]].persist()
-        
-        ## Add entries in new_pc_rels for every parent-child relationship, where
-        ## node_id is the parent. Child neighbours are those neighbours in 
-        ## neighbours that are not parent neighbours.
-        #temp = neighbours.merge(new_cp_rels, left_on="nnode_id", 
-                                #right_on="parent", how="left", indicator=True)
-        #c_neighbour_nodes = temp[temp["_merge"] == "left_only"]["nnode_id"].to_frame("child")
-        #c_neighbours = c_neighbour_nodes.merge(comp_subset, left_on="child", 
-                                               #right_on="post", how="inner")
-        #new_pc_rels = c_neighbours[c_neighbours["pre"] == node_id]
-        #new_pc_rels["parent"] = new_pc_rels["pre"]
-        #new_pc_rels = new_pc_rels[["parent", "child", "syn_count"]].persist()
-        #return (new_pc_rels, new_cp_rels)
+        return (new_pc_rels, new_cp_rels)
         
     new_dfs = level_nodes["node_id"].to_bag().map(process_node).persist()
     new_pc_dfs = new_dfs.map(lambda tup: tup[0]).compute() # List of new pc dask dfs
-    new_pc_df = ddf.concat(new_pc_dfs)
+    print(f"new pc df = {new_pc_dfs[0].compute()}")
+    new_pc_df = ddf.concat(new_pc_dfs).persist()
     new_cp_dfs = new_dfs.map(lambda tup: tup[1]).compute()
     new_cp_df = ddf.concat(new_cp_dfs)
     pc_df = ddf.concat([pc_df, new_pc_df]).persist()
     cp_df = ddf.concat([cp_df, new_cp_df]).persist()
-    print(f"\npc_df ! = \n{pc_df.head(5)}")    
-    print(f"\ncp_df ! = \n{cp_df.head(5)}")    
+    print(f"\npc_df = \n{pc_df.head(5)}")    
+    print(f"\ncp_df = \n{cp_df.head(5)}")    
     return (pc_df, cp_df)
 
 
