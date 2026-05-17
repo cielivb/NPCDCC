@@ -150,10 +150,9 @@ def get_num_nodes(df: ddf.DataFrame) -> int:
 def create_state_df(component: ddf.DataFrame) -> ddf.DataFrame:
     """ The state dataframe uses node ids as indexes to track state in PBFS """
     nodes = get_all_nodes(component)
-    state = nodes.to_dataframe(meta = {"node_id": int})
+    state = nodes.to_dataframe(meta = {"node_id": int}).drop_duplicates()
     state["state"] = "U"
     state = state.set_index("node_id", sort=True)
-    print("Updated state")
     return state
 
 
@@ -264,13 +263,14 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
 
 ### Calculating edge scores functions (includes PBFS & backtracking) ------
     
-def update_state_array(state: ddf.DataFrame, nodes_to_update: ddf.DataFrame, 
+def update_state_df(state: ddf.DataFrame, nodes_to_update: ddf.DataFrame, 
                        new_status: str) -> ddf.DataFrame:
     """ Update states of nodes_to_update in state dataframe to either D or P """
-    indexes_to_update = state.merge(nodes_to_update, left_index=True,
-                                    right_on="node_id", how="inner")["node_id"]
-    state["state"] = state["state"].mask(indexes_to_update, new_status)
-    state = state.persist()
+    merged = state.merge(nodes_to_update, left_index=True, right_on="node_id", 
+                         how="left", indicator=True)
+    merged["update"] = merged["_merge"] == "both"
+    merged = merged.set_index("node_id", drop=False)    
+    state["state"] = state["state"].mask(merged["update"], new_status)
     return state
 
 
@@ -286,31 +286,40 @@ def get_component_subset(level_nodes: ddf.DataFrame,
 
 
 def update_pc_cp_dfs(level_nodes: ddf.DataFrame, comp_subset: ddf.DataFrame, 
-                     pc_df: ddf.DataFrame, 
-                     cp_df: ddf.DataFrame) -> tuple[ddf.DataFrame]:
+                     pc_df: ddf.DataFrame, cp_df: ddf.DataFrame,
+                     state: ddf.DataFrame) -> tuple[ddf.DataFrame]:
     """ Update parent-child and child-parent relationships with this levels data """
     
     def process_node(node_id: int) -> tuple[ddf.DataFrame]:
         """ Create dataframes of new pc and cp relationships """
         neighbours = comp_subset.loc[node_id]["post"].to_frame("nnode_id").persist()
+        neighbours = neighbours.merge(state, left_on="nnode_id", 
+                                      right_index=True, how="inner")
+        print(f"node={node_id},neighbours={neighbours.head(10,npartitions=-1)}")
+        print(f"state={state.head(15,npartitions=-1)}")
+        # Add entries to new_pc_rels for every parent-child relationship where
+        # node_id is the parent
         
-        # Add entries in new_cp_rels for every child-parent relationship, where
-        # node_id is the child
-        p_neighbours = neighbours.merge(pc_df, left_on="nnode_id", 
-                                        right_index=True, how="inner")
-        new_cp_rels = p_neighbours[p_neighbours["child"] == node_id]
-        new_cp_rels = new_cp_rels[["child", "parent", "syn_count"]].persist()
         
-        # Add entries in new_pc_rels for every parent-child relationship, where
-        # node_id is the parent. Child neighbours are those neighbours in 
-        # neighbours that are not parent neighbours.
-        temp = neighbours.merge(new_cp_rels, left_on="nnode_id", 
-                                right_on="parent", how="left", indicator=True)
-        c_neighbour_nodes = temp[temp["_merge"] == "left_only"]["nnode_id"].to_frame("child")
-        c_neighbours = c_neighbour_nodes.merge(comp_subset, left_on="child", 
-                                               right_on="post", how="inner")
-        new_pc_rels = c_neighbours[c_neighbours["pre"] == node_id].persist()
-        return (new_pc_rels, new_cp_rels)
+        ## Add entries in new_cp_rels for every child-parent relationship, where
+        ## node_id is the child
+        #p_neighbours = neighbours.merge(pc_df, left_on="nnode_id", 
+                                        #right_index=True, how="inner")
+        #new_cp_rels = p_neighbours[p_neighbours["child"] == node_id]
+        #new_cp_rels = new_cp_rels[["child", "parent", "syn_count"]].persist()
+        
+        ## Add entries in new_pc_rels for every parent-child relationship, where
+        ## node_id is the parent. Child neighbours are those neighbours in 
+        ## neighbours that are not parent neighbours.
+        #temp = neighbours.merge(new_cp_rels, left_on="nnode_id", 
+                                #right_on="parent", how="left", indicator=True)
+        #c_neighbour_nodes = temp[temp["_merge"] == "left_only"]["nnode_id"].to_frame("child")
+        #c_neighbours = c_neighbour_nodes.merge(comp_subset, left_on="child", 
+                                               #right_on="post", how="inner")
+        #new_pc_rels = c_neighbours[c_neighbours["pre"] == node_id]
+        #new_pc_rels["parent"] = new_pc_rels["pre"]
+        #new_pc_rels = new_pc_rels[["parent", "child", "syn_count"]].persist()
+        #return (new_pc_rels, new_cp_rels)
         
     new_dfs = level_nodes["node_id"].to_bag().map(process_node).persist()
     new_pc_dfs = new_dfs.map(lambda tup: tup[0]).compute() # List of new pc dask dfs
@@ -319,6 +328,8 @@ def update_pc_cp_dfs(level_nodes: ddf.DataFrame, comp_subset: ddf.DataFrame,
     new_cp_df = ddf.concat(new_cp_dfs)
     pc_df = ddf.concat([pc_df, new_pc_df]).persist()
     cp_df = ddf.concat([cp_df, new_cp_df]).persist()
+    print(f"\npc_df ! = \n{pc_df.head(5)}")    
+    print(f"\ncp_df ! = \n{cp_df.head(5)}")    
     return (pc_df, cp_df)
 
 
@@ -332,24 +343,32 @@ def update_num_sps_df(level_nodes: ddf.DataFrame, depth: int, cp_df: ddf.DataFra
     # Parent num sps will always be at depth one level above this level. Subset
     # to the parent level to speed up scan (avoids scanning all levels).
     all_parent_num_sps = num_sps_df[num_sps_df["depth"] == depth-1].persist()
+    #print(f"all parent num sps df =\n{all_parent_num_sps.head(5)}")
+    #print(f" level nodes = \n{level_nodes.head(5)}")
     
     def get_num_sps(node_id: int) -> int:
         """ Sum the total number of shortest paths from node_id to parents. 
         If an edge a->b has three synapses, then there are three shortest paths
         from a->b. 
         """
-        parent_data = cp_df[cp_df["child"] == node_id]
-        parent_data = ddf.merge(left=parent_data, right=all_parent_num_sps,
-                                left_on="parent", right_on="node_id", how="inner")
-        parent_data["parent_num_sps"] = parent_data["num_sps"]
-        parent_data["num_sps"] = parent_data["parent_num_sps"] * parent_data["syn_count"]
-        num_sps = parent_data["num_sps"].shape[0].persist()
+        #print(f"cp_df = \n{cp_df.head()}")
+        parent_data = cp_df.loc[node_id]
+        #print(f"parent_data = {parent_data.head(5)}")
+        parent_data = parent_data.merge(all_parent_num_sps, left_on="parent", 
+                                        right_on="node_id", how="inner")
+        #print(f"parent_data = {parent_data.head(5)}")
+        #parent_data["parent_num_sps"] = parent_data["num_sps"]
+        #parent_data["num_sps"] = parent_data["parent_num_sps"] * parent_data["syn_count"]
+        #print(f"parent_data[numsps] = \n{parent_data["num_sps"].compute()}")
+        #num_sps = parent_data["num_sps"].shape[0].compute()
+        #print(f"node={node_id}, numsps={num_sps}")
         return num_sps
     
     # Get this level's number of shortest paths
     new_num_sps = level_nodes
     new_num_sps["depth"] = depth
-    new_num_sps["num_sps"] = level_nodes["node_id"].map(get_num_sps).persist()
+    new_num_sps["num_sps"] = level_nodes["node_id"].map(
+        get_num_sps).persist()
     
     # Update and return full num_sps_df dataframe
     num_sps_df = ddf.concat([num_sps_df, new_num_sps]).persist()
@@ -358,7 +377,7 @@ def update_num_sps_df(level_nodes: ddf.DataFrame, depth: int, cp_df: ddf.DataFra
 
 def get_children(level_nodes: ddf.DataFrame, pc_df: ddf.DataFrame) -> ddf.DataFrame:
     """ Get the children node ids of all nodes in level_nodes """
-    merged = level_nodes.merge(pc_df, left_on="node_id", right_on="parent", how="inner")
+    merged = level_nodes.merge(pc_df, left_on="node_id", right_index=True, how="inner")
     children = merged["child"].drop_duplicates().to_frame(name="node_id").persist()
     return children
 
@@ -393,9 +412,9 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
     # Run PBFS
     while True:
         # Update child-parent and parent-children relationship dataframes
-        state = update_state_array(state, level_nodes, "D")
+        state = update_state_df(state, level_nodes, "D")
         comp_subset = get_component_subset(level_nodes, component)
-        pc_df, cp_df = update_pc_cp_dfs(level_nodes, comp_subset, pc_df, cp_df)
+        pc_df, cp_df = update_pc_cp_dfs(level_nodes, comp_subset, pc_df, cp_df, state)
         
         # Repartition and reindex pc_df and cp_df. Do it here because will be
         # reused in the next frontier, and I want fast lookups in the next
@@ -405,7 +424,7 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
         
         # Update number of shortest paths dataframe
         num_sps_df = update_num_sps_df(level_nodes, depth, cp_df, num_sps_df)
-        update_state_array(state, level_nodes, "P")
+        update_state_df(state, level_nodes, "P")
         
         # Increase depth and change current nodes to child nodes
         children = get_children(level_nodes, pc_df)        
@@ -413,7 +432,6 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
         if level_nodes.shape[0].compute() == 0:
             break
         depth += 1
-    
     return (state, pc_df, cp_df, num_sps_df)
 
 
