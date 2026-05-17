@@ -408,9 +408,59 @@ def get_initial_edge_scores(start_node: int, component: ddf.DataFrame,
     Return Bag of Girvan Newman edge scores starting at start_node, of general 
     form Bag of tuples Bag([((pre, post), edge_score), ...]) """   
     state = create_state_df(component)
-    state, pc_df, cp_df, num_sps_df = pbfs(start_node, component, state)
+    state, pc_df, cp_df, num_sps = pbfs(start_node, component, state)
     
     # TODO - Implement PBFS backtrack to get initial edge scores
+    num_sps["node_credit"] = 1 # Each node starts with credit = 1
+    pc_rels["edge_credit"] = 0 
+    depth = num_sps["depth"].max().compute()
+    
+    while depth >= 0:
+        level_num_sps = num_sps[num_sps["depth"] == depth].persist()
+        parent_num_sps = num_sps[num_sps["depth"] == depth-1]
+        
+        # Assign node credits ---------
+        # Node credit = 1 + sum of edge credits from that node to children
+        
+        # Get parent-child relationships where this level's nodes are the parents
+        pc_rels = level_num_sps.merge(pc_df, left_on="node_id", 
+                                    right_index=True, how="inner")
+        # Get child contributions to parent (this level's) node credits
+        child_contribs = pc_rels.groupby("node_id")["edge_credit"].sum()
+        
+        # Assign node credit
+        level_num_sps = level_num_sps.merge(child_contribs, left_on="node_id", 
+                                            right_index=True, how="inner")
+        level_num_sps["node_credit"] = 1 + level_num_sps["sum(edge_credit)"]
+        level_num_sps = level_num_sps.persist()
+        
+        # Update num_sps
+        num_sps = num_sps.mask(num_sps["depth"] == depth, level_num_sps).persist()
+        
+        # Assign edge credits ---------
+        
+        # Get child-parent relationships where this level's nodes are the children
+        cp_rels = level_num_sps.merge(cp_df, left_on="node_id", 
+                                    right_index=True, how="inner")
+        
+        # Get number of shortest paths for each parent on this level
+        sps = cp_rels.merge(parent_num_sps, left_on="parent", 
+                            right_on="node_id", how="inner")
+        sps = sps[["node_id","parent","syn_count","num_sps"]]
+        
+        # Calculate edge weights. The raw edge weight is the number of synapses
+        # to a given parent. The actual edge weight is the inverse of the raw
+        # edge weight. A smaller edge weight represents a stronger physical 
+        # connection (proxied by number of synapses).
+        sps["weight"] = 1/(sps["syn_count"] * sps["num_sps"])
+        
+        # Assign edge credits
+        total_weights = sps.groupby("node_id")["weight"].sum() # Index is node_id
+        sps["prop"] = sps["weight"] / total_weights.loc[sps["node_id"]]
+        ...
+        
+        depth -= 1
+    
     raise NotImplementedError
 
 
