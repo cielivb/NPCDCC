@@ -463,7 +463,7 @@ def assign_edge_scores(depth: int, node_credits: ddf.DataFrame,
     edge_scores = edge_scores.rename(columns = {"node_id": "child"})
     edge_scores = edge_scores.persist()
     return edge_scores
-    
+
 
 def pbfs_backtrack(pc_df: ddf.DataFrame, cp_df: ddf.DataFrame, 
                    num_sps: ddf.DataFrame) -> db.Bag:

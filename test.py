@@ -7,6 +7,7 @@ import unittest
 from dask import bag as db
 from dask import dataframe as ddf
 from dask.distributed import Client
+from math import isclose
 from pandas.testing import assert_frame_equal
 
 import run
@@ -107,3 +108,47 @@ class TestPBFS(unittest.TestCase):
         assert_frame_equal(pc_df, self.get_expected_pc_df())
         assert_frame_equal(cp_df, self.get_expected_cp_df())
         assert_frame_equal(num_sps, self.get_expected_num_sps_df())
+        
+
+class TestPBFSBackTrack(unittest.TestCase):
+    """ Test that backtracking assigns correct edge scores """
+    
+    def setUp(self):
+        run.CLIENT = Client()
+    
+    def tearDown(self):
+        run.CLIENT.close()
+        
+    def get_expected_scores(self):
+        d = {"node1": [20, 29, 29, 28, 27, 20, 27, 26, 25, 24, 23, 21, 22,
+                       23, 24, 25, 26, 28, 30],
+             "node2": [29, 30, 31, 29, 28, 21, 31, 31, 31, 31, 31, 22, 23,
+                       24, 25, 26, 27, 31, 31],
+             "score": [2.054055, 1, 5.612612, 1.333333, 0.333333, 1.054055, 
+                       0.666667, 1, 1, 1, 1.945945, 0.054055, 0.945945, 
+                       0, 0, 0, 0, 0, 0]}
+        df = pd.DataFrame(data=d).sort_values(
+            by=["node1","node2"]).reset_index(drop=True)
+        return df
+    
+    def test_pbfs_backtrack(self):
+        """ Test that assigned edge scores closely match expected edge scores """
+        # Set-up test
+        df = get_twelve_node_dask_df()
+        df = run.adj_bag_to_df(run.df_to_adjacency_bag(df)).persist() # Undirect df
+        state = run.create_state_df(df).persist()
+        start_node = 29
+        state, pc_df, cp_df, num_sps = run.pbfs(start_node, df, state) #1e-06
+        
+        # Get result
+        edge_scores_dask_df = run.pbfs_backtrack(pc_df, cp_df, num_sps)
+        edge_scores = edge_scores_dask_df.compute().sort_values(
+            by=["node1","node2"]).reset_index(drop=True)
+        
+        # Get expected result
+        expected = self.get_expected_scores()
+        
+        # Compare each row 
+        for i, row in edge_scores.iterrows():
+            with self.subTest(i=i):
+                self.assertTrue(isclose(row["score"], expected.loc[i]["score"]))
