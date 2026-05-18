@@ -163,6 +163,7 @@ def undirect_df(df: ddf.DataFrame) -> ddf.DataFrame:
     """ Add b->a for every a->b in df """
     df_reversed = df.rename(columns={"pre":"post", "post":"pre"}).persist()
     undirected = ddf.concat([df, df_reversed]).persist()
+    undirected = undirected.set_index("pre", drop=False, sort=True)
     return undirected
 
 
@@ -223,16 +224,14 @@ def get_components(df: ddf.DataFrame) -> list[ddf.DataFrame]:
     return components
 
 
-def prune(adjacency_bag: db.Bag) -> db.Bag:
+@delayed
+def prune(component_df: ddf.DataFrame) -> ddf.DataFrame:
     """ Iteratively remove degree 1 edges from a dask dataframe 
     
     A degree 1 edge is defined here as an edge associated with at least one
     degree 1 node, where a degree 1 node is a node connected by any number of 
     edges to one and only one other node. No nodes in the dataset will have 
     edges to themselves. Synapse count and directionality are not considered.
-    
-    Adjacency bag format:
-            db.from_sequence([(a, [(b, 3)]), (b: [(a, 3)])])
             
     The naive approach would be to take away one edge at a time. This parallel
     version improves performance by finding all degree 1 edges initially, and
@@ -625,13 +624,16 @@ def modified_girvan_newman(component: ddf.DataFrame) -> tuple[ddf.DataFrame|None
     
     """
     global MIN_CLUSTER_SIZE
+    if get_num_nodes(new_df).compute() < MIN_CLUSTER_SIZE:
+        return (None, False) # Cluster/component too small - no point processing
+    
+    # Top-level modified Girvan-Newman
     edge_scores = get_edge_scores(component)
     upper_score_threshold = get_upper_threshold(edge_scores)
     new_df, num_chopped = chop(component, edge_scores, upper_score_threshold)
-    if get_num_nodes(new_df).compute() < MIN_CLUSTER_SIZE:
-        return (None, False) # Cluster/component too small
+    
     if num_chopped == 0:
-        return (new_df, False) # Cluster found! Don't continue processing.    
+        return (new_df, False) # Cluster found! Don't continue processing.
     return (new_df, True) # Further processing required
     
 
@@ -639,12 +641,9 @@ def process_raw_df(raw_df: ddf.DataFrame):
     """ Split up raw_df and create futures mapping to modified GN """
     global CLIENT, MIN_CLUSTER_SIZE
     component_dfs_list = get_components(raw_df)
-    adj_bags = adj_bags.map(prune)
-    adj_bags = adj_bags.filter(
-        lambda adj_bag: adj_bag.count().compute() >= MIN_CLUSTER_SIZE)
-    component_dfs = adj_bags.map(adj_bag_to_df).compute() # List of dfs
+    pruned = [ddf.from_delayed(prune(df)) for df in component_dfs_list]
     new_futures = set()
-    for df in component_dfs:
+    for df in pruned:
         new_futures.add(CLIENT.submit(modified_girvan_newman, df))
     return new_futures
 
@@ -671,7 +670,7 @@ def identify_clusters(connectome_df: ddf.DataFrame) -> ddf.DataFrame:
                 
         # Update future set then snooze
         future_set -= to_delete
-        sleep(30)
+        sleep(10)
     
     tagged_connectome = tag_edges(cluster_dfs, connectome_df)
     return tagged_connectome
