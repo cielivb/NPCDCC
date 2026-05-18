@@ -124,7 +124,7 @@ class TestPBFSBackTrack(unittest.TestCase):
                        23, 24, 25, 26, 28, 30],
              "node2": [29, 30, 31, 29, 28, 21, 31, 31, 31, 31, 31, 22, 23,
                        24, 25, 26, 27, 31, 31],
-             "score": [2.054055, 1, 5.612612, 1.333333, 0.333333, 1.054055, 
+             "score": [2.054055, 1, 6.612612, 1.333333, 0.333333, 1.054055, 
                        0.666667, 1, 1, 1, 1.945945, 0.054055, 0.945945, 
                        0, 0, 0, 0, 0, 0]}
         df = pd.DataFrame(data=d).sort_values(
@@ -138,7 +138,7 @@ class TestPBFSBackTrack(unittest.TestCase):
         df = run.adj_bag_to_df(run.df_to_adjacency_bag(df)).persist() # Undirect df
         state = run.create_state_df(df).persist()
         start_node = 29
-        state, pc_df, cp_df, num_sps = run.pbfs(start_node, df, state) #1e-06
+        state, pc_df, cp_df, num_sps = run.pbfs(start_node, df, state)
         
         # Get result
         edge_scores_dask_df = run.pbfs_backtrack(pc_df, cp_df, num_sps)
@@ -147,8 +147,11 @@ class TestPBFSBackTrack(unittest.TestCase):
         
         # Get expected result
         expected = self.get_expected_scores()
-        
+        print(f"result = \n{edge_scores}")
+        print(f"expected = \n{expected}")
         # Compare each row 
         for i, row in edge_scores.iterrows():
             with self.subTest(i=i):
-                self.assertTrue(isclose(row["score"], expected.loc[i]["score"]))
+                self.assertTrue(isclose(row["score"], 
+                                        expected.loc[i]["score"],
+                                        abs_tol=1e-05))

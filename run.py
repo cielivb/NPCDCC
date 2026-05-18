@@ -35,7 +35,9 @@ TODO
 
 import argparse
 import dask
+import numpy as np
 import os
+import pandas as pd
 from dask import bag as db
 from dask import dataframe as ddf
 from dask.distributed import Client
@@ -366,14 +368,14 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
     depth = 0
     level_nodes = ddf.from_dict({"node_id": [start_node]}, npartitions=1).persist()
     pc_df = ddf.from_dict(
-        {"parent": [], "child": [], "syn_count": []}, 
-        dtype=int, npartitions=1).persist()
+        {"parent": pd.Series(dtype=np.int64), "child": pd.Series(dtype=np.int64),
+         "syn_count": pd.Series(dtype=np.float64)}, npartitions=1).persist()
     cp_df = ddf.from_dict(
-        {"child": [], "parent": [], "syn_count": []}, 
-        dtype=int, npartitions=1).persist()
+        {"child": pd.Series(dtype=np.int64), "parent": pd.Series(dtype=np.int64),
+         "syn_count": pd.Series(dtype=np.float64)}, npartitions=1).persist()    
     num_sps_df = ddf.from_dict(
         {"depth": [0], "node_id": [start_node], "num_sps": [1]}, 
-        dtype=int, npartitions=1).persist()
+        npartitions=1).persist()
     pc_df = pc_df.set_index("parent", drop=False).persist()
     cp_df = cp_df.set_index("child", drop=False).persist()
     num_sps_df = num_sps_df.set_index("depth", drop=False).persist()
@@ -418,13 +420,14 @@ def assign_node_credits(depth: int, level_num_sps: ddf.DataFrame,
     pc_rels = level_num_sps.merge(edge_scores, left_on="node_id", 
                                   right_on="parent", how="inner")
     # Get child contributions to parent (this level's) node credits
-    child_contribs = pc_rels.groupby("node_id")["score"].sum() # index=node_id
+    child_contribs = pc_rels.groupby("node_id")["score"].sum().to_frame() # index=node_id
     
     # Assign node credit
     node_credits = level_num_sps.merge(child_contribs, left_on="node_id", 
-                                        right_index=True, how="inner")
+                                        right_index=True, how="left")
+    node_credits["score"] = node_credits["score"].fillna(0)
     node_credits["credit"] = 1 + node_credits["score"]
-    node_credits = node_credits[["node_id", "credit"]].persist()
+    node_credits = node_credits[["node_id", "credit"]]
     return node_credits
 
 
@@ -444,14 +447,15 @@ def assign_edge_scores(depth: int, node_credits: ddf.DataFrame,
     # Get number of shortest paths for each parent on this level
     sps = cp_rels.merge(parent_num_sps, left_on="parent", 
                         right_on="node_id", how="inner")
-    sps = sps[["node_id", "credit", "parent", "num_sps", "syn_count"]]
+    sps = sps[["node_id_x", "credit", "parent", "num_sps", "syn_count"]]
+    sps = sps.rename(columns={"node_id_x":"node_id"})
     
     # Assign edge credits. Each node->parent edge is allocated a proportion of 
     # the node's credit such that stronger connections (more synapses) receive
     # less credit. More credit increases the likelihood of a higher edge
     # betweenness score later.
     sps["weight"] = 1/(sps["syn_count"] * sps["num_sps"])    
-    total_weights = sps.groupby("node_id")["weight"].sum() # Index is node_id
+    total_weights = sps.groupby("node_id")["weight"].sum().to_frame() # Index is node_id
     edge_scores = sps.merge(total_weights, left_on="node_id", 
                             right_index=True, how="inner")
     edge_scores["prop"] = edge_scores["weight_x"] / edge_scores["weight_y"]
@@ -466,14 +470,15 @@ def assign_edge_scores(depth: int, node_credits: ddf.DataFrame,
 
 
 def pbfs_backtrack(pc_df: ddf.DataFrame, cp_df: ddf.DataFrame, 
-                   num_sps: ddf.DataFrame) -> db.Bag:
+                   num_sps: ddf.DataFrame) -> ddf.DataFrame:
     """ Iterate from the bottom of the PBFS tree upwards, assigning node credits
     and edge scores along the way. Return edge scores. """
     # Set-up PBFS backtrack
     depth = num_sps["depth"].max().compute()
     edge_score_df = ddf.from_dict(
-        {"depth":[],"parent":[],"child":[],"score":[]}, 
-        meta={"depth":int,"parent":int,"child":int,"score":float}).persist()
+        {"depth": pd.Series(dtype=np.int64), "parent": pd.Series(dtype=np.int64),
+         "child": pd.Series(dtype=np.int64), "score": pd.Series(dtype=np.float64)}, 
+        npartitions=1).persist()
     edge_score_df = edge_score_df.set_index("depth", drop=False, sort=True)    
     
     # Run PBFS backtrack, accumulating edge scores
@@ -488,9 +493,11 @@ def pbfs_backtrack(pc_df: ddf.DataFrame, cp_df: ddf.DataFrame,
     
     # Reformat edge_score_df such that the smaller node number is always node1
     # and the larger node number is node2. This makes grouping easier later.
-    edge_score_df["node1"] = min(edge_score_df["parent"], edge_score_df["child"])
-    edge_score_df["node2"] = max(edge_score_df["parent"], edge_score_df["child"])
-    edge_score_df = edge_score_df[["node1", "node2", "score"]].persist()
+    def reformat(df):
+        df["node1"] = df[["parent", "child"]].min(axis=1)
+        df["node2"] = df[["parent", "child"]].max(axis=1)
+        return df[["node1", "node2", "score"]]    
+    edge_score_df = edge_score_df.map_partitions(reformat).persist()
     return edge_score_df
 
 
@@ -522,18 +529,34 @@ def get_edge_scores(component: ddf.DataFrame) -> ddf.DataFrame:
         lambda start_node: get_initial_edge_scores(start_node).to_delayed())
     delayed_df_partitions = delayed_df_partitions.flatten().to_delayed()
     
-    # Concatenate sub-dataframes into one big dataframe of ungrouped edge scores
-    sub_dfs = [ddf.from_delayed(_) for _ in delayed_df_partitions]
-    ungrouped = ddf.concat(sub_dfs)
-
+    # Concatenate sub-dataframes into one big dataframe of edge scores:
     # Group by (node1, node2) and sum edge scores then divide by appropriate
     # factor (for now, factor = 0.5 because sample size = 0.25*num nodes in 
     # component). Edge direction is already normalised so don't need to worry
-    # about accounting for node2->node1 edges.
-    div_factor = 0.5
+    # about accounting for node2->node1 edges.    
+    div_factor = 0.5    
+    sub_dfs = [ddf.from_delayed(_) for _ in delayed_df_partitions]
+    ungrouped = ddf.concat(sub_dfs)
     edge_scores = ungrouped.groupby(["node1","node2"])["score"].sum()
     edge_scores["score"] = edge_scores["score"] / div_factor
-    edge_scores = edge_scores.persist()
+    edge_scores = edge_scores.persist()    
+    
+    # Account for edges not included in any shortest paths:
+    # Collapse component dataframe, then left merge on edge_scores. Subset
+    # merged result by those edges that did not merge and assign score = 0 to
+    # them, then concatenate zero-score edges to edge_scores.
+    def reformat(df):
+        df["node1"] = df[["parent", "child"]].min(axis=1)
+        df["node2"] = df[["parent", "child"]].max(axis=1)    
+        return df[["node1","node2"]]
+    collapsed = component.map_partitions(reformat)
+    merged = collapsed.merge(edge_scores, on=["node1","node2"], 
+                             how="left", indicator=True)
+    no_scores = merged[merged["_merged"] == "left_only"][["node1","node2"]]
+    no_scores["score"] = 0
+    no_scores = no_scores.persist()
+    edge_scores = ddf.concat([edge_scores, no_scores]).persist()
+
     return edge_scores
 
 
