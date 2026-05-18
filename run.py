@@ -210,10 +210,9 @@ def get_component_adjacency_bags(df: ddf.DataFrame, undirected=True) -> db.Bag:
             prev_state = state.copy()
             start_node = nodes[node_index]            
             
-            all_child_parent_rels, state, leaves = pbfs(start_node, 
-                                                        big_adjacency_bag,
-                                                        state)
-            del all_child_parent_rels, leaves
+            pbfs_results = pbfs(start_node, big_adjacency_bag, state, full=False)
+            state, pc_df, cp_df, num_sps_df = pbfs_results
+            del pc_df, cp_df, num_sps_df
             
             # Add new component
             diff_indices = np.where(state != prev_state)[0]
@@ -292,7 +291,7 @@ def get_component_subset(level_nodes: ddf.DataFrame,
 
 def update_pc_cp_dfs(level_nodes: ddf.DataFrame, comp_subset: ddf.DataFrame, 
                      pc_df: ddf.DataFrame, cp_df: ddf.DataFrame,
-                     state: ddf.DataFrame) -> tuple[ddf.DataFrame]:
+                     state: ddf.DataFrame, full: bool) -> tuple[ddf.DataFrame]:
     """ Update parent-child and child-parent relationships with this levels data """
     edges = level_nodes.merge(comp_subset, left_on="node_id", 
                               right_index=True, how="inner")
@@ -304,16 +303,15 @@ def update_pc_cp_dfs(level_nodes: ddf.DataFrame, comp_subset: ddf.DataFrame,
     # node_id is the parent (neighbour/child state is U)
     new_pc_df = edges[edges["state"] == "U"][["pre", "post", "syn_count"]]
     new_pc_df = new_pc_df.rename(columns={"pre": "parent", "post": "child"}).persist()
-    
-    # Add entries to new_cp_rels for every child-parent relationship where
-    # node_id is the child (neighbour/parent state is P)
-    new_cp_df = edges[edges["state"] == "P"][["pre", "post", "syn_count"]]
-    new_cp_df = new_cp_df.rename(columns={"pre": "child", "post": "parent"}).persist()
-        
-    # Update original dataframes with new dataframes
     pc_df = ddf.concat([pc_df, new_pc_df]).persist()
-    cp_df = ddf.concat([cp_df, new_cp_df]).persist()
     
+    if full:
+        # Add entries to new_cp_rels for every child-parent relationship where
+        # node_id is the child (neighbour/parent state is P)
+        new_cp_df = edges[edges["state"] == "P"][["pre", "post", "syn_count"]]
+        new_cp_df = new_cp_df.rename(columns={"pre": "child", "post": "parent"}).persist()
+        cp_df = ddf.concat([cp_df, new_cp_df]).persist()
+        
     return (pc_df, cp_df)
 
 
@@ -353,7 +351,7 @@ def get_children(level_nodes: ddf.DataFrame, pc_df: ddf.DataFrame) -> ddf.DataFr
     return children
 
 
-def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
+def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame, full=True):
     """ Run a parallel breadth-first-search on component. 
     
     Return state dataframe, pc_df (parent-child dataframe), cp_df (child-parent
@@ -370,31 +368,37 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame):
     pc_df = ddf.from_dict(
         {"parent": pd.Series(dtype=np.int64), "child": pd.Series(dtype=np.int64),
          "syn_count": pd.Series(dtype=np.float64)}, npartitions=1).persist()
-    cp_df = ddf.from_dict(
-        {"child": pd.Series(dtype=np.int64), "parent": pd.Series(dtype=np.int64),
-         "syn_count": pd.Series(dtype=np.float64)}, npartitions=1).persist()    
-    num_sps_df = ddf.from_dict(
-        {"depth": [0], "node_id": [start_node], "num_sps": [1]}, 
-        npartitions=1).persist()
     pc_df = pc_df.set_index("parent", drop=False).persist()
-    cp_df = cp_df.set_index("child", drop=False).persist()
-    num_sps_df = num_sps_df.set_index("depth", drop=False).persist()
+    
+    if full:
+        cp_df = ddf.from_dict(
+            {"child": pd.Series(dtype=np.int64), "parent": pd.Series(dtype=np.int64),
+             "syn_count": pd.Series(dtype=np.float64)}, npartitions=1).persist()    
+        num_sps_df = ddf.from_dict(
+            {"depth": [0], "node_id": [start_node], "num_sps": [1]}, 
+            npartitions=1).persist()
+        cp_df = cp_df.set_index("child", drop=False).persist()
+        num_sps_df = num_sps_df.set_index("depth", drop=False).persist()
+    else:
+        cp_df, num_sps_df = None, None
 
     # Run PBFS
     while True:
         # Update child-parent and parent-children relationship dataframes
         state = update_state_df(state, level_nodes, "D")
         comp_subset = get_component_subset(level_nodes, component)
-        pc_df, cp_df = update_pc_cp_dfs(level_nodes, comp_subset, pc_df, cp_df, state)
+        pc_df, cp_df = update_pc_cp_dfs(level_nodes, comp_subset, pc_df, cp_df, state, full)
         
         # Repartition and reindex pc_df and cp_df. Do it here because will be
         # reused in the next frontier, and I want fast lookups in the next
         # frontier as well!
         pc_df = pc_df.set_index("parent", drop=False).persist()
-        cp_df = cp_df.set_index("child", drop=False).persist()
+        if full:
+            cp_df = cp_df.set_index("child", drop=False).persist()
         
         # Update number of shortest paths dataframe
-        num_sps_df = update_num_sps_df(level_nodes, depth, cp_df, num_sps_df)
+        if full:
+            num_sps_df = update_num_sps_df(level_nodes, depth, cp_df, num_sps_df)
         update_state_df(state, level_nodes, "P")
         
         # Increase depth and change current nodes to child nodes

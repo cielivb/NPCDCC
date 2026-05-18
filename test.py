@@ -111,6 +111,43 @@ class TestPBFS(unittest.TestCase):
         assert_frame_equal(cp_df, self.get_expected_cp_df())
         assert_frame_equal(num_sps, self.get_expected_num_sps_df())
         
+    def test_not_full_1(self):
+        """ Test that cp_df and num_sps are None when full is False """
+        df = get_twelve_node_dask_df()
+        df = run.adj_bag_to_df(run.df_to_adjacency_bag(df)).persist() # Undirect df
+        state = run.create_state_df(df).persist()
+        start_node = 29
+        
+        # Get results
+        state, pc_df, cp_df, num_sps = run.pbfs(start_node, df, state, full=False)
+        state = state.compute()
+        pc_df = pc_df.compute().reset_index(drop=True).sort_values(by=["parent","child"]).reset_index(drop=True)
+        
+        # Run assertions
+        self.assertIsNone(cp_df)
+        self.assertIsNone(num_sps)
+        self.assertEqual(12, np.sum(state == "P")) # 12 nodes should be processed
+        assert_frame_equal(pc_df, self.get_expected_pc_df())        
+        
+    def test_not_full_2(self):
+        """ 2-component test - 1 component should be processed, and cp_df and 
+        num_sps should be be None """
+        df = ddf.concat([get_six_node_cycle_dask_df(),
+                         get_twelve_node_dask_df()], axis=0)
+        df = run.adj_bag_to_df(run.df_to_adjacency_bag(df)).persist() # Undirect df        
+        state = run.create_state_df(df)
+        start_node = 29
+        
+        state, pc_df, cp_df, num_sps = run.pbfs(start_node, df, state, full=False)
+        state = state.compute()
+        pc_df = pc_df.compute().reset_index(drop=True).sort_values(by=["parent","child"]).reset_index(drop=True)
+        
+        self.assertIsNone(cp_df)
+        self.assertIsNone(num_sps)
+        self.assertEqual(12, np.sum(state == "P")) # 12 nodes should be processed
+        self.assertEqual(6, np.sum(state == "U")) # 6 nodes should be undiscovered
+        assert_frame_equal(pc_df, self.get_expected_pc_df())
+        
 
 class TestPBFSBackTrack(unittest.TestCase):
     """ Test that backtracking assigns correct edge scores """
