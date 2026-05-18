@@ -163,9 +163,9 @@ def create_state_df(component: ddf.DataFrame) -> ddf.DataFrame:
 
 
 def undirect_df(df: ddf.DataFrame) -> ddf.DataFrame:
-    """ Add b->a for every a->b in df """
+    """ Add b->a for every a->b in df, and remove duplicates """
     df_reversed = df.rename(columns={"pre":"post", "post":"pre"}).persist()
-    undirected = ddf.concat([df, df_reversed]).persist()
+    undirected = ddf.concat([df, df_reversed]).drop_duplicates().persist()
     undirected = undirected.set_index("pre", drop=False, sort=True)
     return undirected
 
@@ -229,8 +229,8 @@ def get_components(df: ddf.DataFrame) -> list[ddf.DataFrame]:
 
 
 @delayed
-def prune(component_df: ddf.DataFrame) -> ddf.DataFrame:
-    """ Iteratively remove degree 1 edges from a dask dataframe 
+def prune(df: ddf.DataFrame) -> ddf.DataFrame:
+    """ Iteratively remove degree 1 edges from a component dataframe 
     
     A degree 1 edge is defined here as an edge associated with at least one
     degree 1 node, where a degree 1 node is a node connected by any number of 
@@ -243,24 +243,28 @@ def prune(component_df: ddf.DataFrame) -> ddf.DataFrame:
     to process the longest 'chain'.
 
     """
-    deg1_nodes = adjacency_bag.filter(
-        lambda node_adj: len(node_adj[1]) == 1).map(
-            lambda node_adj: node_adj[0]).compute()
+    def get_degree_1_nodes(df):
+        node_degrees = df.groupby(df.index)["post"].nunique().to_frame("degree")
+        deg1_nodes = node_degrees[
+            node_degrees["degree"] == 1].index.to_frame("node").persist()
+        return deg1_nodes
     
-    while True:
-        if len(deg1_nodes) == 0:
-            break
+    pruned, deg1_nodes = df, get_degree_1_nodes(df)
+    while deg1_nodes.count().compute() > 0:
+        # Get edges where any involved node is in deg1_nodes
+        merged1 = pruned.merge(deg1_nodes, left_index=True, 
+                               right_on="node", how="inner").persist()
+        merged2 = pruned.merge(deg1_nodes, left_on="post", 
+                               right_on="node", how="inner").persist()
+        to_prune = ddf.concat([merged1, merged2]).persist()
         
-        # Remove edge from deg1 node to neighbour
-        adjacency_bag = adjacency_bag.map(
-            lambda node_adj: cut_deg1_edge(node_adj, node_adj[0] in deg1_nodes)).filter(
-                lambda node_adj: len(node_adj[1]) > 0).persist()
+        # Remove edges and recompute degree 1 nodes
+        merged = pruned.merge(to_prune, on=["pre","post"], how="left", indicator=True)
+        pruned = merged[merged["_merge"] == "left_only"].persist()
+        deg1_nodes = get_degree_1_nodes(pruned).persist()
         
-        # Remove edge from neighbours to deg1 nodes
-        adjacency_bag = adjacency_bag.map(
-            lambda node_adj: remove_deg_1_nodes(node_adj, deg1_nodes)).persist()
-    
-    return adjacency_bag
+    return pruned
+
 
 
 
