@@ -159,6 +159,13 @@ def create_state_df(component: ddf.DataFrame) -> ddf.DataFrame:
     return state
 
 
+def undirect_df(df: ddf.DataFrame) -> ddf.DataFrame:
+    """ Add b->a for every a->b in df """
+    df_reversed = df.rename(columns={"pre":"post", "post":"pre"}).persist()
+    undirected = ddf.concat([df, df_reversed]).persist()
+    return undirected
+
+
 
 
 
@@ -184,44 +191,36 @@ def load_connectome() -> ddf.DataFrame:
 
 ### Pre-PBFS component preparation functions ------------------------------
 
-def get_component_adjacency_bags(df: ddf.DataFrame, undirected=True) -> db.Bag:
-    """ Return a dask bag of adjacency lists/bags for each component in df.
+def get_components(df: ddf.DataFrame) -> list[ddf.DataFrame]:
+    """ Return a list of component dataframes.
    
-    For each component in the graph represented in df, return the 
-    adjacency list of the component containing each edge and their 
-    weights. This is done by performing iteratively performing parallel BFS to 
-    identify nodes belonging to different components. Only one component can
-    be discovered at a time.
-    
-    Parent-child relationships require a start node, which is outside the
-    scope of this function. See the bfs_search function.
+    For each component in the graph represented in df, return a dataframe 
+    containing data for each edge of that component. This is done by performing
+    iteratively performing parallel BFS to identify nodes belonging to different
+    components. Only one component can be discovered at a time.
 
     """
-    big_adjacency_bag = df_to_adjacency_bag(df, undirected)
-    nodes = np.array(big_adjacency_bag.map(
-        lambda node_adjacency: node_adjacency[0]).compute())
-    state = np.full(len(nodes), "U", "<U1") # nodes indices map to state indices
-    components = [] # Will later be a dask bag of adjacency bags (one per component)
+    undirected_df = undirect_df(df)
+    state = create_state_df(df)
+    components = []
     
-    # Iterate until all nodes are assigned to a component. Must find one
-    # component at a time.
-    for node_index in range(len(nodes)):
-        if state[node_index] == "U":
-            prev_state = state.copy()
-            start_node = nodes[node_index]            
-            
-            pbfs_results = pbfs(start_node, big_adjacency_bag, state, full=False)
-            state, pc_df, cp_df, num_sps_df = pbfs_results
-            del pc_df, cp_df, num_sps_df
-            
-            # Add new component
-            diff_indices = np.where(state != prev_state)[0]
-            component_nodes = nodes[diff_indices]
-            component_adj = big_adjacency_bag.filter(
-                lambda node_adjacency: node_adjacency[0] in component_nodes)
-            components = components + [component_adj.persist()]
-    
-    return db.from_sequence(components)
+    while not (state["state"] == "P").all().compute():
+        
+        # Get nodes present in next component
+        start_node = state[state["state"] == "U"]["state"].min().compute()
+        results = pbfs(start_node, undirected_df, state, full=False)
+        state, pc_df = results[0], results[1]
+        component_nodes = get_all_nodes(pc_df).to_dataframe(meta={"node":int})
+        
+        # Create and append dataframe from component nodes
+        merged1 = component_nodes.merge(df, left_on="node", right_on="pre", 
+                                        how="inner").persist()
+        merged2 = component_nodes.merge(df, left_on="node", right_on="post", 
+                                        how="inner").persist()
+        component_df = ddf.concat([merged1, merged2]).drop_duplicates.persist()
+        components.append(component_df)
+
+    return components
 
 
 def prune(adjacency_bag: db.Bag) -> db.Bag:
@@ -367,13 +366,13 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame, full=T
     level_nodes = ddf.from_dict({"node_id": [start_node]}, npartitions=1).persist()
     pc_df = ddf.from_dict(
         {"parent": pd.Series(dtype=np.int64), "child": pd.Series(dtype=np.int64),
-         "syn_count": pd.Series(dtype=np.float64)}, npartitions=1).persist()
+         "syn_count": pd.Series(dtype=np.int64)}, npartitions=1).persist()
     pc_df = pc_df.set_index("parent", drop=False).persist()
     
     if full:
         cp_df = ddf.from_dict(
             {"child": pd.Series(dtype=np.int64), "parent": pd.Series(dtype=np.int64),
-             "syn_count": pd.Series(dtype=np.float64)}, npartitions=1).persist()    
+             "syn_count": pd.Series(dtype=np.int64)}, npartitions=1).persist()    
         num_sps_df = ddf.from_dict(
             {"depth": [0], "node_id": [start_node], "num_sps": [1]}, 
             npartitions=1).persist()
@@ -639,7 +638,7 @@ def modified_girvan_newman(component: ddf.DataFrame) -> tuple[ddf.DataFrame|None
 def process_raw_df(raw_df: ddf.DataFrame):
     """ Split up raw_df and create futures mapping to modified GN """
     global CLIENT, MIN_CLUSTER_SIZE
-    adj_bags = get_component_adjacency_bags(raw_df)
+    component_dfs_list = get_components(raw_df)
     adj_bags = adj_bags.map(prune)
     adj_bags = adj_bags.filter(
         lambda adj_bag: adj_bag.count().compute() >= MIN_CLUSTER_SIZE)
