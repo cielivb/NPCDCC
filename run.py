@@ -646,7 +646,7 @@ def process_raw_df(raw_df: ddf.DataFrame):
     return new_futures
 
 
-def identify_clusters(connectome_df: ddf.DataFrame) -> list[ddf.DataFrame]:
+def identify_clusters(connectome_df: ddf.DataFrame) -> ddf.DataFrame:
     """ Run modified Girvan Newman repeatedly to identify clusters """
     future_set, cluster_dfs = set(), []
     process_raw_df(connectome_df) # Start processing from the top
@@ -669,13 +669,28 @@ def identify_clusters(connectome_df: ddf.DataFrame) -> list[ddf.DataFrame]:
         # Update future set then snooze
         future_set -= to_delete
         sleep(30)
+    
+    tagged_connectome = tag_edges(cluster_dfs, connectome_df)
+    return tagged_connectome
+
+
+def tag_edges(cluster_dfs: list[ddf.DataFrame], 
+              connectome_df: ddf.DataFrame) -> ddf.DataFrame:
+    """ Return connectome_df sorted by and tagged with cluster IDs. 
+    Cluster IDs are simple integers. Allocate each cluster dataframe in the
+    list a cluster ID, concatenate the cluster dataframes, then left merge
+    connectome_df onto cluster_dfs.
+    """
+    cluster_ids = range(1, len(cluster_dfs)+1)
+    for cluster_df, cluster_id in zip(cluster_dfs, cluster_ids):
+        cluster_df["cluster"] = cluster_id
+        cluster_df = cluster_df.persist()
         
-    return cluster_dfs
-
-
-def tag_edges(cluster_dfs, connectome_df):
-    """ Return connectome_df sorted by and tagged with cluster IDs """
-    raise NotImplementedError # TODO - implement
+    big_cluster_df = ddf.concat(cluster_dfs).persist()
+    
+    tagged = connectome_df.merge(big_cluster_df, on=["pre","post"], 
+                                 how="left").persist()
+    return tagged
 
 
 
@@ -706,9 +721,9 @@ def main():
     """ Run the full statistical analysis pipeline from loading to reporting """
     parse_args()
     connectome_df = load_connectome()
-    clusters = identify_clusters(connectome_df)
-    do_stats(clusters)    
-    make_graphs(clusters)
+    tagged_connectome_df = identify_clusters(connectome_df)
+    do_stats(tagged_connectome_df)
+    make_graphs(tagged_connectome_df)
 
 
 if __name__ == "__main__":

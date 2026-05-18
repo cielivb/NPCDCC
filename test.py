@@ -12,6 +12,9 @@ from pandas.testing import assert_frame_equal
 
 import run
 
+
+### Functions to create test dataframes -----------------------------------
+
 def get_six_node_cycle_dask_df():
     d = {"pre": [0,0,1,5,3,3],
          "post": [1,5,2,4,2,4],
