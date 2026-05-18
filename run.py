@@ -60,10 +60,12 @@ def parse_args():
     P = argparse.ArgumentParser(prog="run_cluster_detector", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     P.add_argument("-f", "--file", required=True, help="Connectome file directory")
-    P.add_argument("-o", "--outdir", required=True, help="Output folder directory")
+    P.add_argument("-o", "--outdir", required=True, help="Output directory")
     P.add_argument("-s", "--minsize", type=int, default=30, help="Minimum cluster size")
     P.add_argument("-k", "--madk", type=float, default=3.5,
                    help="Multiplier (k) for MAD outlier detection")
+    P.add_argument("-r", "--writeraw", action="store_true", 
+                   help="Write raw data tagged with cluster IDs to output directory")
     ARGS = P.parse_args()
 
 
@@ -267,13 +269,10 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
     to process the longest 'chain'.
 
     """
-    print(f"type of df = {type(df)}; df = {df}")
     def get_degree_1_nodes(df):
         node_degrees = df.groupby(df.index)["post"].nunique().to_frame("degree")
-        print(f"node_degrees = {node_degrees}")
         deg1_nodes = node_degrees[
             node_degrees["degree"] == 1].index.to_frame("node")
-        print(f"deg1_nodes = {deg1_nodes}")
         return deg1_nodes
     
     pruned, deg1_nodes = df, get_degree_1_nodes(df)
@@ -674,9 +673,7 @@ def process_raw_df(raw_df: ddf.DataFrame):
     """ Split up raw_df and create futures mapping to modified GN """
     global CLIENT
     component_dfs_list = get_components(raw_df)
-    print(f"component dfs list = \n{component_dfs_list}")
-    print(f"type of df = {type(component_dfs_list[0])}")
-    pruned = [ddf.from_delayed(prune(df)) for df in component_dfs_list]
+    pruned = [prune(df) for df in component_dfs_list]
     new_futures = set()
     for df in pruned:
         new_futures.add(CLIENT.submit(modified_girvan_newman, df))
@@ -689,7 +686,7 @@ def identify_clusters(connectome_df: ddf.DataFrame) -> ddf.DataFrame:
     process_raw_df(connectome_df) # Start processing from the top
     
     # Check for new results in future set and create new futures as required
-    while len(future_list) > 0:
+    while len(future_set) > 0:
         to_delete = set()
         
         # Process finished futures        
@@ -718,11 +715,13 @@ def tag_edges(cluster_dfs: list[ddf.DataFrame],
     list a cluster ID, concatenate the cluster dataframes, then left merge
     connectome_df onto cluster_dfs.
     """
+    if len(cluster_dfs) == 0:
+        return None
     cluster_ids = range(1, len(cluster_dfs)+1)
     for cluster_df, cluster_id in zip(cluster_dfs, cluster_ids):
         cluster_df["cluster"] = cluster_id
         cluster_df = cluster_df.persist()
-        
+    
     big_cluster_df = ddf.concat(cluster_dfs).persist()
     
     tagged = connectome_df.merge(big_cluster_df, on=["pre","post"], 
@@ -754,10 +753,22 @@ def make_graphs(clusters):
 
 ################################### MAIN #######################################
 
+def write_tagged_connectome(connectome: ddf.DataFrame, outdir: str):
+    """ Write tagged connectome to feather file/s """
+    connectome_folder = os.path.join(outdir, "tagged_data")
+    for i, chunk in enumerate(connectome.to_delayed()):
+        chunk_df = chunk.compute() # pandas dataframe
+        filename = os.path.join(connectome_folder, f"tagged_{i}.feather")
+        chunk_df.to_feather(filename)
+
+
 def main():
     """ Run the full statistical analysis pipeline from loading to reporting """
+    global ARGS
     connectome_df = load_connectome()
     tagged_connectome_df = identify_clusters(connectome_df)
+    if ARGS.writeraw:
+        write_tagged_connectome(tagged_connectome_df, ARGS.outdir)
     do_stats(tagged_connectome_df)
     make_graphs(tagged_connectome_df)
 
