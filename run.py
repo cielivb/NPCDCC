@@ -40,6 +40,7 @@ import os
 import pandas as pd
 from dask import bag as db
 from dask import dataframe as ddf
+from dask import delayed
 from dask.distributed import Client
 from time import sleep
 
@@ -137,10 +138,12 @@ def adj_df_to_adj_bag(adj_df: ddf.DataFrame) -> db.Bag:
     return adj_bag
 
 
-def get_all_nodes(df: ddf.DataFrame) -> db.Bag:
+def get_all_nodes(df: ddf.DataFrame, node_cols=["pre","post"]) -> db.Bag:
     """ Return a bag of every unique node in the dataframe """
-    unique_pre = df["pre"].drop_duplicates().to_bag()
-    unique_post = df["post"].drop_duplicates().to_bag()
+    if len(node_cols) != 2:
+        raise Exception("Must use two node columns")
+    unique_pre = df[node_cols[0]].drop_duplicates().to_bag()
+    unique_post = df[node_cols[1]].drop_duplicates().to_bag()
     unique_nodes = db.concat([unique_pre, unique_post])
     return unique_nodes
     
@@ -208,17 +211,18 @@ def get_components(df: ddf.DataFrame) -> list[ddf.DataFrame]:
     while not (state["state"] == "P").all().compute():
         
         # Get nodes present in next component
-        start_node = state[state["state"] == "U"]["state"].min().compute()
+        start_node = state[state["state"] == "U"]["state"].index.min().compute()
         results = pbfs(start_node, undirected_df, state, full=False)
         state, pc_df = results[0], results[1]
-        component_nodes = get_all_nodes(pc_df).to_dataframe(meta={"node":int})
+        component_nodes = get_all_nodes(
+            pc_df, node_cols=["parent","child"]).to_dataframe(meta={"node":int})
         
         # Create and append dataframe from component nodes
-        merged1 = component_nodes.merge(df, left_on="node", right_on="pre", 
+        merged1 = component_nodes.merge(df, left_on="node", right_index=True, 
                                         how="inner").persist()
         merged2 = component_nodes.merge(df, left_on="node", right_on="post", 
                                         how="inner").persist()
-        component_df = ddf.concat([merged1, merged2]).drop_duplicates.persist()
+        component_df = ddf.concat([merged1, merged2]).drop_duplicates().persist()
         components.append(component_df)
 
     return components
@@ -362,12 +366,12 @@ def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame, full=T
     """
     # Set-up PBFS
     depth = 0
-    level_nodes = ddf.from_dict({"node_id": [start_node]}, npartitions=1).persist()
+    level_nodes = ddf.from_dict({"node_id": [start_node]}, 
+                                dtype=int, npartitions=1).persist()
     pc_df = ddf.from_dict(
         {"parent": pd.Series(dtype=np.int64), "child": pd.Series(dtype=np.int64),
          "syn_count": pd.Series(dtype=np.int64)}, npartitions=1).persist()
     pc_df = pc_df.set_index("parent", drop=False).persist()
-    
     if full:
         cp_df = ddf.from_dict(
             {"child": pd.Series(dtype=np.int64), "parent": pd.Series(dtype=np.int64),
