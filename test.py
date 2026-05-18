@@ -34,17 +34,18 @@ def get_twelve_node_dask_df():
     return df
 
 
+
+### Cluster identification tests ------------------------------------------
+
 class TestPBFS(unittest.TestCase):
     """ Test that parallel breadth-first search outputs state, parent-child,
     child-parent, and num-shortest-paths dataframes correctly """
-    
     
     def setUp(self):
         run.CLIENT = Client()
         
     def tearDown(self):
         run.CLIENT.close()
-    
     
     def get_expected_pc_df(self):
         d = {"parent": [29,29,29,29,20,28,31,31,31,31,31,21,23],
@@ -70,7 +71,6 @@ class TestPBFS(unittest.TestCase):
         df = pd.DataFrame(data=d).sort_values(by=["node_id"]).reset_index(drop=True)
         return df        
     
-    
     def test_case_1(self):
         """ 1-component test with 4 levels """
         df = get_twelve_node_dask_df()
@@ -90,7 +90,6 @@ class TestPBFS(unittest.TestCase):
         assert_frame_equal(pc_df, self.get_expected_pc_df())
         assert_frame_equal(cp_df, self.get_expected_cp_df())
         assert_frame_equal(num_sps, self.get_expected_num_sps_df())
-        
         
     def test_case_2(self):
         """ 2-component test - only 1 component should be processed """
@@ -155,3 +154,20 @@ class TestPBFSBackTrack(unittest.TestCase):
                 self.assertTrue(isclose(row["score"], 
                                         expected.loc[i]["score"],
                                         abs_tol=1e-05))
+                
+                
+
+class TestIdentifyClusters(unittest.TestCase):
+    
+    def setUp(self):
+        run.CLIENT = Client()
+    
+    def tearDown(self):
+        run.CLIENT.close()
+        
+    def test_case_tiny(self):
+        """ Test that no errors are thrown with tiny fake connectome """
+        df = get_twelve_node_dask_df()
+        tagged = run.identify_clusters(df).compute()
+        print(tagged)
+        self.assertTrue(len(tagged["cluster"]) == 12)
