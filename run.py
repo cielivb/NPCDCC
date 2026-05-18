@@ -33,41 +33,77 @@ TODO
 
 """
 
+import argparse
 import dask
 import numpy as np
 import os
-import random
-from collections import Counter
-from collections import defaultdict
+import pandas as pd
 from dask import bag as db
 from dask import dataframe as ddf
+from dask import delayed
 from dask.distributed import Client
+from time import sleep
 
-CLIENT = None # Assigned properly at bottom of script
-MIN_CLUSTER_SIZE = 30
-MAD_K = 3.5
-
-ROOT_DIR = os.path.dirname(__file__)
-
+ARGS = None # Updated in parse_args()
+CLIENT = None # Assigned at bottom of script
+dask.config.set({"dataframe.shuffle.method": "tasks"})
 
 
-### CLUSTER IDENTIFICATION - HELPER FUNCTIONS -----------------------------
+
+
+
+################################## LOAD ########################################
+
+def parse_args():
+    """ Read in and store user-supplied arguments """
+    global ARGS
+    P = argparse.ArgumentParser(prog="run_cluster_detector", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    P.add_argument("-f", "--file", required=True, help="Connectome file directory")
+    P.add_argument("-o", "--outdir", required=True, help="Output directory")
+    P.add_argument("-s", "--minsize", type=int, default=30, help="Minimum cluster size")
+    P.add_argument("-k", "--madk", type=float, default=3.5,
+                   help="Multiplier (k) for MAD outlier detection")
+    P.add_argument("-r", "--writeraw", action="store_true", 
+                   help="Write raw data tagged with cluster IDs to output directory")
+    ARGS = P.parse_args()
+
+
+def load_connectome() -> ddf.DataFrame:
+    """ Parse connectome feather file into dask dataframe """
+    global ARGS
+    
+    @delayed
+    def read_feather(path):
+        return pd.read_feather(path, use_threads=True)
+    
+    raw = ddf.from_delayed(read_feather(ARGS.file))
+    
+    # Remove any edges to self - they are not needed for this analysis and I
+    # have not danger-proofed the pipeline from them
+    edges_to_remove = raw[raw["pre"] == raw["post"]]
+    merged = raw.merge(edges_to_remove, on=["pre","post"], how="left", indicator=True)
+    connectome = merged[merged["_merge"] == "left_only"].persist()
+    
+    return connectome
+
+
+
+
+
+
+
+######################## GENERIC HELPER FUNCTIONS ##############################
 
 def df_to_adjacency_bag(df, undirect=True):
-    """ Convert dataframe edges into adjacency list/bag of edges with weights.
+    """ Convert dataframe into adjacency list/bag of edges with synapse counts.
     
     Return an adjacency list for the dataframe as a dask bag of the form
         db.from_sequence([(a, [(b, 3)]), (b: [(a, 3)])])
     if undirected, otherwise
         db.from_sequence([(a, []), (b, [(a, 3)])])
-    where the edge from b->a (or b->a and a->b in the undirected version) has
-    weight 3.
-    
-    Weight represents the number of synpases between two neurons a and b.
-    
-    For the DATA301 project, only the undirected version is required, but I
-    have included the option for directed should I choose to extend the 
-    project (I have not tested with the directed version).
+    where the edge/neuronal connection from b->a (or b->a and a->b in the 
+    undirected version) involves 3 synapses.
     
     """
     if undirect: # Add (b,a,w) for every (a,b,w)
@@ -95,343 +131,137 @@ def df_to_adjacency_bag(df, undirect=True):
     return adjacency_bag.persist()
 
 
-def get_main_nodes(adjacency_bag):
-    """ Return bag of all main/pre nodes in bag """
-    main_nodes = adjacency_bag.map(lambda node_adj: node_adj[0])
-    return main_nodes
-
-
-def get_neighbour_nodes(adjacency_bag):
-    """ Return bag of all nodes in a list in bag """
-    nnodes = adjacency_bag.map(
-        lambda node_adj: node_adj[1]).flatten().map(lambda tup: tup[0]).distinct()
-    return nnodes
-
-
-def get_all_nodes(adjacency_bag):
-    """ Return bag of all nodes in graph represented by bag """
-    main_nodes = get_main_nodes(adjacency_bag)
-    nnodes = get_neighbour_nodes(adjacency_bag)
-    nodes = db.concat([main_nodes, nnodes])
-    return nodes
-
-
-def get_num_nodes(adjacency_bag):
-    """ Return the number of nodes in the graph represented by bag """
-    return get_all_nodes(adjacency_bag).count().compute()
-
-
-def log_removed_edges(removed_edges):
-    """ Log removed edges in a temp file. These edges can be analysed to address
-    the research question in a similar manner as the clusters. """
-    pass # TODO
-
-
-
-
-### PARALLEL BFS ----------------------------------------------------------
-
-class Layer():
-    """ Represents a layer d of nodes at depth d of parallel BFS """
+def adj_bag_to_adj_df(adj_bag: db.Bag) -> ddf.DataFrame:
+    """ Convert an adjacency bag to an adjacency dataframe. 
     
-    def __init__(self):
-        self.nodes = db.from_sequence([])
-    
-    
-    def insert(self, node_bag: db.Bag):
-        self.nodes = node_bag.persist() # bag of int nodes in layer e.g., bag([1,2,...])
-    
-    
-    def is_empty(self):
-        return self.nodes.count().compute() == 0
-
-    
-    def update_leaves(self, adjacencies, leaves, state, node_to_i):
-        """ Add leaf nodes in adjacencies to leaves bag. 
-        Leaf nodes are those with no children, i.e., none of their neighbours
-        are undiscovered.
-        """
-        # TODO - this func is a slight bottleneck - fix it if time allows        
-        no_weights = adjacencies.map(
-            lambda node_adjacency: (node_adjacency[0], 
-                                    list(map(lambda tup: tup[0], node_adjacency[1]))))
-        neighbour_states = no_weights.map(
-            lambda node_adjacency: (node_adjacency[0],
-                                    list(map(
-                                        lambda nnode: state[node_to_i[nnode]],
-                                        node_adjacency[1])))).persist()
-        del no_weights
-        leaf_nodes = neighbour_states.filter(
-            lambda tup: Counter(tup[1])["P"] == len(tup[1])).map(
-                lambda tup: tup[0]).persist()
-        del neighbour_states
-        leaves = db.concat([leaves, leaf_nodes]).persist()  
-        del leaf_nodes
-        return leaves
-
-    
-    def get_child_parent_rels(self, adjacency_bag, adjacencies, state, node_to_i, all_children, all_child_parent_rels):
-        """ Record parentage for each child 
-        The child node's parents are those nodes in the child's adjacencies
-        where the states of those nodes are 'P'."""
-        # TODO - this func is a slight bottleneck - fix it if time allows
-        child_ids = all_children.compute()
-        child_adjacencies = adjacency_bag.filter(
-            lambda node_adjacency: node_adjacency[0] in child_ids).persist()
-        del child_ids
-        parent_ids = adjacencies.map(
-            lambda node_adjacency: node_adjacency[0]).filter(
-                lambda node_id: state[node_to_i[node_id]] == "P").compute()
-        child_parent_rels = child_adjacencies.map(
-            lambda node_adjacency: (
-                node_adjacency[0], 
-                list(filter(lambda tup: tup[0] in parent_ids, node_adjacency[1]))
-            )).persist()
-        del parent_ids, child_adjacencies
-        all_child_parent_rels = db.concat([all_child_parent_rels, 
-                                           child_parent_rels])
-        del child_parent_rels
-        return all_child_parent_rels
-
-
-    def update_num_shortest_paths(self, all_children, all_child_to_parent_rels, num_shortest_paths):
-        """ Compute number of shortest paths to each child.
-        Returns Bag of form ([(node1, num_paths), (node2, num_paths), ...])
-        """
-        # Create quick look-up shortest paths dict. Gives number of shortest
-        # paths to each parent.
-        parent_nodes = get_neighbour_nodes(all_child_to_parent_rels).compute()
-        num_sp_to_parents = num_shortest_paths.filter(
-            lambda sp_data: sp_data[0] in parent_nodes)
-        num_sp = dict(num_sp_to_parents.compute())
-        del parent_nodes, num_sp_to_parents
-        
-        # Create quick look-up child-to-parents dict
-        children = all_children.compute()
-        get_parents = dict(all_child_to_parent_rels.filter(
-            lambda child_adj: child_adj[0] in children).compute())
-        del children
-        
-        def num_paths(child_node):
-            """ Sum the total number of paths from child to parents """            
-            total = 0
-            for parent_node, num_synapses in get_parents[child_node]:
-                total += num_sp[parent_node] * num_synapses
-            return total
-        
-        # Compute number of shortest paths to each child
-        new_num_shortest_paths = all_children.map(
-            lambda child_node: (child_node, num_paths(child_node))).persist()
-        # Update num_shortest_paths
-        num_shortest_paths = db.concat([num_shortest_paths, 
-                                        new_num_shortest_paths])
-        del new_num_shortest_paths
-        return num_shortest_paths
-        
-    
-    def process(self, adjacency_bag, state, node_to_i, all_child_parent_rels, 
-                leaves, num_shortest_paths):
-        """ Check all neighbours of self.nodes for those that should be added
-        to the next layer out_layer. Updates state, all_child_parent_rels, and
-        leaves as required. Returns out_layer. 
-        
-        adjacency_bag is of the form:
-            Bag([(a, [(b, 3)]), (b: [(a, 3), (c, 2)], ...]))
-        where the edge from b->a and a->b has weight 3 (i.e., 3 synapses).
-        """
-        print("Setting up layer processing ...")
-        # Set-up layer processing
-        out_layer = Layer()
-        layer_nodes = self.nodes.compute()
-        adjacencies = adjacency_bag.filter( # Get adjacencies for this layer's nodes
-            lambda node_adjacency: node_adjacency[0] in layer_nodes).persist()
-        del layer_nodes
-        print("Set up layer processing")
-        
-        print("Marking this layer's nodes as processed ...")
-        # Mark this layer's nodes as processed. The child-parent rel and leaf
-        # computation sections rely on parents being marked as P.
-        processed_is = adjacencies.map( # Get this layer's node's indices
-            lambda node_adjacency: node_to_i[node_adjacency[0]]).compute()
-        state[processed_is] = "P"
-        del processed_is
-        print("Marked as processed")
-        
-        print("Getting leaf nodes ...")
-        # Get leaf nodes (those with no child nodes)
-        leaves = self.update_leaves(adjacencies, leaves, state, node_to_i)
-        print("Leaf nodes retrieved")
-
-        print("Getting children nodes ...")
-        # Get the children nodes of this layer
-        all_children = adjacencies.map(
-            lambda tup: tup[1]).flatten().map(
-                lambda tup: tup[0]).distinct().filter(
-                    lambda node_id: state[node_to_i[node_id]] != "P").persist()
-        print("Children nodes retrieved")
-        
-        # Discover child nodes and compute child-parent relationships
-        if all_children.count().compute() > 0:
-            print("Inserting children into next layer ...")
-            out_layer.insert(all_children)
-            print("Children inserted into next layer")
-            print("Marking children as discovered ...")
-            undiscovered_is = all_children.map(
-                lambda child_id: node_to_i[child_id]).compute()
-            state[undiscovered_is] = "D"
-            del undiscovered_is
-            print("Children marked as discovered")
-            print("Getting child-parent relationships ...")
-            all_child_parent_rels = self.get_child_parent_rels(
-                adjacency_bag, adjacencies, state, node_to_i, all_children, all_child_parent_rels).persist()
-            print("Relationships retrieved")
-            print("Getting new shortest paths ...")
-            num_shortest_paths = self.update_num_shortest_paths(
-                all_children, all_child_parent_rels, num_shortest_paths).persist()
-            print("Shortest paths retrieved")
-        
-        print("Returning PBFS data ...")
-        return (out_layer, leaves, all_child_parent_rels, num_shortest_paths)
-        
-
-
-def pbfs(start_node: int, adjacency_bag: db.Bag, state=None, nodes=None):
-    """ Returns child_parent_rels bag, state array, leaves bag, and 
-    num_shortest_paths bag.
-    
-    The numpy arrays nodes and state will be automatically computed from the
-    adjacency bag if not supplied. state is not required to complete the bfs
-    search, however, the caller (e.g., get_component_adjacency_bags()) may 
-    wish to validate the status of each node after the search is complete.
-    
-    adjacency_bag has the general form
-        db.from_sequence([(c, [(a, w), (b, w)]), (d, [(c, w)])])
-    where a and b are parents of c, c is the only parent of d, and w is the
-    edge weight or number of synapses along that edge.
-
-    The bag of leaves contains nodes that do not have any children.
-    
-    The num_shortest_paths bag is of the general form
-        db.from_sequence([(node1, num_paths), (node2, num_paths), ...])
-    where num_paths is the number of shortest paths from start_node to node1 etc
-    
-    The original PBFS inspiration comes from the logic behind 'Bags' and 'Pennants'
-    described at https://dl.acm.org/doi/epdf/10.1145/1810479.1810534. This is
-    a simplified daskified implementation of their PBFS. What they term a 'bag'
-    is here a 'Layer', which represents all the nodes at some leve/depth d in the 
-    BFS tree.
+    An adjacency dataframe differs from the original dataframe in that it has
+    two columns - one for node ID, and the other for neighbours of that node.
     
     """
-    # Create nodes and state arrays if not supplied
-    supplied_nodes = nodes
-    if not type(nodes) is np.ndarray:
-        nodes = np.array(adjacency_bag.map(
-            lambda node_adjacency: node_adjacency[0]).compute())
-    if not type(state) is np.ndarray:
-        state = np.full(len(nodes), "U", dtype="<U1")
-    
-    # Create look-up dict node_to_i and initialise state array.
-    # node_to_i has key = node, value = corresponding index in state array.
-    node_to_i = {node: i for i, node in enumerate(nodes)} 
-    start_node_index = node_to_i[start_node]
-    state[start_node_index] = "D"
-    
-    # The nodes array is no longer required for this function. If nodes was not
-    # originally supplied, delete the nodes array. Don't delete the nodes 
-    # array if it was supplied to avoid interfering with other functions.
-    if not type(supplied_nodes) is np.ndarray:
-        del nodes, supplied_nodes
-    
-    # Create empty leaves and all_child_parent_rels bags
-    leaves = db.from_sequence([])
-    all_child_parent_rels = db.from_sequence([(start_node, [])])
-    
-    # Initialise num_shortest_paths bag
-    num_shortest_paths = db.from_sequence([(start_node, 1)])
-    
-    # Initialise current layer (depth/level = 0)
-    current_layer = Layer()
-    current_layer.insert(db.from_sequence([start_node]))
-
-    # Process each layer until max tree depth reached
-    while not current_layer.is_empty():
-        next_layer, leaves, all_child_parent_rels, num_shortest_paths = current_layer.process(
-            adjacency_bag, state, node_to_i, all_child_parent_rels, leaves, num_shortest_paths)
-        current_layer = next_layer
-
-    return (all_child_parent_rels, state, leaves, num_shortest_paths)
+    adj_df = adj_bag.to_dataframe(
+        meta = {"node_id": int, "neighbours": object}).persist()
+    return adj_df
 
 
-def get_component_adjacency_bags(df: ddf.DataFrame, undirected=True):
-    """ Return a dask bag of adjacency lists/bags for each component in df.
+def adj_bag_to_df(adj_bag: db.Bag) -> ddf.DataFrame:
+    """ Convert an adjacency bag to an edge dataframe. 
+    
+    The returned dataframe will have three columns: pre, post, syn_count.
+    
+    adj_bag has the form [(pre, [(post1, syn_count), (post2, syn_count)], ...)]
+    
+    """
+    # Expand adj_bag to bag of tuples (pre, post, syn_count)
+    def expand(adj_tup):
+        pre, post_list = adj_tup[0], adj_tup[1]
+        expanded = list(map(lambda tup: (pre, tup[0], tup[1]), post_list))
+        return expanded
+    tuple_bag = adj_bag.map(expand).flatten()
+    
+    # Convert tuple_bag to dataframe
+    df = tuple_bag.to_dataframe(
+        meta = {"pre": int, "post": int, "syn_count": int}).persist()
+    df = df.set_index("pre", drop=False, sort=True)
+    return df
+
+
+def adj_df_to_adj_bag(adj_df: ddf.DataFrame) -> db.Bag:
+    """ Convert an adjacency dataframe to an adjacency bag.
+    
+    An adjacency dataframe differs from the original dataframe in that it has
+    two columns - one for node ID, and the other for neighbours of that node.
+
+    """
+    adj_bag = adj_df.to_bag().map(lambda tup: (tup[0], tup[1])).persist()
+    return adj_bag
+
+
+def get_all_nodes(df: ddf.DataFrame, node_cols=["pre","post"]) -> db.Bag:
+    """ Return a bag of every unique node in the dataframe """
+    if len(node_cols) != 2:
+        raise Exception("Must use two node columns")
+    unique_pre = df[node_cols[0]].drop_duplicates().to_bag()
+    unique_post = df[node_cols[1]].drop_duplicates().to_bag()
+    unique_nodes = db.concat([unique_pre, unique_post])
+    return unique_nodes
+    
+    
+def get_num_nodes(df: ddf.DataFrame) -> int:
+    """ Compute the number of unique nodes present in a dataframe """
+    return get_all_nodes.count().compute()
+
+
+def create_state_df(component: ddf.DataFrame) -> ddf.DataFrame:
+    """ The state dataframe uses node ids as indexes to track state in PBFS """
+    nodes = get_all_nodes(component)
+    state = nodes.to_dataframe(meta = {"node_id": int}).drop_duplicates()
+    state["state"] = "U"
+    state = state.set_index("node_id", sort=True)
+    return state
+
+
+def undirect_df(df: ddf.DataFrame) -> ddf.DataFrame:
+    """ Add b->a for every a->b in df, and remove duplicates """
+    df_reversed = df.rename(columns={"pre":"post", "post":"pre"}).persist()
+    undirected = ddf.concat([df, df_reversed]).drop_duplicates().persist()
+    undirected = undirected.set_index("pre", drop=False, sort=True)
+    return undirected
+
+
+
+
+
+
+
+
+
+
+############################ IDENTIFY CLUSTERS #################################
+
+
+### Pre-PBFS component preparation functions ------------------------------
+
+def get_components(df: ddf.DataFrame) -> list[ddf.DataFrame]:
+    """ Return a list of component dataframes.
    
-    For each component in the graph represented in df, return the 
-    adjacency list of the component containing each edge and their 
-    weights. This is done by performing iteratively performing parallel BFS to 
-    identify nodes belonging to different components. Only one component can
-    be discovered at a time.
-    
-    Parent-child relationships require a start node, which is outside the
-    scope of this function. See the bfs_search function.
+    For each component in the graph represented in df, return a dataframe 
+    containing data for each edge of that component. This is done by performing
+    iteratively performing parallel BFS to identify nodes belonging to different
+    components. Only one component can be discovered at a time.
 
     """
-    big_adjacency_bag = df_to_adjacency_bag(df, undirected)
-    nodes = np.array(big_adjacency_bag.map(
-        lambda node_adjacency: node_adjacency[0]).compute())
-    state = np.full(len(nodes), "U", "<U1") # nodes indices map to state indices
-    components = [] # Will later be a dask bag of adjacency bags (one per component)
+    undirected_df = undirect_df(df)
+    state = create_state_df(df)
+    components = []
     
-    # Iterate until all nodes are assigned to a component. Must find one
-    # component at a time.
-    for node_index in range(len(nodes)):
-        if state[node_index] == "U":
-            prev_state = state.copy()
-            start_node = nodes[node_index]            
-            
-            all_child_parent_rels, state, leaves = pbfs(start_node, 
-                                                        big_adjacency_bag,
-                                                        state, nodes)
-            del all_child_parent_rels, leaves
-            
-            # Add new component
-            diff_indices = np.where(state != prev_state)[0]
-            component_nodes = nodes[diff_indices]
-            component_adj = big_adjacency_bag.filter(
-                lambda node_adjacency: node_adjacency[0] in component_nodes)
-            components = components + [component_adj.persist()]
-    
-    return db.from_sequence(components)
+    while not (state["state"] == "P").all().compute():
+        
+        # Get nodes present in next component
+        start_node = state[state["state"] == "U"]["state"].index.min().compute()
+        results = pbfs(start_node, undirected_df, state, full=False)
+        state, pc_df = results[0], results[1]
+        component_nodes = get_all_nodes(
+            pc_df, node_cols=["parent","child"]).to_dataframe(meta={"node":int})
+        
+        # Create and append dataframe from component nodes
+        merged1 = component_nodes.merge(df, left_on="node", right_index=True, 
+                                        how="inner").persist()
+        merged2 = component_nodes.merge(df, left_on="node", right_on="post", 
+                                        how="inner").persist()
+        component_df = ddf.concat([merged1, merged2]).drop_duplicates().persist()
+        components.append(component_df)
+
+    return components
 
 
-
-
-### CLUSTER IDENTIFICATION - PRUNE ----------------------------------------
-
-def cut_deg1_edge(node_adj, should_cut: bool):
-    """ Change node adjacency list to empty list if should cut. 
-    This effectively makes the node a degree 0 node. """
-    if should_cut:
-        node_adj = (node_adj[0], [])
-    return node_adj
-
-
-def remove_deg_1_nodes(node_adj, deg1_nodes):
-    """ Remove edges from node to nodes in degree 1 nodes """
-    neighbours = list(filter(
-        lambda tup: tup[0] not in deg1_nodes, node_adj[1]))
-    return (node_adj[0], neighbours)
-
-
-def prune(adjacency_bag: db.Bag) -> db.Bag:
-    """ Iteratively remove degree 1 edges from a dask dataframe 
+@delayed
+def prune(df: ddf.DataFrame) -> ddf.DataFrame:
+    """ Iteratively remove degree 1 edges from a component dataframe 
     
     A degree 1 edge is defined here as an edge associated with at least one
     degree 1 node, where a degree 1 node is a node connected by any number of 
     edges to one and only one other node. No nodes in the dataset will have 
     edges to themselves. Synapse count and directionality are not considered.
-    
-    Adjacency bag format:
-            db.from_sequence([(a, [(b, 3)]), (b: [(a, 3)])])
             
     The naive approach would be to take away one edge at a time. This parallel
     version improves performance by finding all degree 1 edges initially, and
@@ -439,206 +269,510 @@ def prune(adjacency_bag: db.Bag) -> db.Bag:
     to process the longest 'chain'.
 
     """
-    deg1_nodes = adjacency_bag.filter(
-        lambda node_adj: len(node_adj[1]) == 1).map(
-            lambda node_adj: node_adj[0]).compute()
+    def get_degree_1_nodes(df):
+        node_degrees = df.groupby(df.index)["post"].nunique().to_frame("degree")
+        deg1_nodes = node_degrees[
+            node_degrees["degree"] == 1].index.to_frame("node")
+        return deg1_nodes
     
+    pruned, deg1_nodes = df, get_degree_1_nodes(df)
+    while deg1_nodes.count().compute() > 0:
+        # Get edges where any involved node is in deg1_nodes
+        merged1 = pruned.merge(deg1_nodes, left_index=True, 
+                               right_on="node", how="inner").persist()
+        merged2 = pruned.merge(deg1_nodes, left_on="post", 
+                               right_on="node", how="inner").persist()
+        to_prune = ddf.concat([merged1, merged2]).persist()
+        
+        # Remove edges and recompute degree 1 nodes
+        merged = pruned.merge(to_prune, on=["pre","post"], how="left", indicator=True)
+        pruned = merged[merged["_merge"] == "left_only"].persist()
+        deg1_nodes = get_degree_1_nodes(pruned).persist()
+        
+    return pruned
+
+
+
+
+
+### Calculating edge scores functions (includes PBFS & backtracking) ------
+    
+def update_state_df(state: ddf.DataFrame, nodes_to_update: ddf.DataFrame, 
+                       new_status: str) -> ddf.DataFrame:
+    """ Update states of nodes_to_update in state dataframe to either D or P """
+    merged = state.merge(nodes_to_update, left_index=True, right_on="node_id", 
+                         how="left", indicator=True)
+    merged["update"] = merged["_merge"] == "both"
+    merged = merged.set_index("node_id", drop=False)    
+    state["state"] = state["state"].mask(merged["update"], new_status)
+    state = state.persist()
+    return state
+
+
+def get_component_subset(level_nodes: ddf.DataFrame, 
+                         component: ddf.DataFrame) -> ddf.DataFrame:
+    """ Get all edges from component involving any node in level_nodes """
+    # Select columns in component pre that match level_nodes node_id. 
+    subset_full = level_nodes.merge(component, left_on="node_id", 
+                                    right_index=True, how="inner")
+    subset = subset_full[["pre", "post", "syn_count"]]
+    subset = subset.set_index("pre", drop=False)
+    subset = subset.persist()
+    return subset
+
+
+def update_pc_cp_dfs(level_nodes: ddf.DataFrame, comp_subset: ddf.DataFrame, 
+                     pc_df: ddf.DataFrame, cp_df: ddf.DataFrame,
+                     state: ddf.DataFrame, full: bool) -> tuple[ddf.DataFrame]:
+    """ Update parent-child and child-parent relationships with this levels data """
+    edges = level_nodes.merge(comp_subset, left_on="node_id", 
+                              right_index=True, how="inner")
+    
+    # Get neighbour states
+    edges = edges.merge(state, left_on="post", right_index=True, how="inner")
+    
+    # Add entries to new_pc_df for every parent-child relationship where
+    # node_id is the parent (neighbour/child state is U)
+    new_pc_df = edges[edges["state"] == "U"][["pre", "post", "syn_count"]]
+    new_pc_df = new_pc_df.rename(columns={"pre": "parent", "post": "child"}).persist()
+    pc_df = ddf.concat([pc_df, new_pc_df]).persist()
+    
+    if full:
+        # Add entries to new_cp_rels for every child-parent relationship where
+        # node_id is the child (neighbour/parent state is P)
+        new_cp_df = edges[edges["state"] == "P"][["pre", "post", "syn_count"]]
+        new_cp_df = new_cp_df.rename(columns={"pre": "child", "post": "parent"}).persist()
+        cp_df = ddf.concat([cp_df, new_cp_df]).persist()
+        
+    return (pc_df, cp_df)
+
+
+def update_num_sps_df(level_nodes: ddf.DataFrame, depth: int, cp_df: ddf.DataFrame, 
+                      num_sps_df: ddf.DataFrame) -> ddf.DataFrame:
+    """ Update num_sps_df with the number of shortest paths to each node in level_nodes. 
+    num_sps_df has the columns : depth, node_id, num_sps
+    """
+    if depth == 0: # Root node - prefilled at start of PBFS
+        return num_sps_df
+    # Parent num sps will always be at depth one level above this level. Subset
+    # to the parent level to speed up scan (avoids scanning all levels).
+    all_parent_num_sps = num_sps_df[num_sps_df["depth"] == depth-1].persist()
+    
+    # Get number of shortest paths to each node on this level
+    cp_rels = level_nodes.merge(cp_df, left_on="node_id", 
+                                right_index=True, how="inner")
+    new_num_sps = cp_rels.merge(all_parent_num_sps, left_on="parent", 
+                                right_on="node_id", how="inner")
+    new_num_sps["child_num_sps"] = new_num_sps["num_sps"] * new_num_sps["syn_count"]    
+    new_num_sps = new_num_sps[["node_id_x", "child_num_sps"]]
+    new_num_sps = new_num_sps.rename(
+        columns={"node_id_x": "node_id", "child_num_sps": "num_sps"})
+    new_num_sps = new_num_sps.groupby("node_id")["num_sps"].sum().reset_index()
+    new_num_sps["depth"] = depth
+    new_num_sps = new_num_sps.persist()
+    
+    # Update and return original number of shortest paths dataframe
+    num_sps_df = ddf.concat([num_sps_df, new_num_sps]).persist()
+    return num_sps_df
+
+
+def get_children(level_nodes: ddf.DataFrame, pc_df: ddf.DataFrame) -> ddf.DataFrame:
+    """ Get the children node ids of all nodes in level_nodes """
+    merged = level_nodes.merge(pc_df, left_on="node_id", right_index=True, how="inner")
+    children = merged["child"].drop_duplicates().to_frame(name="node_id").persist()
+    return children
+
+
+def pbfs(start_node: int, component: ddf.DataFrame, state: ddf.DataFrame, full=True):
+    """ Run a parallel breadth-first-search on component. 
+    
+    Return state dataframe, pc_df (parent-child dataframe), cp_df (child-parent
+    dataframe) and num_sps_df (number of shortest paths dataframe).
+    
+    The parallel component of this BFS involves processing an entire level/
+    frontier at a time, rather than naively iterating over every node for
+    every level.
+
+    """
+    # Set-up PBFS
+    depth = 0
+    level_nodes = ddf.from_dict({"node_id": [start_node]}, 
+                                dtype=int, npartitions=1).persist()
+    pc_df = ddf.from_dict(
+        {"parent": pd.Series(dtype=np.int64), "child": pd.Series(dtype=np.int64),
+         "syn_count": pd.Series(dtype=np.int64)}, npartitions=1).persist()
+    pc_df = pc_df.set_index("parent", drop=False).persist()
+    if full:
+        cp_df = ddf.from_dict(
+            {"child": pd.Series(dtype=np.int64), "parent": pd.Series(dtype=np.int64),
+             "syn_count": pd.Series(dtype=np.int64)}, npartitions=1).persist()    
+        num_sps_df = ddf.from_dict(
+            {"depth": [0], "node_id": [start_node], "num_sps": [1]}, 
+            npartitions=1).persist()
+        cp_df = cp_df.set_index("child", drop=False).persist()
+        num_sps_df = num_sps_df.set_index("depth", drop=False).persist()
+    else:
+        cp_df, num_sps_df = None, None
+
+    # Run PBFS
     while True:
-        if len(deg1_nodes) == 0:
+        # Update child-parent and parent-children relationship dataframes
+        state = update_state_df(state, level_nodes, "D")
+        comp_subset = get_component_subset(level_nodes, component)
+        pc_df, cp_df = update_pc_cp_dfs(level_nodes, comp_subset, pc_df, cp_df, state, full)
+        
+        # Repartition and reindex pc_df and cp_df. Do it here because will be
+        # reused in the next frontier, and I want fast lookups in the next
+        # frontier as well!
+        pc_df = pc_df.set_index("parent", drop=False).persist()
+        if full:
+            cp_df = cp_df.set_index("child", drop=False).persist()
+        
+        # Update number of shortest paths dataframe
+        if full:
+            num_sps_df = update_num_sps_df(level_nodes, depth, cp_df, num_sps_df)
+        update_state_df(state, level_nodes, "P")
+        
+        # Increase depth and change current nodes to child nodes
+        children = get_children(level_nodes, pc_df)        
+        level_nodes = children
+        if level_nodes.shape[0].compute() == 0:
             break
-        
-        # Remove edge from deg1 node to neighbour
-        adjacency_bag = adjacency_bag.map(
-            lambda node_adj: cut_deg1_edge(node_adj, node_adj[0] in deg1_nodes)).filter(
-                lambda node_adj: len(node_adj[1]) > 0).persist()
-        
-        # Remove edge from neighbours to deg1 nodes
-        adjacency_bag = adjacency_bag.map(
-            lambda node_adj: remove_deg_1_nodes(node_adj, deg1_nodes)).persist()
+        depth += 1
+
+    return (state, pc_df, cp_df, num_sps_df)
+
+
+def assign_node_credits(depth: int, level_num_sps: ddf.DataFrame, 
+                        edge_scores_df: ddf.DataFrame) -> ddf.DataFrame:
+    """ Apply Rules 1 & 2 of MMDS Ch10 pp. 365.
+    Each node gets a credit equal to 1 plus the sum of the scores of the 
+    DAG edges from that node to the level below. Lead nodes thus get credit
+    of 1. Return a df with columns node_id, credit."""    
+    # Get edge scores relevant only to this level's nodes
+    edge_scores = edge_scores_df.loc[depth+1]
     
-    return adjacency_bag
-
-
-
-
-
-### CLUSTER IDENTIFICATION - GIRVAN NEWMAN --------------------------------
-
-
-def calculate_edge_scores(start_node, child_parent_rels, num_shortest_paths, 
-                          leaves, component):
-    """ Return Bag of tuples Bag([((pre, post), edge_score), ...])
-    Edge scoring rules are detailed on page 365 of MMDS Chapter 10 
+    # Get parent-child relationships where this level's nodes are the parents
+    pc_rels = level_num_sps.merge(edge_scores, left_on="node_id", 
+                                  right_on="parent", how="inner")
+    # Get child contributions to parent (this level's) node credits
+    child_contribs = pc_rels.groupby("node_id")["score"].sum().to_frame() # index=node_id
     
-    The num_shortest_paths bag is of the general form
-        db.from_sequence([(node1, num_paths), (node2, num_paths), ...])
-    where num_paths is the number of shortest paths from start_node to node1 etc
-    
+    # Assign node credit
+    node_credits = level_num_sps.merge(child_contribs, left_on="node_id", 
+                                        right_index=True, how="left")
+    node_credits["score"] = node_credits["score"].fillna(0)
+    node_credits["credit"] = 1 + node_credits["score"]
+    node_credits = node_credits[["node_id", "credit"]]
+    return node_credits
+
+
+def assign_edge_scores(depth: int, node_credits: ddf.DataFrame, 
+                       cp_df: ddf.DataFrame, 
+                       parent_num_sps: ddf.DataFrame) -> ddf.DataFrame:
+    """ Apply Rule 3 of MMDS Ch10 pp. 365.
+    'A DAG edge e entering node Z from the level above is given a share of the
+    credit of Z proportional to the fraction of shortest paths from the root to
+    Z that go through e'
+    Return a dataframe with columns depth, parent, child, score.
     """
-    num_sp = dict(num_shortest_paths.compute()) # Quick look-up
-    to_score = leaves
-    edge_scores = db.from_sequence([])
-    all_child_parent_rels = dict(child_parent_rels.compute())
+    # Get child-parent relationships where this level's nodes are the children
+    cp_rels = node_credits.merge(cp_df, left_on="node_id", 
+                                 right_index=True, how="inner")
     
-    def credit(node):
-        """ Rule 1: leaves get credit = 1. Rule 2: other nodes get credit = 1 + 
-        sum of credits of the DAG edges from that node to its children """
-        credit = 1 + edge_scores.filter(
-            lambda entry: entry[0][0] == node).map(
-                lambda entry: entry[1]).sum().compute()
-        return (node, credit)
+    # Get number of shortest paths for each parent on this level
+    sps = cp_rels.merge(parent_num_sps, left_on="parent", 
+                        right_on="node_id", how="inner")
+    sps = sps[["node_id_x", "credit", "parent", "num_sps", "syn_count"]]
+    sps = sps.rename(columns={"node_id_x":"node_id"})
     
-    def process_nodes(node_w_credit):
-        """ Rule 3: A DAG edge e entering node Z from the level above is given a
-        share of the credit of Z proportional to the fraction of shortest
-        paths from the root to Z that go through e.
-        """
-        node, credit = node_w_credit
-        parents = db.from_sequence(all_child_parent_rels[node])
-        total_num_shortest_paths_to_parents = parents.map(
-            lambda parent: num_shortest_paths[parent[0]])
-        node_edge_scores = parents.map(
-            lambda parent: ((parent[0], node), 
-                            credit * num_shortest_paths[parent[0]] / 
-                            total_num_shortest_paths_to_parents))
-        return node_edge_scores
-        
-    while to_score.count().compute() > 0:
-        print(f"Nodes to score = {to_score.compute()}")
-        nodes_w_credits = to_score.map(credit)
-        new_edge_scores = nodes_w_credits.map(process_nodes).flatten()
-        edge_scores = db.concat([edge_scores, new_edge_scores])
-        to_score = nodes_w_credits.map( # to_score = parents
-            lambda node_w_c: all_child_parent_rels[node_w_c[0]]).flatten()
-        
+    # Assign edge credits. Each node->parent edge is allocated a proportion of 
+    # the node's credit such that stronger connections (more synapses) receive
+    # less credit. More credit increases the likelihood of a higher edge
+    # betweenness score later.
+    sps["weight"] = 1/(sps["syn_count"] * sps["num_sps"])    
+    total_weights = sps.groupby("node_id")["weight"].sum().to_frame() # Index is node_id
+    edge_scores = sps.merge(total_weights, left_on="node_id", 
+                            right_index=True, how="inner")
+    edge_scores["prop"] = edge_scores["weight_x"] / edge_scores["weight_y"]
+    edge_scores["score"] = edge_scores["credit"] * edge_scores["prop"]
+    
+    # Reformat columns then return
+    edge_scores = edge_scores[["parent", "node_id", "score"]]
+    edge_scores["depth"] = depth
+    edge_scores = edge_scores.rename(columns = {"node_id": "child"})
+    edge_scores = edge_scores.persist()
     return edge_scores
 
 
-def get_edge_scores(start_node, component):
-    """ Return dict of Girvan Newman edge scores starting at start_node.
-    df should only contain pre, post, and syn_count cols """
-    print("\nRunning PBFS ...")
-    child_parent_rels, state, leaves, num_shortest_paths = pbfs(start_node, component)
-    print("Ran PBFS")
-    print("\nCalculating edge scores ...")
-    edge_scores = calculate_edge_scores(start_node, child_parent_rels, 
-                                        num_shortest_paths, leaves, component)
-    print("Calculated edge scores")
+def pbfs_backtrack(pc_df: ddf.DataFrame, cp_df: ddf.DataFrame, 
+                   num_sps: ddf.DataFrame) -> ddf.DataFrame:
+    """ Iterate from the bottom of the PBFS tree upwards, assigning node credits
+    and edge scores along the way. Return edge scores. """
+    # Set-up PBFS backtrack
+    depth = num_sps["depth"].max().compute()
+    edge_score_df = ddf.from_dict(
+        {"depth": pd.Series(dtype=np.int64), "parent": pd.Series(dtype=np.int64),
+         "child": pd.Series(dtype=np.int64), "score": pd.Series(dtype=np.float64)}, 
+        npartitions=1).persist()
+    edge_score_df = edge_score_df.set_index("depth", drop=False, sort=True)    
+    
+    # Run PBFS backtrack, accumulating edge scores
+    while depth >= 0:
+        level_num_sps = num_sps[num_sps["depth"] == depth].persist()
+        parent_num_sps = num_sps[num_sps["depth"] == depth-1]
+        node_credits = assign_node_credits(depth, level_num_sps, edge_score_df)
+        edge_scores = assign_edge_scores(depth, node_credits, cp_df, parent_num_sps)
+        edge_score_df = ddf.concat([edge_score_df, edge_scores])
+        edge_score_df = edge_score_df.set_index("depth", drop=False, sort=True)
+        depth -= 1
+    
+    # Reformat edge_score_df such that the smaller node number is always node1
+    # and the larger node number is node2. This makes grouping easier later.
+    def reformat(df):
+        df["node1"] = df[["parent", "child"]].min(axis=1)
+        df["node2"] = df[["parent", "child"]].max(axis=1)
+        return df[["node1", "node2", "score"]]    
+    edge_score_df = edge_score_df.map_partitions(reformat).persist()
+    return edge_score_df
+
+
+def get_initial_edge_scores(start_node: int, component: ddf.DataFrame, 
+                            num_nodes: int) -> db.Bag:
+    """ Run one PBFS then one PBFS backtrack then collate edge scores.
+    Return Bag of Girvan Newman edge scores starting at start_node, of general 
+    form Bag of tuples Bag([((pre, post), edge_score), ...]) """   
+    state = create_state_df(component)
+    state, pc_df, cp_df, num_sps = pbfs(start_node, component, state)
+    init_edge_scores = pbfs_backtrack(pc_df, cp_df, num_sps)
+    return init_edge_scores
+
+
+def get_edge_scores(component: ddf.DataFrame) -> ddf.DataFrame:
+    """ Set up and do the edge-score calculation phase of Girvan-Newman. 
+    Output edge score df columns node1, node2, score
+    """
+    # Get random subset of nodes. For now, using sample size = ~1/4 the number
+    # of nodes in component.
+    mult_factor = 0.25
+    component_nodes = get_all_nodes(component)
+    num_nodes = component_nodes.count().compute()
+    random_nodes = db.random.sample(component_nodes, int(mult_factor*num_nodes))
+    
+    # Get delayed dataframe partitions of edge scores (can mush them up because 
+    # will all be concatenated anyways)
+    delayed_df_partitions = random_nodes.map(
+        lambda start_node: get_initial_edge_scores(start_node).to_delayed())
+    delayed_df_partitions = delayed_df_partitions.flatten().to_delayed()
+    
+    # Concatenate sub-dataframes into one big dataframe of edge scores:
+    # Group by (node1, node2) and sum edge scores then divide by appropriate
+    # factor (for now, factor = 0.5 because sample size = 0.25*num nodes in 
+    # component). Edge direction is already normalised so don't need to worry
+    # about accounting for node2->node1 edges.    
+    div_factor = 0.5    
+    sub_dfs = [ddf.from_delayed(_) for _ in delayed_df_partitions]
+    ungrouped = ddf.concat(sub_dfs)
+    edge_scores = ungrouped.groupby(["node1","node2"])["score"].sum()
+    edge_scores["score"] = edge_scores["score"] / div_factor
+    edge_scores = edge_scores.persist()    
+    
+    # Account for edges not included in any shortest paths:
+    # Collapse component dataframe, then left merge on edge_scores. Subset
+    # merged result by those edges that did not merge and assign score = 0 to
+    # them, then concatenate zero-score edges to edge_scores.
+    def reformat(df):
+        df["node1"] = df[["parent", "child"]].min(axis=1)
+        df["node2"] = df[["parent", "child"]].max(axis=1)    
+        return df[["node1","node2"]]
+    collapsed = component.map_partitions(reformat)
+    merged = collapsed.merge(edge_scores, on=["node1","node2"], 
+                             how="left", indicator=True)
+    no_scores = merged[merged["_merged"] == "left_only"][["node1","node2"]]
+    no_scores["score"] = 0
+    no_scores = no_scores.persist()
+    edge_scores = ddf.concat([edge_scores, no_scores]).persist()
+
     return edge_scores
 
 
-def girvan_newman(component):
-    """ Set up and do the edge-score calculation phase of Girvan-Newman on a 
-    single component """
-    # Map random subset of nodes to get_edge_scores.
-    # For now, using sample size = quarter the number of nodes in the df.
-    print("Getting random node subset ...")
-    component_nodes = get_all_nodes(component).compute()
-    random_nodes = db.from_sequence(
-        random.sample(component_nodes, int(len(component_nodes)/4)))
-    print(f"Using nodes {random_nodes.compute()}")
-    
-    # Bag([((pre, post), edge_score), ...])
-    print("Getting edge scores ...")
-    all_edge_scores = random_nodes.map(
-        lambda start_node: get_edge_scores(start_node, component)).flatten()
-    print("Got edge scores")
-    
-    # Sum edge scores and divide by factor
-    factor = 0.5 # Used sample size = quarter # nodes in df -> factor = 0.5
-    scores = all_edge_scores.foldby(
-        key = lambda edge_score: edge_score[0],
-        binop = lambda accum, edge_score: accum + edge_score[1],
-        initial = 0,
-        combine = lambda accum1, accum2: accum1 + accum2,
-        combine_initial = 0
-    )
-    standardised_scores = scores.map(
-        lambda edge_score: (edge_score[0], edge_score[1]/factor))
-    return standardised_scores
 
+### Chopping functions ----------------------------------------------------
 
-
-
-### CLUSTER IDENTIFICATION - DECOMPOSITION --------------------------------
-
-def get_upper_threshold(edge_scores, k):
+def get_upper_threshold(edge_scores: ddf.DataFrame) -> float:
     """ Calculate MAD-based upper threshold.
-    edge_scores of form Bag([((pre, post), edge_score), ...])
+    edge_scores is dataframe with columns node1, node2, score
     """
-    global MAD_K
-    if not k:
-        k = MAD_K
-    scores = np.array(edge_scores.map(lambda tup: tup[1]).compute())
-    median_score = np.median(scores)
-    mad = np.median(np.absolute(scores - median_score))
-    upper_threshold = median_score + k * mad
+    global ARGS
+    scores = edge_scores["scores"].to_dask_array()
+    median_score = scores.median().compute()
+    
+    def get_abs_dev(arr: np.ndarray):
+        return np.absolute(arr - median_score)
+    MAD = scores.map_blocks(get_abs_dev).median().compute()
+    upper_threshold = median_score + ARGS.k * MAD
     return upper_threshold
 
 
-def chop(component, edge_scores, upper_threshold):
-    """ Remove outlier edges from component. 
-    Return updated adjacency bag and bag of edges removed.
-    """
-    pass # TODO
+def chop(component: ddf.DataFrame, edge_scores: ddf.DataFrame, 
+         upper_score_threshold: float) -> tuple:
+    """ Remove edges from component dataframe where score exceeds threshold """
+    # Get edges to chop: expand to_chop to include (b->a) for each (a->b), and
+    # rename columns for easy merging.    
+    to_chop = edge_scores[
+        edge_scores["score"] >= upper_score_threshold].persist()
+    to_chop_reversed = to_chop.rename(
+        columns={"node1":"node2", "node2":"node1"}).persist()
+    to_chop = ddf.concat(
+        [to_chop, to_chop_reversed])[["node1", "node2"]].persist()
+    to_chop = to_chop.rename(columns={"node1":"pre", "node2":"post"})
+    
+    # Make copy of component with edges to_chop removed.
+    size_before = component.shape[0].compute()
+    merged = component.merge(to_chop, on=["pre","post"], 
+                             how="left", indicator=True)
+    new_df = merged[merged["_merge"] == "left_only"].persist()
+    size_after = new_df.shape[0].compute()
+    num_chopped = size_before - size_after
+    return (new_df, num_chopped)
 
 
 
+### Top-level cluster tagging/identification ------------------------------
 
-### CLUSTER IDENTIFICATION - IDENTIFY CLUSTERS ----------------------------
-
-def process_component(component):
-    """ Returns a bag of components and whether processing should continue.
-    Bag([(component1_bag, _continue), (component2_bag, _continue), ...])
+def modified_girvan_newman(component: ddf.DataFrame) -> tuple[ddf.DataFrame|None, bool]:
+    """ Remove linker edges from the component dataframe.
+    
+    Returns a bag of components and whether processing should continue.
+    Bag([(component1_df, _continue), (component2_df, _continue), ...])
     where component1, component2, ... are components derived from component.
         
     If _continue is true, then the caller function should apply another round
-    of girvan newman on the components. continue = False occurs when no more
+    of girvan newman on the subcomponents. continue = False occurs when no more
     edges are removed from the input component (i.e., the component is a 
-    cluster).
+    cluster), in which case the associated component dataframe is a cluster, or
+    when the associated component dataframe is too small, in which case None is
+    returned in place of the too-small component.
     
-    Takes a bag called component representing the edges of a component.
     """
-    global MIN_CLUSTER_SIZE
-    edge_scores = girvan_newman(component)
+    global ARGS
+    if get_num_nodes(new_df).compute() < ARGS.minsize:
+        return (None, False) # Cluster/component too small - no point processing
+    
+    # Top-level modified Girvan-Newman
+    edge_scores = get_edge_scores(component)
     upper_score_threshold = get_upper_threshold(edge_scores)
-    new_adj_bag, removed_edges = chop(component, edge_scores, upper_score_threshold)
-    log_removed_edges(removed_edges)
-    if get_num_nodes(new_adj_bag).compute() < MIN_CLUSTER_SIZE:
-        return (None, False) # Cluster/component too small
-    if removed_edges.count().compute() == 0:
-        return (new_bag, False) # Cluster found! Don't continue processing.    
+    new_df, num_chopped = chop(component, edge_scores, upper_score_threshold)
+    
+    if num_chopped == 0:
+        return (new_df, False) # Cluster found! Don't continue processing.
+    return (new_df, True) # Further processing required
     
 
-def recurse(component):
-    component_bag, _continue = component
-    if not _continue:
-        return (component_bag, False)
-    return identify_clusters(adjacency_bags = component_bag)
+def process_raw_df(raw_df: ddf.DataFrame):
+    """ Split up raw_df and create futures mapping to modified GN """
+    global CLIENT
+    component_dfs_list = get_components(raw_df)
+    pruned = [prune(df) for df in component_dfs_list]
+    new_futures = set()
+    for df in pruned:
+        new_futures.add(CLIENT.submit(modified_girvan_newman, df))
+    return new_futures
 
 
-def identify_clusters(df=None, adjacency_bags=None):
-    global MIN_CLUSTER_SIZE, CLIENT
+def identify_clusters(connectome_df: ddf.DataFrame) -> ddf.DataFrame:
+    """ Run modified Girvan Newman repeatedly to identify clusters """
+    future_set, cluster_dfs = set(), []
+    process_raw_df(connectome_df) # Start processing from the top
     
-    # Clean and filter
-    if df: adjacency_bags = get_component_adjacency_bags(df)
-    adjacency_bags = adjacency_bags.map(prune)
-    adjacency_bags = adjacency_bags.filter(
-        lambda adj_bag: adj_bag.count >= MIN_CLUSTER_SIZE)
+    # Check for new results in future set and create new futures as required
+    while len(future_set) > 0:
+        to_delete = set()
+        
+        # Process finished futures        
+        for future in future_set:
+            if future.done():
+                fresh_df, should_continue = future.result()
+                if should_continue:
+                    future_set.add(process_raw_df(fresh_df))
+                else:
+                    if fresh_df is not None:
+                        cluster_dfs.append(fresh_df)
+                to_delete.add(future)
+                
+        # Update future set then snooze
+        future_set -= to_delete
+        sleep(10)
     
-    # Bag([(component1_bag, continue), (component2_bag, continue), ...])
-    components = adjacency_bags.map(process_component).flatten()
-    components = components.map(lambda component: recurse(component))
+    tagged_connectome = tag_edges(cluster_dfs, connectome_df)
+    return tagged_connectome
+
+
+def tag_edges(cluster_dfs: list[ddf.DataFrame], 
+              connectome_df: ddf.DataFrame) -> ddf.DataFrame:
+    """ Return connectome_df sorted by and tagged with cluster IDs. 
+    Cluster IDs are simple integers. Allocate each cluster dataframe in the
+    list a cluster ID, concatenate the cluster dataframes, then left merge
+    connectome_df onto cluster_dfs.
+    """
+    if len(cluster_dfs) == 0:
+        return None
+    cluster_ids = range(1, len(cluster_dfs)+1)
+    for cluster_df, cluster_id in zip(cluster_dfs, cluster_ids):
+        cluster_df["cluster"] = cluster_id
+        cluster_df = cluster_df.persist()
     
-    # Filter and map components to include only bags
-    clusters = components.filter(
-        lambda component: component[0] is not None).map(
-            lambda component: component[0])
-    return clusters
+    big_cluster_df = ddf.concat(cluster_dfs).persist()
+    
+    tagged = connectome_df.merge(big_cluster_df, on=["pre","post"], 
+                                 how="left").persist()
+    return tagged
 
 
 
-### -----------------------------------------------------------------------
+
+
+
+
+################################# ANALYSIS #####################################
+
+def do_stats(clusters):
+    """ Run a statistical analysis on the clusters and report the results """
+    pass # TODO - implement
+
+
+def make_graphs(clusters):
+    """ Generate supporting graphs """
+    pass # TODO - implement
+
+
+
+
+
+
+
+################################### MAIN #######################################
+
+def write_tagged_connectome(connectome: ddf.DataFrame, outdir: str):
+    """ Write tagged connectome to feather file/s """
+    connectome_folder = os.path.join(outdir, "tagged_data")
+    for i, chunk in enumerate(connectome.to_delayed()):
+        chunk_df = chunk.compute() # pandas dataframe
+        filename = os.path.join(connectome_folder, f"tagged_{i}.feather")
+        chunk_df.to_feather(filename)
+
+
+def main():
+    """ Run the full statistical analysis pipeline from loading to reporting """
+    global ARGS
+    connectome_df = load_connectome()
+    tagged_connectome_df = identify_clusters(connectome_df)
+    if ARGS.writeraw:
+        write_tagged_connectome(tagged_connectome_df, ARGS.outdir)
+    do_stats(tagged_connectome_df)
+    make_graphs(tagged_connectome_df)
+
 
 if __name__ == "__main__":
     CLIENT = Client()
+    main()
