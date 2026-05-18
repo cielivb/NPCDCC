@@ -567,20 +567,40 @@ def get_upper_threshold(edge_scores: ddf.DataFrame, k:float|int|None) -> float:
     """ Calculate MAD-based upper threshold.
     edge_scores is dataframe with columns node1, node2, score
     """
-    # TODO - reimplement w df edge_scores
     global MAD_K
     if not k:
         k = MAD_K
-    scores = np.array(edge_scores.map(lambda tup: tup[1]).compute()) 
-    median_score = np.median(scores)
-    mad = np.median(np.absolute(scores - median_score))
+    scores = edge_scores["scores"].to_dask_array()
+    median_score = scores.median().compute()
+    
+    def get_abs_dev(arr: np.ndarray):
+        return np.absolute(arr - median_score)
+    mad = scores.map_blocks(get_abs_dev).median().compute()
     upper_threshold = median_score + k * mad
     return upper_threshold
 
 
-def chop(component, edge_scores, upper_score_threshold):
-    raise NotImplementedError # TODO
-
+def chop(component: ddf.DataFrame, edge_scores: ddf.DataFrame, 
+         upper_score_threshold: float) -> tuple:
+    """ Remove edges from component dataframe where score exceeds threshold """
+    # Get edges to chop: expand to_chop to include (b->a) for each (a->b), and
+    # rename columns for easy merging.    
+    to_chop = edge_scores[
+        edge_scores["score"] >= upper_score_threshold].persist()
+    to_chop_reversed = to_chop.rename(
+        columns={"node1":"node2", "node2":"node1"}).persist()
+    to_chop = ddf.concat(
+        [to_chop, to_chop_reversed])[["node1", "node2"]].persist()
+    to_chop = to_chop.rename(columns={"node1":"pre", "node2":"post"})
+    
+    # Make copy of component with edges to_chop removed.
+    size_before = component.shape[0].compute()
+    merged = component.merge(to_chop, on=["pre","post"], 
+                             how="left", indicator=True)
+    new_df = merged[merged["_merge"] == "left_only"].persist()
+    size_after = new_df.shape[0].compute()
+    num_chopped = size_before - size_after
+    return (new_df, num_chopped)
 
 
 
@@ -604,12 +624,12 @@ def modified_girvan_newman(component: ddf.DataFrame) -> tuple[ddf.DataFrame|None
     global MIN_CLUSTER_SIZE
     edge_scores = get_edge_scores(component)
     upper_score_threshold = get_upper_threshold(edge_scores)
-    new_adj_df, removed_edges = chop(component, edge_scores, upper_score_threshold)
-    if get_num_nodes(new_adj_df).compute() < MIN_CLUSTER_SIZE:
+    new_df, num_chopped = chop(component, edge_scores, upper_score_threshold)
+    if get_num_nodes(new_df).compute() < MIN_CLUSTER_SIZE:
         return (None, False) # Cluster/component too small
-    if removed_edges.count().compute() == 0:
-        return (new_adj_df, False) # Cluster found! Don't continue processing.    
-    return (new_adj_df, True) # Further processing required
+    if num_chopped == 0:
+        return (new_df, False) # Cluster found! Don't continue processing.    
+    return (new_df, True) # Further processing required
     
 
 def process_raw_df(raw_df: ddf.DataFrame):
