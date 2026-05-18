@@ -182,7 +182,20 @@ def parse_args():
 
 def load_connectome() -> ddf.DataFrame:
     """ Parse connectome feather file into dask dataframe """
-    raise NotImplementedError # TODO: implement
+    @delayed
+    def read_feather(path):
+        return pd.read_feather(path, use_threads=True)
+    
+    connectome_path = os.path.join(ROOT_DIR, data, "proofread_connections_783.feather")
+    raw = ddf.from_delayed(read_feather(connectome_path))
+    
+    # Remove any edges to self - they are not needed for this analysis and I
+    # have not danger-proofed the pipeline from them
+    edges_to_remove = raw[raw["pre"] == raw["post"]]
+    merged = raw.merge(edges_to_remove, on=["pre","post"], how="left", indicator=True)
+    connectome = merged[merged["_merge"] == "left_only"].persist()
+    
+    return connectome
 
 
 
@@ -245,8 +258,10 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
     """
     def get_degree_1_nodes(df):
         node_degrees = df.groupby(df.index)["post"].nunique().to_frame("degree")
+        print(f"node_degrees = {node_degrees}")
         deg1_nodes = node_degrees[
-            node_degrees["degree"] == 1].index.to_frame("node").persist()
+            node_degrees["degree"] == 1].index.to_frame("node")
+        print(f"deg1_nodes = {deg1_nodes}")
         return deg1_nodes
     
     pruned, deg1_nodes = df, get_degree_1_nodes(df)
