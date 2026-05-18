@@ -14,7 +14,7 @@ Data License: Creative Commons Attribution 4.0 International (https://creativeco
 
 File : proofread_connections_783.feather
 
-16847997 rows
+16,847,997 rows
 
 Columns (descriptions taken from zenodo):
 
