@@ -44,13 +44,49 @@ from dask import delayed
 from dask.distributed import Client
 from time import sleep
 
-CLIENT = None # Assigned properly at bottom of script
-MIN_CLUSTER_SIZE = 30
-MAD_K = 3.5
-
-ROOT_DIR = os.path.dirname(__file__)
-
+ARGS = None # Updated in parse_args()
+CLIENT = None # Assigned at bottom of script
 dask.config.set({"dataframe.shuffle.method": "tasks"})
+
+
+
+
+
+################################## LOAD ########################################
+
+def parse_args():
+    """ Read in and store user-supplied arguments """
+    global ARGS
+    P = argparse.ArgumentParser(prog="run_cluster_detector", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    P.add_argument("-f", "--file", required=True, help="Connectome file directory")
+    P.add_argument("-o", "--outdir", required=True, help="Output folder directory")
+    P.add_argument("-s", "--minsize", type=int, default=30, help="Minimum cluster size")
+    P.add_argument("-k", "--madk", type=float, default=3.5,
+                   help="Multiplier (k) for MAD outlier detection")
+    ARGS = P.parse_args()
+
+
+def load_connectome() -> ddf.DataFrame:
+    """ Parse connectome feather file into dask dataframe """
+    global ARGS
+    
+    @delayed
+    def read_feather(path):
+        return pd.read_feather(path, use_threads=True)
+    
+    raw = ddf.from_delayed(read_feather(ARGS.file))
+    
+    # Remove any edges to self - they are not needed for this analysis and I
+    # have not danger-proofed the pipeline from them
+    edges_to_remove = raw[raw["pre"] == raw["post"]]
+    merged = raw.merge(edges_to_remove, on=["pre","post"], how="left", indicator=True)
+    connectome = merged[merged["_merge"] == "left_only"].persist()
+    
+    return connectome
+
+
+
 
 
 
@@ -173,31 +209,6 @@ def undirect_df(df: ddf.DataFrame) -> ddf.DataFrame:
 
 
 
-################################## LOAD ########################################
-
-def parse_args():
-    """ Validate and store script arguments in global variables """
-    raise NotImplementedError # TODO : implement
-
-
-def load_connectome() -> ddf.DataFrame:
-    """ Parse connectome feather file into dask dataframe """
-    @delayed
-    def read_feather(path):
-        return pd.read_feather(path, use_threads=True)
-    
-    connectome_path = os.path.join(ROOT_DIR, data, "proofread_connections_783.feather")
-    raw = ddf.from_delayed(read_feather(connectome_path))
-    
-    # Remove any edges to self - they are not needed for this analysis and I
-    # have not danger-proofed the pipeline from them
-    edges_to_remove = raw[raw["pre"] == raw["post"]]
-    merged = raw.merge(edges_to_remove, on=["pre","post"], how="left", indicator=True)
-    connectome = merged[merged["_merge"] == "left_only"].persist()
-    
-    return connectome
-
-
 
 
 
@@ -256,6 +267,7 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
     to process the longest 'chain'.
 
     """
+    print(f"type of df = {type(df)}; df = {df}")
     def get_degree_1_nodes(df):
         node_degrees = df.groupby(df.index)["post"].nunique().to_frame("degree")
         print(f"node_degrees = {node_degrees}")
@@ -588,20 +600,18 @@ def get_edge_scores(component: ddf.DataFrame) -> ddf.DataFrame:
 
 ### Chopping functions ----------------------------------------------------
 
-def get_upper_threshold(edge_scores: ddf.DataFrame, k:float|int|None) -> float:
+def get_upper_threshold(edge_scores: ddf.DataFrame) -> float:
     """ Calculate MAD-based upper threshold.
     edge_scores is dataframe with columns node1, node2, score
     """
-    global MAD_K
-    if not k:
-        k = MAD_K
+    global ARGS
     scores = edge_scores["scores"].to_dask_array()
     median_score = scores.median().compute()
     
     def get_abs_dev(arr: np.ndarray):
         return np.absolute(arr - median_score)
-    mad = scores.map_blocks(get_abs_dev).median().compute()
-    upper_threshold = median_score + k * mad
+    MAD = scores.map_blocks(get_abs_dev).median().compute()
+    upper_threshold = median_score + ARGS.k * MAD
     return upper_threshold
 
 
@@ -646,8 +656,8 @@ def modified_girvan_newman(component: ddf.DataFrame) -> tuple[ddf.DataFrame|None
     returned in place of the too-small component.
     
     """
-    global MIN_CLUSTER_SIZE
-    if get_num_nodes(new_df).compute() < MIN_CLUSTER_SIZE:
+    global ARGS
+    if get_num_nodes(new_df).compute() < ARGS.minsize:
         return (None, False) # Cluster/component too small - no point processing
     
     # Top-level modified Girvan-Newman
@@ -662,8 +672,10 @@ def modified_girvan_newman(component: ddf.DataFrame) -> tuple[ddf.DataFrame|None
 
 def process_raw_df(raw_df: ddf.DataFrame):
     """ Split up raw_df and create futures mapping to modified GN """
-    global CLIENT, MIN_CLUSTER_SIZE
+    global CLIENT
     component_dfs_list = get_components(raw_df)
+    print(f"component dfs list = \n{component_dfs_list}")
+    print(f"type of df = {type(component_dfs_list[0])}")
     pruned = [ddf.from_delayed(prune(df)) for df in component_dfs_list]
     new_futures = set()
     for df in pruned:
@@ -744,7 +756,6 @@ def make_graphs(clusters):
 
 def main():
     """ Run the full statistical analysis pipeline from loading to reporting """
-    parse_args()
     connectome_df = load_connectome()
     tagged_connectome_df = identify_clusters(connectome_df)
     do_stats(tagged_connectome_df)
