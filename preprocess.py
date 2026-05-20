@@ -30,16 +30,22 @@ COORD_FILE = os.path.join(DATA_DIR, "flywire_synapses_783.parquet")
 
 def fetch_from_zenodo(file_path):
     """ Fetch file from Zenodo via internet if not already downloaded """
+    global DATA_DIR
+    filename = os.path.basename(file_path)
+    
     if not os.path.exists(file_path):
         DOI = "https://doi.org/10.5281/zenodo.10676866"
-        filename = os.path.basename(file_path)
-        if filename == "flywire_synapses_783":
-            print(f"\nDownloading {filename} (9.5 GB) from Zenodo ... ")
+        if filename == "flywire_synapses_783.feather":
+            print(f"\nDownloading {filename} (9.5 GB) from Zenodo ... \n")
         else:
-            print(f"\nDownloading {filename} (812 MB) from Zenodo ...")
+            print(f"\nDownloading {filename} (812 MB) from Zenodo ...\n")
         download(record_or_doi=DOI, output_dir=file_path, file_glob=filename,
-                 continue_on_error=True)
-        print(f"\nDownloaded {filename} successfully")
+                 continue_on_error=True, verbosity=3)
+        print(f"\nDownloaded {filename} successfully\n")
+        
+    # File is downloaded to a folder in output directory (input file_path) with
+    # same name as file. Return path to actual feather file
+    file_path = os.path.join(DATA_DIR, filename, filename)
     return file_path
 
 
@@ -73,14 +79,14 @@ def feather_to_parquet(file_to_convert, destination):
     made many modifications and added thorough annotations to improve clarity.
     """
     filename = os.path.basename(file_to_convert)
-    print(f"Converting {filename} to parquet ...")
+    print(f"\nConverting {filename} to parquet ...\n")
     chunk_size = 250_000
     reader = pyarrow.ipc.open_file(file_to_convert) # Create streaming reader
     writer = None
     
     for i in range(reader.num_record_batches):
         batch = reader.get_record_batch(i) # Get subset of rows from feather file
-        table = pa.Table.from_batches([batch]) # Wrap low-level batch into high-level table
+        table = pyarrow.Table.from_batches([batch]) # Wrap low-level batch into high-level table
         
         # Create parquet writer (once). The writer needs a schema, and that 
         # schema is supplied by the table, hence cannot do this step outside
@@ -96,7 +102,7 @@ def feather_to_parquet(file_to_convert, destination):
         writer.write_table(table, row_group_size = chunk_size)
         
     writer.close()
-    print(f"Converted {filename} to parquet")
+    print(f"\nConverted {filename} to parquet\n")
     
 
 def write_test_metadata(sub_connectome, test_id):
@@ -128,7 +134,7 @@ def write_subset_file(sub_connectome, test_id):
     
 def make_tests(main_file, test_ids, test_paths):
     """ Create subsets of main file of varying sizes for performance analysis """
-    print(f"Generating test parquet files ...")
+    print(f"\nGenerating test parquet files ...\n")
     connectome = ddf.read_parquet(main_file)
     
     # Subset dataframe into different sizes
@@ -144,7 +150,7 @@ def make_tests(main_file, test_ids, test_paths):
     for sub_connectome, test_id in zip(subsets, test_ids):
         write_test_metadata(sub_connectome, test_id)
         write_subset_file(sub_connectome, test_id)
-    print(f"Generated test parquet files")
+    print(f"\nGenerated test parquet files\n")
 
 
 ################################### MAIN #######################################
@@ -157,7 +163,6 @@ def initialise_client():
         memory_limit = "4GB",
         dashboard_address=":8787"
     )
-    print(cluster.dashboard_link)
     client = Client(cluster)
     return client
 
@@ -172,7 +177,7 @@ def main():
     coord_path_f = CLIENT.submit(preprocess_coord_file, coord_file_raw_path_f)
     file_paths = file_paths_f.result()
     coord_path = coord_path_f.result()
-    print(f"\nPreprocessing complete!")
+    print(f"\n\nPreprocessing complete!")
     print(f"You should be able to execute run.py directly now.")
     
 

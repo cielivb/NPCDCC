@@ -634,16 +634,16 @@ def run(connectome_df: ddf.DataFrame, minsize=30, k=2.5) -> ddf.DataFrame:
 
 def tag_edges(cluster_dfs: list[ddf.DataFrame], 
               connectome_df: ddf.DataFrame) -> ddf.DataFrame:
-    """ Return connectome_df sorted by and tagged with cluster IDs. 
-    Cluster IDs are simple integers. Allocate each cluster dataframe in the
-    list a cluster ID, concatenate the cluster dataframes, then left merge
+    """ Return connectome_df sorted by and tagged with community IDs. 
+    Community IDs are simple integers. Allocate each cluster dataframe in the
+    list a community ID, concatenate the cluster dataframes, then left merge
     connectome_df onto cluster_dfs.
     """
     if len(cluster_dfs) == 0:
         return None
     cluster_ids = range(1, len(cluster_dfs)+1)
     for cluster_df, cluster_id in zip(cluster_dfs, cluster_ids):
-        cluster_df["cluster"] = cluster_id
+        cluster_df["community_id"] = cluster_id
         cluster_df = cluster_df.persist()
     
     big_cluster_df = ddf.concat(cluster_dfs).persist()

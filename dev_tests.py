@@ -210,3 +210,26 @@ class TestIdentifyClusters(unittest.TestCase):
         self.assertTrue(len(tagged["cluster"]) == 12)
         
 
+
+################################################################################
+        
+class TestWriteSummaryStats(unittest.TestCase):
+    
+    def setUp(self):
+        run.CLIENT = Client()
+        
+    def tearDown(self):
+        run.CLIENT.close()
+        
+    def test_aggregate_community_data(self):
+        nt_list = [0.01, 0.02, 0.01, 0.02, 0.03, 0.7, 0.9, 0.98, 0.7, 0.8, 0.8, 0.8, 0.8, 0.1, 0.01]
+        fake_df = pd.from_dict({"pre": [1,1,1,1,1,2,2,2,2,2,3,3,3,3,3],
+                                "post": [2,3,2,3,2,3,1,3,1,3,1,2,1,2,1],
+                                "syn_count": [1,2,3,4,5,6,7,8,9,8,7,6,5,4,3],
+                                "gaba_avg": nt_list, "ach_avg": nt_list,
+                                "glut_avg": nt_list, "oct_avg": nt_list,
+                                "ser_avg": nt_list, "da_avg": nt_list,
+                                "neuropil": ["N" for _ in range(15)],
+                                "community_id": [1 for _ in range(15)]})
+        
+        result = run.write_community_data.aggregate(fake_df)

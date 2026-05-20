@@ -93,7 +93,9 @@ def start_cluster(num_cores):
 
 def load_connectome(file) -> ddf.DataFrame:
     """ Load parquet connectome file into dask dataframe """
-    connectome = ddf.read_parquet(file).persist()
+    connectome = ddf.read_parquet(file)
+    connectome = connectome.rename(columns = {"pre": "pre_pt_root_id",
+                                              "post": "post_pt_root_id"})
     return connectome
 
 
@@ -103,39 +105,89 @@ def write_tagged_connectome(tagged_connectome: ddf.DataFrame, outdir: str):
     tagged_connectome.to_parquet(outfile)
 
 
-def write_cluster_data(tagged_connectome: ddf.DataFrame, outdir: str):
-    """ Generate and write the following metrics for each cluster:
+def write_community_data(tagged_connectome: ddf.DataFrame, outdir: str):
+    """ Generate and write the following metrics for each community:
     
-    Cluster ID, number of nodes, number of edges, number of synapses, 
+    Community ID, number of nodes, number of edges, number of synapses, 
     dominant neuropil, neuropil purity (i.e., the largest proportion of edges in
     a given neuropil), average GABA probabilities + variance, average acetylcholine 
     probabilities + variance, average other neurotransmitter probabilities +
     variance. 
+    
+    Tagged connectome has columns : pre, post, syn_count, neuropil, gaba_avg,
+    ach_avg, glut_avg, oct_avg, ser_avg, da_avg, community_id
+    
     """
-    raise NotImplementedError
+    df = tagged_connectome
+    
+    easy_aggs = {"pre": "count", "syn_count": "sum",
+                 "gaba_avg": ["mean", "var", "min", "max"],
+                 "ach_avg": ["mean", "var", "min", "max"],
+                 "glut_avg": ["mean", "var", "min", "max"],
+                 "oct_avg": ["mean", "var", "min", "max"],
+                 "ser_avg": ["mean", "var", "min", "max"],
+                 "da_avg": ["mean", "var", "min", "max"]}
+    group1 = df.groupby("community_id").agg(easy_aggs)
+    
+    # Calculate dominant neuropil - the neuropil that accounts for the largest
+    # proportion of edges in the community, and calculate neuropil purity, the 
+    # maximum proportion of the community's edges belonging to a single neuropil,
+    # i.e., the proportion of edges of the community belonging to the dominant 
+    # neuropil.
+    def get_dominant_neuropil(df: pd.DataFrame):
+        total_edges = df["num_edges"].sum()
+        max_edges_i = df["num_edges"].idxmax()
+        dominant_neuropil = df.loc[max_edges_i]["neuropil"]
+        prop = df.loc[max_edges_i]["num_edges"] / total_edges # purity
+        return pd.from_dict({"community_id": community_id, 
+                             "dominant": dominant_neuropil, 
+                             "purity": prop})
+    neuropil_counts = df.groupby(
+        ["community_id", "neuropil"])["pre"].count().rename("num_edges")
+    group2 = neuropil_counts.groupby("community_id").apply(get_dominant_neuropil)
+    
+    # Get number of nodes/neurons per community
+    communities = list(df["community_id"].drop_duplicates().compute())
+    @delayed
+    def get_num_nodes_by_community(community_id):
+        subset = df[df["community_id"] == community_id]
+        num_nodes = detect_communities.get_num_nodes(subset) # Returns computed int
+        return pd.from_dict({"community_id": community_id, "num_nodes": num_nodes})
+    tasks = [get_num_nodes_by_community(comm) for comm in communities]
+    group3 = ddf.from_delayed(tasks)
+    
+    # Merge the 3 groups then write to csv file
+    result = group1.merge(group2, on="community_id", how="inner")
+    result = result.merge(group3, on="community_id", how="inner")
+    outfile = os.path.join(outdir, "summary_stats_communities.csv")
+    result.to_csv(outfile, write_index=True)
 
 
 def write_neuropil_data(tagged_connectome: ddf.DataFrame, outdir: str):
     """ Generate and write the following metrics for each neuropil: 
     
-    Neuropil, number of clusters, number of edges assigned to clusters, number
-    of synapses assigned to clusters, number of edges not assigned to clusters,
-    number of synapses not assigned to clusters, percentage of edges assigned
-    to clusters, percentage of edges not assigned to clusters, percentage of
-    synapses assigned to clusters, percentage of synapses not assigned to
-    clusters, average GABA probs + var for clustered edges vs unclustered edges,
-    average acetylchole probs + var for clustered vs unclustered edges, and
-    average other neurotransmitter probs + var for clustered vs unclustered edges.
+    Neuropil, number of communities, number of edges assigned to communities, number
+    of synapses assigned to communities, number of edges not assigned to communities,
+    number of synapses not assigned to communities, percentage of edges assigned
+    to communities, percentage of edges not assigned to communities, percentage of
+    synapses assigned to communities, percentage of synapses not assigned to
+    communities, average GABA probs + var for community edges vs other edges,
+    average acetylchole probs + var for community edges vs other edges, and
+    average other neurotransmitter probs + var for community vs other edges.
     
     Neuropils with L and R portions should have L and R portion summary stats
     in addition to collated summary stats.
+    
+    Tagged connectome has columns : pre, post, syn_count, neuropil, gaba_avg,
+    ach_avg, glut_avg, oct_avg, ser_avg, da_avg, community_id
+    
     """
     raise NotImplementedError
 
 
 def do_stats(tagged_connectome: ddf.DataFrame, outdir: str):
-    """ Run a statistical analysis on the clusters and report the results. 
-    Only clusters with neuropil purity >= 98% will be used in brain region
+    """ Run a statistical analysis on the communities and report the results. 
+    Only communities with neuropil purity >= 98% will be used in brain region
     comparisons.
     """
     raise NotImplementedError
@@ -176,7 +228,7 @@ def main():
     # Start timing
     start_time = datetime.now()
     
-    # Set up cluster, load data, and identify clusters
+    # Set up cluster, load data, and identify communities
     start_cluster(args.cores)
     connectome = load_connectome(args.file)
     tagged = detect_communities.run(connectome, args.min, args.madk)
@@ -184,7 +236,7 @@ def main():
     # Write tagged data, perform analyses, and generate visuals. None of these
     # tasks depend on the completion of any other of these tasks.
     w1_f = CLIENT.submit(write_tagged_connectome, tagged, outdir)
-    w2_f = CLIENT.submit(write_cluster_data, tagged, outdir)
+    w2_f = CLIENT.submit(write_community_data, tagged, outdir)
     w3_f = CLIENT.submit(write_neuropil_data, tagged, outdir)
     stats_f = CLIENT.submit(do_stats, tagged, outdir)
     graphs_f = CLIENT.submit(make_graphs, tagged, outdir)
