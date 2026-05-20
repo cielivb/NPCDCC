@@ -9,13 +9,7 @@ from dask import delayed
 from dask.distributed import Client
 from time import sleep
 
-CLIENT = None
-
-
-def run(df: ddf.DataFrame, minsize=30, k=3.5):
-    """ Return a dataframe with a tag column containing cluster IDs """
-    identify_clusters()
-    pass # TODO : Implement
+CLIENT, MINSIZE, MADK = None, None, None
 
 
 
@@ -606,9 +600,13 @@ def process_raw_df(raw_df: ddf.DataFrame):
     return new_futures
 
 
-def identify_clusters(connectome_df: ddf.DataFrame) -> ddf.DataFrame:
+def run(connectome_df: ddf.DataFrame, minsize=30, k=2.5) -> ddf.DataFrame:
     """ Run modified Girvan Newman repeatedly to identify clusters """
+    global CLIENT, MINSIZE, MADK
+    CLIENT = get_client()
+    MINSIZE, MADK = minsize, k
     future_set, cluster_dfs = set(), []
+    
     process_raw_df(connectome_df) # Start processing from the top
     
     # Check for new results in future set and create new futures as required
@@ -653,14 +651,3 @@ def tag_edges(cluster_dfs: list[ddf.DataFrame],
     tagged = connectome_df.merge(big_cluster_df, on=["pre","post"], 
                                  how="left").persist()
     return tagged
-
-
-
-def write_tagged_connectome(connectome: ddf.DataFrame, outdir: str):
-    """ Write tagged connectome to feather file/s """
-    connectome_folder = os.path.join(outdir, "tagged_data")
-    for i, chunk in enumerate(connectome.to_delayed()):
-        chunk_df = chunk.compute() # pandas dataframe
-        filename = os.path.join(connectome_folder, f"tagged_{i}.feather")
-        chunk_df.to_feather(filename)
-

@@ -33,7 +33,7 @@ TODO
 
 
 """
-
+import argparse
 import dask
 import numpy as np
 import os
@@ -43,59 +43,68 @@ from dask import dataframe as ddf
 from dask import delayed
 from dask.distributed import Client
 from dask.distributed import LocalCluster
+from datetime import datetime
 from time import sleep
 
 import detect_communities
-import preprocess
 
-CLIENT = None # Assigned at bottom of script
+
+CLIENT = None # Assigned in start_cluster()
 
 ROOT_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(ROOT_DIR, "data")
-MAIN_FILE = os.path.join(DATA_DIR, "proofread_connections_783.parquet")
-COORD_FILE = os.path.join(DATA_DIR, "flywire_synapses_783.parquet")
+RESULT_DIR = os.path.join(ROOT_DIR, "results")
 
 
+def parse_args():
+    """ Process user input """
+    p = argparse.ArgumentParser()
+    p.add_argument("-c", "--cores", "Number of cores to use", type=int, required=True)
+    p.add_argument("-f", "--file", "Parquet file to run through pipeline", required=True)
+    p.add_argument("-m", "--min", "Minimum community size", type=int, default=30)
+    p.add_argument("-k", "--madk", "MAD outlier detection K", type=float, default=2.5)
+    args = p.parse_args()
+    return args
 
-################################## LOAD ########################################
 
-def read_parquet_w_id(path):
-    """ Create dataframe from parquet file at path with attribute ID """
-    file_id = os.path.splitext(os.path.basename(path))
-    raw_df = ddf.read_parquet(path)
-    raw_df.attrs["id"] = file_id
-    return raw_df
+def create_session_id(file, num_cores):
+    """ Derive session id from filename, number of cores, and datetime """
+    datetime_id = datetime.now().strftime("%Y%m%d%H%M")
+    filename = os.path.basename(file)
+    if "_" in filename:
+        filename = "full"
+    session_id = f"{datetime_id}_{num_cores}_{filename}"
+    return session_id
 
 
-def remove_self_edges(raw):
-    """ Remove any edges to self - they are not needed for this analysis and I
-     have not danger-proofed the pipeline from them """
-    edges_to_remove = raw[raw["pre"] == raw["post"]]
-    merged = raw.merge(edges_to_remove, on=["pre","post"], how="left", indicator=True)
-    connectome = merged[merged["_merge"] == "left_only"].persist()
-    connectome.id = raw.id
+def start_cluster(num_cores):
+    """ Create dask client and start cluster with 1 worker per core """
+    global CLIENT
+    cluster = LocalCluster(
+        n_workers=num_cores,
+        processes=True,
+        threads_per_worker=1,
+        memory_limit = "2GB",
+        dashboard_address=":8787"
+    )
+    CLIENT = Client(cluster)
+    dask.config.set({"dataframe.shuffle.method": "tasks"})    
+
+
+def load_connectome(file) -> ddf.DataFrame:
+    """ Load parquet connectome file into dask dataframe """
+    connectome = ddf.read_parquet(file).persist()
     return connectome
 
 
-def load_connectomes() -> list[ddf.DataFrame]:
-    """ Parse connectome feather files in data directory into dask dataframes """
-    global FILES, CLIENT
-    raw_dfs = [CLIENT.submit(read_parquet_w_id(f)) for f in FILES]
-    raw_dfs = CLIENT.gather(raw_dfs)
-    connectomes = [CLIENT.submit(remove_self_edges(df)) for df in raw_dfs]
-    connectomes = CLIENT.gather(connectomes)
-    print(connectomes[0].attrs)
-    return connectomes
+def write_tagged_connectome(tagged_connectome: ddf.DataFrame, outdir: str):
+    """ Write tagged connectome to feather file/s """
+    outfile = os.path.join(outdir, "tagged.parquet")
+    tagged_connectome.to_parquet(outfile)
 
 
-
-
-
-################################# ANALYSIS #####################################
-
-
-def aggregate_cluster_data(tagged_connectome_df):
-    """ Generate the following metrics for each cluster:
+def write_cluster_data(tagged_connectome: ddf.DataFrame, outdir: str):
+    """ Generate and write the following metrics for each cluster:
     
     Cluster ID, number of nodes, number of edges, number of synapses, 
     dominant neuropil, neuropil purity (i.e., the largest proportion of edges in
@@ -106,8 +115,8 @@ def aggregate_cluster_data(tagged_connectome_df):
     raise NotImplementedError
 
 
-def aggregate_neuropil_data(tagged_connectome_df):
-    """ Generate the following metrics for each neuropil: 
+def write_neuropil_data(tagged_connectome: ddf.DataFrame, outdir: str):
+    """ Generate and write the following metrics for each neuropil: 
     
     Neuropil, number of clusters, number of edges assigned to clusters, number
     of synapses assigned to clusters, number of edges not assigned to clusters,
@@ -124,7 +133,7 @@ def aggregate_neuropil_data(tagged_connectome_df):
     raise NotImplementedError
 
 
-def do_stats(aggregated):
+def do_stats(tagged_connectome: ddf.DataFrame, outdir: str):
     """ Run a statistical analysis on the clusters and report the results. 
     Only clusters with neuropil purity >= 98% will be used in brain region
     comparisons.
@@ -132,10 +141,14 @@ def do_stats(aggregated):
     raise NotImplementedError
 
 
-def make_graphs(aggregated):
-    """ Generate supporting graphs """
+def make_graphs(tagged_connectome: ddf.DataFrame, outdir: str):
+    """ Generate supporting bar charts """
     raise NotImplementedError
 
+
+def make_brain_maps(tagged_connectome: ddf.DataFrame, outdir: str):
+    """ Use PyVista to generate before and after brain map images. """
+    raise NotImplementedError
 
 
 
@@ -144,59 +157,46 @@ def make_graphs(aggregated):
 
 ################################### MAIN #######################################
 
-def needs_preprocessing():
-    """ Check if data is ready for pipelining """
-    global MAIN_FILE, COORD_FILE
-    if not os.path.exists(MAIN_FILE) or not os.path.exists(COORD_FILE):
-        return True
-    return False
+def report_duration(session_id, duration):
+    """ Write duration to duration file """
+    global RESULT_DIR
+    duration_file = os.path.join(RESULT_DIR, "durations.txt")
+    with open(duration_file, 'a') as file:
+        file.write(f"{session_id}: {duration}\n")
 
 
 def main():
     """ Run the full statistical analysis pipeline from loading to reporting """
-    global MAIN_FILE, COORD_FILE
+    # Set-up performance testing stuff
+    args = parse_args()
+    session_id = create_session_id(args.file, args.cores)
+    outdir = os.path.join(RESULT_DIR, session_id)
+    os.mkdir(outdir)
     
-    # Preprocess files (if applicable)
-    if needs_preprocessing():
-        print("Preprocessing datasets ...")
-        preprocess.run(MAIN_FILE, COORD_FILE)
-    print("Datasets ready for pipelining")
-
-    # Load connectomes
-    print("\nLoading connectomes ...")
-    connectome_dfs = load_connectomes() # List of dataframes
-    print(f"{len(connectome_dfs)} connectomes loaded into dask dataframes")
+    # Start timing
+    start_time = datetime.now()
     
-    # Identify clusters
-    print(f"\nIdentifying clusters (this may take a while) ...")
-    tagged = [CLIENT.submit(detect_clusters.run, df) for df in connectome_dfs]
-    tagged = CLIENT.gather(tagged) # List of dataframes tagged with cluster IDs
-    print("\nClusters identified; all dataframes tagged")
-    for df in tagged:
-        print(f"\n{df.id}")
-        print(df.head(10))
-        
-    # Do statistical analyses
-    print(f"Doing statistical analyses ...")
-    do_stats(tagged_connectome_df)
-    print(f"Statistical analyses complete")
+    # Set up cluster, load data, and identify clusters
+    start_cluster(args.cores)
+    connectome = load_connectome(args.file)
+    tagged = detect_communities.run(connectome, args.min, args.madk)
     
-    # Create supporting visuals
-    print(f"Generating brain maps ...")
-    make_graphs(tagged_connectome_df)
-    print(f"Brain maps generated")
+    # Write tagged data, perform analyses, and generate visuals. None of these
+    # tasks depend on the completion of any other of these tasks.
+    w1_f = CLIENT.submit(write_tagged_connectome, tagged, outdir)
+    w2_f = CLIENT.submit(write_cluster_data, tagged, outdir)
+    w3_f = CLIENT.submit(write_neuropil_data, tagged, outdir)
+    stats_f = CLIENT.submit(do_stats, tagged, outdir)
+    graphs_f = CLIENT.submit(make_graphs, tagged, outdir)
+    bm_f = CLIENT.submit(make_brain_maps, tagged, outdir)
+    futures = [w1_f, w2_f, w3_f, stats_f, graphs_f, bm_f]
+    status = futures.gather() # Block until are tasks are done
+    
+    # Stop timing and report duration
+    end_time = datetime.now()
+    duration = end_time - start_time
+    report_duration(session_id, duration)
 
 
 if __name__ == "__main__":
-    # Set-up dask cluster and client.
-    # My local machine has 16 GB RAM.
-    cluster = LocalCluster(
-        n_workers=4,
-        processes=True,
-        threads_per_worker=1,
-        memory_limit = "3GB",
-        dashboard_address=":8787"
-    )
-    CLIENT = Client(cluster)
-    dask.config.set({"dataframe.shuffle.method": "tasks"})    
     main()
