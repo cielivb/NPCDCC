@@ -184,52 +184,38 @@ def write_neuropil_data(tagged_connectome: ddf.DataFrame, outdir: str):
     
     """
     df = tagged_connectome
+    df["assigned"] = df[df["community_id"].notna()]
+    df["base_neuropil"] = df["neuropil"].str.split("_").str[0]
+    df["hemisphere"] = df["neuropil"].str.split("_").str[1] # L or R
+    
+    # Get overall neuropil summary statistics
+    nt_cols = ["gaba_avg", "ach_avg", "glut_avg", "oct_avg", "ser_avg", "da_avg"]
+    easy_aggs = {"pre": "count", "syn_count": "sum", 
+                   **{nt: ["mean", "var"] for nt in nt_cols}}
+    overall_stats = df.groupby("neuropil").agg(easy_aggs)
+    
+    # Get community and bridge stats
+    comm_stats = df[df["assigned"]].groupby("neuropil").agg(
+        base_aggs).add_prefix("comm_")
+    bridge_stats = df[~df["assigned"]].groupby("neuropil").agg(
+        base_aggs).add_prefix("bridge_")
+    
+    # Merge overall stats, community stats, and bridge stats columnwise
+    stat_df = ddf.concat([overall_stats, comm_stats, bridge_stats], axis=1)
+    
+    # Compute proportion of edges and synapses assigned to communities
+    stat_df["prop_edges_comm"] = stat_df["comm_pre_count"] / stat_df["pre_count"]
+    stat_df["prop_synapses_comm"] = stat_df["comm_syn_count_sum"] / stat_df["syn_count_sum"]
 
-    def get_summary_stats(df: pd.DataFrame):
-        """ Get general summary stats across edges in df """
-        easy_aggs = {"pre": "count", "syn_count": "sum",
-                    "gaba_avg": ["mean", "var", "min", "max"],
-                    "ach_avg": ["mean", "var", "min", "max"],
-                    "glut_avg": ["mean", "var", "min", "max"],
-                    "oct_avg": ["mean", "var", "min", "max"],
-                    "ser_avg": ["mean", "var", "min", "max"],
-                    "da_avg": ["mean", "var", "min", "max"]}
-        group = df.agg(easy_aggs)
-        return group
-    
-    def get_comm_summary_stats(df: pd.DataFrame):
-        """ Get stats for communities and bridges within neuropil """
-        comm_edges, bridge_edges = df[df["assigned"]], df[~df["assigned"]]
-        comm_agg_df = get_summary_stats(comm_edges).add_prefix("comm_")
-        bridge_agg_df = get_summary_stats(bridge_edges).add_prefix("bridge_")
-        df = pd.concat([comm_agg_df, bridge_agg_df], axis=1) # Column-wise
-        return df
-    
-    main_df = df.groupby("neuropil").apply(
-        get_summary_stats, meta=pd.DataFrame())
-    comm_bridge_df = df.groupby(["neuropil"]).apply(
-        get_comm_summary_stats, meta=pd.DataFrame())
-    stat_df = ddf.concat([main_df, comm_bridge_df], axis=1) # Column-wise
-    
-    # Aggregate left and right hemispheres. Neuropils with left and right sides
-    # contain underscores, e.g., ME_L and ME_R are the left and right hemisphere
-    # equivalents of the medulla
-    hemispheric = stat_df[stat_df.index.str.contains("_")] # Neuropil is index
-    hemispheric["base_neuropil"] = hemispheric["neuropil"].str.split("_").str[0]
-    combined_hemispheres = hemispheric.groupby("base_neuropil").apply(
-        get_summary_stats, meta=pd.DataFrame())
-    stat_df = ddf.concat([stat_df, combined_hemispheres]) # Row-wise
-    
-    # Sort rows and clean columns, then write to single csv file
-    stat_df = stat_df.reset_index().sort_values("neuropil")
-    stat_df = stat_df.rename(
-        columns = {"pre": "total_edges", "syn_count": "total_syn_count",
-                   "comm_pre": "comm_edges", "bridge_pre": "bridge_edges"})
-    stat_df["cb_edge_ratio"] = stat_df["comm_edges"] / stat_df["bridge_edges"]
-    stat_df["cb_synapse_ratio"] = stat_df["comm_syn_count"] / stat_df["bridge_syn_count"]
-    stat_df = stat_df[sorted(stat_df.columns)]
+    # Aggregate left and right hemisphere neuropils into single neuropil summary
+    # and add to stat_df
+    combined = df.groupby("base_neuropil").agg(easy_aggs)
+    stat_df = ddf.concat([stat_df, combined])
+
+    # Write to file
     outfile = os.path.join(outdir, "summary_stats_neuropils.csv")    
     stat_df.to_csv(outfile, write_index=True)
+
     
 
 
