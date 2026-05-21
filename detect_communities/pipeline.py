@@ -9,37 +9,44 @@ down, then returns the tagged connectome
 
 from dask import dataframe as ddf
 from dask.distributed import Client
-from queue import Queue
 
 type DDF = ddf.DataFrame
 
 
 def run(connectome: DDF, args) -> DDF:
     """ Submit component jobs then tag connectome with community IDs """
+    # Set-up controller including active future set
     client = get_client()
-    queue, communities = Queue(), []
-    initial_components = client.submit(graph_utils.get_components, connectome).result()
-    for component in initial_components:
-        queue.put(component)
+    active, communities = set(), []
+    init_comps = client.submit(graph_utils.get_components, connectome).result()
+    for comp in init_comps:
+        f = client.submit(mgn, comp, args.k)
+        active.add(f)
     
-    # Iterate until all connectome communities are found
-    while not queue.empty():
-        component = queue.get()
-        f = client.submit(modified_girvan_newman, component, args.madk)
-        new_components = f.result() # List of tuples (ddf, bool)
-        
-        for df, should_continue in new_components:
-            size_f = client.submit(count_edges, df)
-            size = size_f.result()
-            if size < args.minsize:
-                continue # Skip too-small components
-            if should_continue:
-                queue.put(df)
-            elif df:
-                communities.append(df)
+    while active: # While at least one component is still being/needs processed
+        done, active = client.wait(active, return_when='FIRST_COMPLETED')
+        for future in done:
+            og_comp, chopped = future.result()
+            
+            # Get number of edges in original and chopped dataframe
+            f = [client.submit(count_edges, chopped), 
+                 client.submit(count_edges, og_comp)]
+            edges_ch, edges_comp = client.gather(f)
+            
+            # Decide what to do based on number of edges and size
+            if edges_ch < edges_comp: # At least one edge was removed
+                new_comps = client.submit(graph_utils.get_components, chopped).result()
+                new_sizes = [client.submit(count_edges, nc) for nc in new_comps]
+                new_sizes = client.gather(new_sizes)
                 
-    tagged = tag_edges(connectome, communities)
-    return tagged
+                for new_comp, size in zip(new_comps, new_sizes):
+                    # Discard if too small, otherwise process further
+                    if size > args.minsize: 
+                        f = client.submit(mgn, new_comp, args.k)
+                        active.add(f)
+            
+            else: # Same number of edges as before - community found
+                communities.append(chopped)        
 
 
 def count_edges(df):
@@ -66,32 +73,15 @@ def tag_edges(connectome: DDF, communities: list[DDF]) -> DDF:
     return tagged
 
 
-def modified_girvan_newman(component: DDF, k: float) -> list[tuple[DDF,bool]]:
-    """ Remove bridge edges from component dataframe.
+def mgn(component: DDF, k: float) -> tuple[DDF]:
+    """ Remove bridge edges from component dataframe
     
-    k is used in get_upper_threshold() as a multiplier.
-    
-    Returns a list of tuples containing component dataframes and a boolean for
-    whether processing should continue. 
-    
-    If bool continue is True, the caller should apply another round of modified
-    girvan newman on each of the returned component dataframes. continue = False
-    occurs when no edges can be removed from the component (community found).
+    Modified Girvan Newman. k is used in get_upper_threshold() as a multiplier.
+    Returns the original component and the 'chopped' dataframe.
     
     """
     component = graph_utils.prune(component)
-    
     edge_scores = edge_scoring.get_edge_scores(component)
     upper_score_threshold = edge_scoring.get_upper_threshold(edge_scores, k)
-    new_df, num_chopped = edge_scoring.chop(
-        component, edge_scores, upper_score_threshold)
-    
-    if num_chopped == 0: # Community found - don't continue processing
-        return [(new_df, False)]
-    
-    # Further processing required
-    new_components = graph_utils.get_components(new_df)
-    to_return = []
-    for component in new_components:
-        to_return.append((component, True))
-    return to_return
+    new_df = edge_scoring.chop(component, edge_scores, upper_score_threshold)
+    return (component, new_df)

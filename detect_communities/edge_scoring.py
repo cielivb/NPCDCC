@@ -17,6 +17,7 @@ def get_upper_threshold(edge_scores: DDF) -> ...:
     raise NotImplementedError
 
 
-def chop(df: DDF, edge_scores: DDF, upper_thresh: ...) -> tuple[DDF, ...]:
+def chop(df: DDF, edge_scores: DDF, upper_thresh: ...) -> DDF:
+    """ Return dataframe with edges that exceeded thresh removed """
     raise NotImplementedError
     
