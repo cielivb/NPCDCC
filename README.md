@@ -2,7 +2,7 @@
 
 ## Result Replication - Quick start
 1. Download the raw data files into the repo's data directory (see Downloading required files section below)
-2. In the repo root directory, execute `python preprocess.py` - this converts the raw data to parquet files and generates additional test files
+2. In the repo root directory, execute `python preprocess.py` - this converts the raw data to parquet files and generates additional test files. This took about ~10 minutes on my local machine.
 3. TODO
 
 ## Original data source
