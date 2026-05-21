@@ -35,17 +35,19 @@ def fetch_from_zenodo(file_path):
     
     if not os.path.exists(file_path):
         DOI = "https://doi.org/10.5281/zenodo.10676866"
-        if filename == "flywire_synapses_783.feather":
-            print(f"\nDownloading {filename} (9.5 GB) from Zenodo ... \n")
-        else:
-            print(f"\nDownloading {filename} (812 MB) from Zenodo ...\n")
-        download(record_or_doi=DOI, output_dir=file_path, file_glob=filename,
+        print(f"\nDownloading {filename} from Zenodo ... \n")
+        download(record_or_doi=DOI, output_dir=DATA_DIR, file_glob=filename,
                  continue_on_error=True, verbosity=3)
         print(f"\nDownloaded {filename} successfully\n")
+    
+        # Validate download
+        if filename == "proofread_connections_783.feather":
+            expected_min_size = 800 * 1024 * 1024  # >800 MB
+        else:
+            expected_min_size = 9.5 * 1024 * 1024 * 1024 # >9.5 GB
+        if os.path.getsize(file_path) < expected_min_size:
+            raise RuntimeError("Download incomplete — file too small.")        
         
-    # File is downloaded to a folder in output directory (input file_path) with
-    # same name as file. Return path to actual feather file
-    file_path = os.path.join(DATA_DIR, filename, filename)
     return file_path
 
 
@@ -81,7 +83,7 @@ def feather_to_parquet(file_to_convert, destination):
     filename = os.path.basename(file_to_convert)
     print(f"\nConverting {filename} to parquet ...\n")
     chunk_size = 250_000
-    reader = pyarrow.ipc.open_file(file_to_convert) # Create streaming reader
+    reader = pyarrow.ipc.RecordBatchFileReader(pyarrow.memory_map(file_to_convert)) # Create streaming reader
     writer = None
     
     for i in range(reader.num_record_batches):
