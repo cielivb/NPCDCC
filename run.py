@@ -50,6 +50,7 @@ import detect_communities
 
 
 CLIENT = None # Assigned in start_cluster()
+dask.config.set({"dataframe.shuffle.method": "tasks"})
 
 ROOT_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(ROOT_DIR, "data")
@@ -88,7 +89,6 @@ def start_cluster(num_cores):
         dashboard_address=":8787"
     )
     CLIENT = Client(cluster)
-    dask.config.set({"dataframe.shuffle.method": "tasks"})    
 
 
 def load_connectome(file) -> ddf.DataFrame:

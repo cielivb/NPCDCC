@@ -10,11 +10,15 @@ import os
 import pyarrow
 import pyarrow.feather as feather
 import pyarrow.parquet as pq
+import dask
+from concurrent.futures import ThreadPoolExecutor
+from dask import dataframe as ddf
 from dask.distributed import Client
 from dask.distributed import LocalCluster
 from detect_communities import get_all_nodes  
 
 CLIENT = None # Assigned at bottom of script
+dask.config.set({"dataframe.shuffle.method": "tasks"})
 
 ROOT_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(ROOT_DIR, "data")
@@ -23,7 +27,7 @@ COORD_FILE_RAW = os.path.join(DATA_DIR, "flywire_synapses_783.feather")
 MAIN_FILE = os.path.join(DATA_DIR, "proofread_connections_783.parquet")
 COORD_FILE = os.path.join(DATA_DIR, "flywire_synapses_783.parquet")
 
-
+METADATA_FILE = os.path.join(DATA_DIR, "metadata.txt")
 
 
 ############################### PREPROCESS #####################################
@@ -57,7 +61,7 @@ def feather_to_parquet(file_to_convert, destination):
     """
     filename = os.path.basename(file_to_convert)
     print(f"\nConverting {filename} to parquet ...\n")
-    chunk_size = 250_000
+    chunk_size = 500_000
     reader = pyarrow.ipc.open_file(file_to_convert) # Create streaming reader
     writer = None
     
@@ -69,70 +73,83 @@ def feather_to_parquet(file_to_convert, destination):
         # schema is supplied by the table, hence cannot do this step outside
         # the for loop.
         if writer is None:
-            writer = pq.ParquetWriter(destination, table.schema)
+            writer = pq.ParquetWriter(destination, table.schema, compression="snappy")
             
-        # Write batch into row groups of chunk size. Chunk size of 250,000
-        # means 250,000 rows per row group/chunk. Currently do not know how
+        # Write batch into row groups of chunk size. Chunk size of 500,000
+        # means 500,000 rows per row group/chunk. Currently do not know how
         # large the batches are in the feather file but they could be much 
-        # larger than 250,000. If they are, it will dramatically slow down
-        # the pipeline. 250,000 rows per chunk seems to be a healthy middle ground.
-        writer.write_table(table, row_group_size = chunk_size)
+        # larger than 500,000. If they are, it will dramatically slow down
+        # the pipeline (although I could always just repartition later). 
+        # 500,000 rows per chunk might be a little large (ideally would be more
+        # like 250,000) but this should speed up the preprocessing stage.
+        writer.write_table(table, row_group_size=chunk_size)
         
     writer.close()
     print(f"\nConverted {filename} to parquet\n")
     
 
 def write_test_metadata(sub_connectome, test_id):
-    global METADATA_FILE
-    """ Write test connectome file metadata 
+    """ Write test connectome file metadata
     E.g., number of nodes, number of edges, node:edge ratio, neuropils """
-    num_nodes = get_all_nodes(
-        sub_connectome, 
-        node_cols=["pre_pt_root_id","post_pt_root_id"]).count().compute()
-    num_edges = sub_connectome["pre_pt_root_id"].count().compute()
-    node_edge_ratio = num_nodes/num_edges
-    neuropils = list(sub_connectome["neuropil"].unique().compute())
+    global METADATA_FILE    
+    num_nodes = get_all_nodes(sub_connectome, 
+        node_cols=["pre_pt_root_id","post_pt_root_id"]).count()
+    num_edges = sub_connectome["pre_pt_root_id"].count()
+    neuropils = sub_connectome["neuropil"].unique()
+    
+    num_nodes, num_edges, neuropils = dask.compute(
+        num_nodes, num_edges, neuropils)
+    node_edge_ratio = num_nodes/num_edges    
+    
     with open(METADATA_FILE, "a") as mfile:
         mfile.write(f"Testfile Metadata: {test_id}.feather\n")
         mfile.write(f"Number of nodes: {num_nodes}\n")
         mfile.write(f"Number of edges: {num_edges}\n")
         mfile.write(f"Node-edge ratio: {node_edge_ratio}\n")
-        mfile.write(f"Neuropils: {neuropils}\n\n")
-    
+        mfile.write(f"Neuropils: {list(neuropils)}\n\n")
+
 
 def write_subset_file(sub_connectome, test_id):
-    """ Write feather file containing sub-connectome. 
-    These tests should fit in memory so am using non-streaming conversion. 
-    Saving as feather file to match full dataset file type. """
-    global OUT_DIR
-    filename = os.path.join(OUT_DIR, f"{test_id}.parquet")
-    sub_connectome.to_parquet(filename)
+    """ Write parquet file containing sub-connectome. 
+    These tests should fit in memory so will compute to pandas first to avoid
+    saving them in their own directories """
+    global DATA_DIR
+    filename = os.path.join(DATA_DIR, f"{test_id}.parquet")
+    pd_sub_connectome = sub_connectome.compute()
+    pd_sub_connectome.to_parquet(filename, index=False, compression="snappy")
     
     
 def make_tests(main_file, test_ids, test_paths):
     """ Create subsets of main file of varying sizes for performance analysis """
     print(f"\nGenerating test parquet files ...\n")
     connectome = ddf.read_parquet(main_file)
+    connectome = connectome.categorize(columns=["neuropil"]).persist()    
     
     # Subset dataframe into different sizes
-    tiny = connectome[connectome["neuropil"].str.startswith("BU_")]
-    small = connectome[connectome["neuropil"].str.startswith("LOP_")]
-    medium = connectome[connectome["neuropil"].str.startswith("ME_")]    
+    tiny = connectome.map_partitions(
+        lambda df: df[df["neuropil"].str.startswith("BU_")])
+    small = connectome.map_partitions(
+        lambda df: df[df["neuropil"].str.startswith("LOP_")])   
+    medium = connectome.map_partitions(
+        lambda df: df[df["neuropil"].str.startswith("ME_")])    
     omit = {"ME_L", "ME_R", "LOP_L", "LOP_R"}
-    large = connectome[~connectome["neuropil"].isin(omit)]
+    large = connectome.map_partitions(
+        lambda df: df[~df["neuropil"].isin(omit)])
     
     # Write subset data 
-    # TODO - could parallelise but unlikely to be a bottleneck
     subsets = [tiny, small, medium, large]
+    futures = []
     for sub_connectome, test_id in zip(subsets, test_ids):
+        futures.append(CLIENT.submit(write_subset_file, sub_connectome, test_id))
         write_test_metadata(sub_connectome, test_id)
-        write_subset_file(sub_connectome, test_id)
+    CLIENT.gather(futures)
     print(f"\nGenerated test parquet files\n")
 
 
 ################################### MAIN #######################################
 
 def initialise_client():
+    global CLIENT
     cluster = LocalCluster(
         n_workers=2,
         processes=True,
@@ -140,18 +157,25 @@ def initialise_client():
         memory_limit = "6GB",
         dashboard_address=":8787"
     )
-    client = Client(cluster)
-    return client
+    CLIENT = Client(cluster)
 
 
 def main():
-    """ Download and convert raw data """
-    global MAIN_FILE_RAW, COORD_FILE_RAW
-    CLIENT = initialise_client()
-    file_paths_f = CLIENT.submit(preprocess_main_file, MAIN_FILE_RAW)
-    coord_path_f = CLIENT.submit(preprocess_coord_file, COORD_FILE_RAW)
-    file_paths = file_paths_f.result()
-    coord_path = coord_path_f.result()
+    """ Convert raw data """
+    global MAIN_FILE_RAW, COORD_FILE_RAW, CLIENT
+    initialise_client()
+    # The threads of this main process are distinct from the main threads of
+    # the dask worker processes, and pure python tasks are completed before
+    # dask tasks depending on the results of those pure python tasks are started, 
+    # so using ThreadPoolExecutor to process both files in parallel should
+    # be safe
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(preprocess_main_file, MAIN_FILE_RAW)
+        f2 = pool.submit(preprocess_coord_file, COORD_FILE_RAW)
+    
+        file_paths = f1.result()
+        coord_path = f2.result()
+        
     print(f"\n\nPreprocessing complete!")
     
 

@@ -106,9 +106,9 @@ def get_all_nodes(df: ddf.DataFrame, node_cols=["pre","post"]) -> db.Bag:
     return unique_nodes
     
     
-def get_num_nodes(df: ddf.DataFrame) -> int:
-    """ Compute the number of unique nodes present in a dataframe """
-    return get_all_nodes.count().compute()
+def get_num_nodes(df: ddf.DataFrame):
+    """ Get the number of unique nodes present in a dataframe """
+    return get_all_nodes.count()
 
 
 def create_state_df(component: ddf.DataFrame) -> ddf.DataFrame:
