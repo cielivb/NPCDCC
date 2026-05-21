@@ -1,8 +1,7 @@
 """ Preprocess raw data 
 
-Download raw data from Zenodo if not already in data directory, then convert
-raw data from feather files to parquet files, and generate scalability test
-files of varying problem sizes.
+Convert raw data from feather files to parquet files, and generate scalability 
+test files of varying problem sizes.
 
 This script should only need to be ran once.
 
@@ -14,7 +13,6 @@ import pyarrow.parquet as pq
 from dask.distributed import Client
 from dask.distributed import LocalCluster
 from detect_communities import get_all_nodes  
-from zenodo_get import download
 
 CLIENT = None # Assigned at bottom of script
 
@@ -26,29 +24,6 @@ MAIN_FILE = os.path.join(DATA_DIR, "proofread_connections_783.parquet")
 COORD_FILE = os.path.join(DATA_DIR, "flywire_synapses_783.parquet")
 
 
-################################## FETCH #######################################
-
-def fetch_from_zenodo(file_path):
-    """ Fetch file from Zenodo via internet if not already downloaded """
-    global DATA_DIR
-    filename = os.path.basename(file_path)
-    
-    if not os.path.exists(file_path):
-        DOI = "https://doi.org/10.5281/zenodo.10676866"
-        print(f"\nDownloading {filename} from Zenodo ... \n")
-        download(record_or_doi=DOI, output_dir=DATA_DIR, file_glob=filename,
-                 continue_on_error=True, verbosity=3)
-        print(f"\nDownloaded {filename} successfully\n")
-    
-        # Validate download
-        if filename == "proofread_connections_783.feather":
-            expected_min_size = 800 * 1024 * 1024  # >800 MB
-        else:
-            expected_min_size = 9.5 * 1024 * 1024 * 1024 # >9.5 GB
-        if os.path.getsize(file_path) < expected_min_size:
-            raise RuntimeError("Download incomplete — file too small.")        
-        
-    return file_path
 
 
 ############################### PREPROCESS #####################################
@@ -83,7 +58,7 @@ def feather_to_parquet(file_to_convert, destination):
     filename = os.path.basename(file_to_convert)
     print(f"\nConverting {filename} to parquet ...\n")
     chunk_size = 250_000
-    reader = pyarrow.ipc.RecordBatchFileReader(pyarrow.memory_map(file_to_convert)) # Create streaming reader
+    reader = pyarrow.ipc.open_file(file_to_convert) # Create streaming reader
     writer = None
     
     for i in range(reader.num_record_batches):
@@ -159,10 +134,10 @@ def make_tests(main_file, test_ids, test_paths):
 
 def initialise_client():
     cluster = LocalCluster(
-        n_workers=3,
+        n_workers=2,
         processes=True,
         threads_per_worker=1,
-        memory_limit = "4GB",
+        memory_limit = "6GB",
         dashboard_address=":8787"
     )
     client = Client(cluster)
@@ -171,16 +146,13 @@ def initialise_client():
 
 def main():
     """ Download and convert raw data """
-    global MAIN_FILE_RAW, COORD_FILE_RAW, MAIN_FILE, COORD_FILE
+    global MAIN_FILE_RAW, COORD_FILE_RAW
     CLIENT = initialise_client()
-    main_file_raw_path_f = CLIENT.submit(fetch_from_zenodo, MAIN_FILE_RAW)
-    coord_file_raw_path_f = CLIENT.submit(fetch_from_zenodo, COORD_FILE_RAW)
-    file_paths_f = CLIENT.submit(preprocess_main_file, main_file_raw_path_f)
-    coord_path_f = CLIENT.submit(preprocess_coord_file, coord_file_raw_path_f)
+    file_paths_f = CLIENT.submit(preprocess_main_file, MAIN_FILE_RAW)
+    coord_path_f = CLIENT.submit(preprocess_coord_file, COORD_FILE_RAW)
     file_paths = file_paths_f.result()
     coord_path = coord_path_f.result()
     print(f"\n\nPreprocessing complete!")
-    print(f"You should be able to execute run.py directly now.")
     
 
 if __name__ == "__main__":
