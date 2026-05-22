@@ -5,6 +5,7 @@ from dask import dataframe as ddf
 from typing import TypeAlias
 
 DDF: TypeAlias = ddf.DataFrame
+PDF: TypeAlias = pd.DataFrame
 
 
 def get_all_node_ids(df: DDF, node_cols=["pre","post"]) -> DDF:
@@ -14,12 +15,18 @@ def get_all_node_ids(df: DDF, node_cols=["pre","post"]) -> DDF:
     return all_nodes
 
 
-def undirect_df():
+def undirect_df(df: DDF|PDF):
+    raise NotImplementedError
+
+
+def create_state_df(df: DDF|PDF):
     raise NotImplementedError
 
 
 def get_components(df: DDF) -> list[DDF]:
     """ Return a list of component dataframes.
+    
+    DRIVER version of get_components
    
     For each component in the graph represented in df, return a dataframe 
     containing data for each edge of that component. This is done by performing
@@ -27,9 +34,62 @@ def get_components(df: DDF) -> list[DDF]:
     components. Only one component can be discovered at a time.
 
     """    
-    raise NotImplementedError
+    undirected_df = undirect_df(df)
+    state = create_state_df(df)
+    components = []
+    
+    while not (state["state"] == "P").all().compute():
+        
+        # Get nodes present in next component
+        start_node = state[state["state"] == "U"].head(1).index.compute()[0]
+        state, pc_df = pbfs(start_node, undirected_df, state, full=False)
+        comp_nodes = get_all_nodes(
+            pc_df, node_cols=["parent","child"]).to_frame(name="node")
+        
+        # Build component dataframe
+        merged1 = comp_nodes.merge(df, left_on="node", right_index=True, how="inner")
+        merged2 = comp_nodes.merge(df, left_on="node", right_on="post", how="inner")
+        component_df = ddf.concat([merged1, merged2]).drop_duplicates().persist()
+        components.append(component_df)
+
+    return components
 
 
+def get_components_pd(df: DDF) -> list[DDF]:
+    """ Return a list of component dataframes.
+    
+    WORKER version of get_components
+    
+    For each component in the graph represented in df, return a dataframe 
+    containing data for each edge of that component. This is done by performing
+    iteratively performing parallel BFS to identify nodes belonging to different
+    components. Only one component can be discovered at a time.
+
+    """
+    undirected_df = undirect_df(df)
+    state = create_state_df(df)
+    components = []
+    
+    while not (state["state"] == "P").all():
+        
+        # Get nodes present in next component
+        start_node = state[state["state"] == "U"].head(1).index[0]
+        state, pc_df = pbfs_pd(start_node, undirected_df, state, full=False)
+        comp_nodes = get_all_nodes(
+            pc_df, node_cols=["parent", "child"]).to_frame(name="node")
+
+        # Build component dataframe
+        merged1 = comp_nodes.merge(df, left_on="node", right_index=True, how="inner")
+        merged2 = comp_nodes.merge(df, left_on="node", right_on="post", how="inner")
+        component_df = pd.concat([merged1, merged2]).drop_duplicates()
+        components.append(component_df)
+    
+    dask_comps = []
+    for comp in components:
+        dask_comps.append(ddf.from_pandas(comp))
+    return dask_comps
+
+    
 def prune(df: DDF) -> DDF:
     """ Iteratively remove degree 1 edges from a component dataframe 
     
@@ -85,7 +145,7 @@ def prune_pd(df: DDF) -> DDF:
     """    
     pruned = df.compute() # Convert to pandas
     
-    def get_degree_1_nodes(df: pd.DataFrame) -> pd.DataFrame:
+    def get_degree_1_nodes(df: PDF) -> PDF:
         node_degrees = df.groupby(df.index)["post"].nunique().to_frame("degree")
         deg1_nodes = node_degrees[
             node_degrees["degree"] == 1].index.to_frame("node")

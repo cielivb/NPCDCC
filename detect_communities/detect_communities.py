@@ -157,17 +157,17 @@ def get_components(df: ddf.DataFrame) -> list[ddf.DataFrame]:
     while not (state["state"] == "P").all().compute():
         
         # Get nodes present in next component
-        start_node = state[state["state"] == "U"]["state"].index.min().compute()
+        start_node = state[state["state"] == "U"].head(1).index.compute()[0]
         results = pbfs(start_node, undirected_df, state, full=False)
         state, pc_df = results[0], results[1]
         component_nodes = get_all_nodes(
-            pc_df, node_cols=["parent","child"]).to_dataframe(meta={"node":int})
+            pc_df, node_cols=["parent","child"]).to_frame()
         
         # Create and append dataframe from component nodes
         merged1 = component_nodes.merge(df, left_on="node", right_index=True, 
-                                        how="inner").persist()
+                                        how="inner")
         merged2 = component_nodes.merge(df, left_on="node", right_on="post", 
-                                        how="inner").persist()
+                                        how="inner")
         component_df = ddf.concat([merged1, merged2]).drop_duplicates().persist()
         components.append(component_df)
 
