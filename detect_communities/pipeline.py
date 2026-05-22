@@ -7,6 +7,7 @@ down, then returns the tagged connectome
 
 """
 import dask
+from collections import defaultdict
 from dask import dataframe as ddf
 from dask.distributed import Client
 
@@ -36,6 +37,81 @@ def is_community(og_comp, proc_comp) -> bool:
     return True if num_edges_og == num_edges_proc else False
 
 
+def decide_fates(client, proc_comp, og_comp=None):
+    """ Inspect girvan newman results to decide component fates """
+    communities, small_comps, big_comps = set(), set(), set()
+    if og_comp and is_community(og_comp, proc_comp):
+        communities.append(og_comp)
+    else:
+        new_comps = graph_utils.get_components(proc_comp)
+        for comp in new_comps:
+            if send_to_worker(comp, max_worker_df_size):
+                f = client.submit(worker_gn, comp)
+                small_comps.add(f)
+            else:
+                big_comps.add(comp)    
+    return communities, small_comps, big_comps
+
+
+def process_small_pipeline_results(client, chop_futures):
+    """ Process small components that have reached the end of the pipeline """
+    communities, to_prune, big_comps = set(), set(), set()
+    if chop_futures:
+        done, chop_futures = client.wait(chop_futures, return_when="FIRST_COMPLETED")
+        for proc_comp, og_comp in done:
+            comms, tp, big = decide_fates(proc_comp, og_comp)
+            communities.update(comms), to_prune.update(tp), big_comps.update(big)
+    return chop_futures, communities, to_prune, big_comps
+
+
+def process_agg_futures(client, agg_futures):
+    """ Process small components that are ready to be 'chopped' (i.e., have 
+    final/aggregated edge scores available)"""
+    chop_futures = set()
+    if agg_futures:
+        done, agg_futures = client.wait(agg_futures, return_when="FIRST_COMPLETED")
+        for comp, score_df in done:
+            f = client.submit(chop, comp, score_df)
+            chop_futures.add(f)    
+    return agg_futures, chop_futures
+
+
+def process_esp_dict(client, esp):
+    """ Process small components that have all initial edge scores available """
+    agg_futures = set()
+    for comp_id, future_list in esp.items():
+        ready = map(lambda f: f.done(), future_list).all()
+        if ready:
+            f = client.submit(aggregate_scores, comp, future_list)
+            agg_futures.add(f)
+            del esp[comp_id]
+    return esp, agg_futures
+
+
+def process_pruned_futures(client, pruned_futures, esp, next_id):
+    """ Parallelise getting initial edge scores for each small pruned component """
+    if pruned_futures:
+        done, pruned_futures = client.wait(pruned_futures, return_when="FIRST_COMPLETED")
+        for comp in done:
+            comp_id = next_id
+            next_id += 1
+            start_nodes = get_start_nodes(comp).compute()
+            for s in start_nodes:
+                f = client.submit(get_scores, comp, s)
+                esp[comp_id].add(f)
+    return pruned_futures, esp, next_id
+
+
+def process_to_prune(client, to_prune):
+    """ Prune small components in to_prune """
+    pruned_futures = set()
+    if to_prune:
+        for comp in to_prune:
+            f = client.submit(prune, comp)
+            pruned_futures.add(f)
+    return pruned_futures
+            
+    
 def run(connectome: DDF, args) -> DDF:
     """ Detect and label communities in connectome. 
     
@@ -48,52 +124,46 @@ def run(connectome: DDF, args) -> DDF:
     Goal 2: parallelise as much as possible while respecting the constraints of
     parallel breadth first search (PBFS). PBFS is the core algorithm supporting
     community detection, but its control flow means it requires computes on
-    dask dataframes, meaning workers cannot run a pure dask PBFS on their
+    dask dataframes, meaning workers cannot usually run a pure dask PBFS on their
     assigned components. Workers must run a pandas PBFS on their components 
     instead, but this requires bringing dataframes into memory. It is crucial
     to separate components that can be processed by workers from components that
     are too large for workers.
     
-    """
-    # Set-up controller variables
-    client = get_client()
+    """    
+    # Set up controller variables
+    client, next_id = get_client(), 0
     max_worker_df_size = get_worker_df_size(client)
-    big_comps, small_comps, communities = set(), set(), []
-    
-    def decide_fates(proc_comp, og_comp=None):
-        """ Inspect girvan newman results to decide component fates """
-        if og_comp and is_community(og_comp, proc_comp):
-            communities.append(og_comp)
-        else:
-            new_comps = graph_utils.get_components(proc_comp)
-            for comp in new_comps:
-                if send_to_worker(comp, max_worker_df_size):
-                    f = client.submit(worker_gn, comp)
-                    small_comps.add(f)
-                else:
-                    big_comps.add(comp)       
-                
+    agg_futures, chop_futures = set(), set()
+    esp = defaultdict(set) # edge score progress dictionary
+                    
     # Get and allocate initial components
-    init_components = graph_utils.get_components(connectome)
-    decide_fates(init_components)
-            
+    communities, to_prune, big_comps = decide_fates(client, connectome)
+    
     # Enter control loop - continue breaking connectome components down into
     # communities until no more components remain to be processed
     while len(big_comps) > 0 or len(small_comps) > 0:
         
         # Process one big component
         if len(big_comps) > 0:
-            big_comp = big_comps.pop()
-            proc_comp = driver_gn(big_comp)
-            decide_fates(proc_comp, big_comp)
-            
-        # Decide what to do with finished small components
-        if len(small_comps) > 0:
-            done, small_comps = client.wait(small_comps, return_when="FIRST_COMPLETED")
-            for og_comp, proc_comp in done:
-                decide_fates(proc_comp, big_comp)
-                
-    # All communities found - can now tag connectome
+            proc_comp = driver_gn(big_comps.pop())
+            decide_fates(client, proc_comp, big_comp)
+        
+        # Process small components that have reached the end of the pipeline
+        cf, comms, tp, big = process_small_pipeline_results(client, chop_futures)
+        chopped_futures = cf
+        communities.update(comms), to_prune.update(tp), big_comps.update(big_comps)
+
+        # Shuffle small and ready components one step forward through pipeline
+        agg_futures, new_chop_futures = process_agg_futures(client, agg_futures)
+        chop_futures.update(new_chop_futures)
+        esp, new_agg_futures = process_esp_dict(client, esp)
+        agg_futures.update(new_agg_futures)
+        pruned_futures, esp, next_id = process_pruned_futures(
+            client, pruned_futures, esp, next_id)
+        pruned_futures.update(process_to_prune(client, to_prune))
+        to_prune = set()
+    
     return tag(connectome, communities).persist()
 
 
@@ -115,6 +185,20 @@ def tag(connectome: DDF, communities: list[DDF]) -> DDF:
                               how="left")
     tagged = tagged.sort_values(["neuropil", "community_id"]).persist()
     return tagged
+
+
+def driver_mgn() -> DDF:
+    """ 
+    Return the processed dataframe after applying pure dask modified girvan 
+    newman. """
+    raise NotImplementedError
+
+
+def worker_mgn() -> tuple[DDF]:
+    """ 
+    Return the original component dataframe and the processed dataframe after 
+    applying pandas-supported girvan newman """
+    raise NotImplementedError
 
 
 #def mgn(component: DDF, k: float) -> tuple[DDF]:
