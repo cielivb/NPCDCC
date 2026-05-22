@@ -19,13 +19,13 @@ def get_all_node_ids(df: DDF|PDF, node_cols=["pre","post"]) -> DDF:
 
 
 def undirect_df(df: DDF|PDF):
-    """ Add b->a for every a->b in df, and remove duplicates """
+    """ Add b->a for every a->b in df """
     df_reversed = df.rename(columns={"pre": "post", "post": "pre"})
     if isinstance(df, PDF):
-        undirected = pd.concat([df, df_reversed]).drop_duplicates()
+        undirected = pd.concat([df, df_reversed])
         undirected = undirected.set_index("pre", drop = False)
     else:
-        undirected = ddf.concat([df, df_reversed]).drop_duplicates()
+        undirected = ddf.concat([df, df_reversed])
         undirected = undirected.set_index("pre", drop = False).persist()    
     return undirected
 
@@ -69,10 +69,10 @@ def get_components(df: DDF) -> list[DDF]:
         component_df = ddf.concat([merged1, merged2]).drop_duplicates().persist()
         components.append(component_df)
 
-    return components
+    return components.persist()
 
 
-def get_components_pd(df: DDF) -> list[DDF]:
+def get_components_pd(dask_df: DDF) -> list[DDF]:
     """ Return a list of component dataframes.
     
     WORKER version of get_components
@@ -83,6 +83,7 @@ def get_components_pd(df: DDF) -> list[DDF]:
     components. Only one component can be discovered at a time.
 
     """
+    df = dask_df.compute() # Convert to pandas
     undirected_df = undirect_df(df)
     state = create_state_df(df)
     components = []
@@ -103,7 +104,7 @@ def get_components_pd(df: DDF) -> list[DDF]:
     
     dask_comps = []
     for comp in components:
-        dask_comps.append(ddf.from_pandas(comp, npartitions=1))
+        dask_comps.append(ddf.from_pandas(comp, npartitions=1).persist())
     return dask_comps
 
     
@@ -141,10 +142,10 @@ def prune(df: DDF) -> DDF:
         pruned = merged[merged["_merge"] == "left_only"].drop(columns=["_merge"]).persist()
         deg1_nodes = get_degree_1_nodes(pruned)
         
-    return pruned
+    return pruned.persist()
 
 
-def prune_pd(df: DDF) -> DDF:
+def prune_pd(dask_df: DDF) -> DDF:
     """ Iteratively remove degree 1 edges from a component dataframe 
     
     WORKER version of prune
@@ -160,7 +161,7 @@ def prune_pd(df: DDF) -> DDF:
     to process the longest 'chain'.
 
     """    
-    pruned = df.compute() # Convert to pandas
+    pruned = dask_df.compute() # Convert to pandas
     
     def get_degree_1_nodes(df: PDF) -> PDF:
         node_degrees = df.groupby(df.index)["post"].nunique().to_frame("degree")
@@ -181,4 +182,4 @@ def prune_pd(df: DDF) -> DDF:
         pruned = merged[merged["_merge"] == "left_only"].drop(columns=["_merge"])
         deg1_nodes = get_degree_1_nodes(pruned)
     
-    return ddf.from_pandas(pruned, npartitions=1)
+    return ddf.from_pandas(pruned, npartitions=1).persist()

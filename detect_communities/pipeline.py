@@ -93,8 +93,8 @@ def process_agg_futures(client, agg_futures, k):
     chop_futures = set()
     if agg_futures:
         done, agg_futures = client.wait(agg_futures, return_when="FIRST_COMPLETED")
-        for comp, score_df in done:
-            f = client.submit(edge_scoring.chop_pd, comp, score_df, k)
+        for comp_w_scores in done:
+            f = client.submit(edge_scoring.chop_pd, comp_w_scores, k)
             chop_futures.add(f)    
     return agg_futures, chop_futures
 
@@ -106,7 +106,7 @@ def process_esp_dict(client, esp):
         comp, future_list = comp_tup[0], comp_tup[1]
         ready = all(f.done() for f in future_list)
         if ready:
-            f = client.submit(edge_scoring.aggregate_scores_pd, comp, future_list)
+            f = client.submit(edge_scoring.aggregate_scores, comp, future_list)
             agg_futures.add(f)
             del esp[comp_id]
     return esp, agg_futures
