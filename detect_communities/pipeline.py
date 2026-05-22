@@ -243,7 +243,7 @@ def driver_mgn(component: DDF, k: float) -> tuple[DDF]:
     
     """
     pruned_component = graph_utils.prune(component)
-    edge_scores = edge_scoring.get_edge_scores(pruned_component)
+    edge_scores = edge_scoring.get_edge_scores(pruned_component) # TODO - update
     upper_score_threshold = edge_scoring.get_upper_threshold(edge_scores, k)
     new_df = edge_scoring.chop(pruned_component, edge_scores, upper_score_threshold)
     return (new_df, component)

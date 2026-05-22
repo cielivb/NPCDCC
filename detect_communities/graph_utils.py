@@ -103,7 +103,7 @@ def get_components_pd(df: DDF) -> list[DDF]:
     
     dask_comps = []
     for comp in components:
-        dask_comps.append(ddf.from_pandas(comp))
+        dask_comps.append(ddf.from_pandas(comp, npartitions=1))
     return dask_comps
 
     
@@ -181,4 +181,4 @@ def prune_pd(df: DDF) -> DDF:
         pruned = merged[merged["_merge"] == "left_only"].drop(columns=["_merge"])
         deg1_nodes = get_degree_1_nodes(pruned)
     
-    return ddf.from_pandas(pruned)
+    return ddf.from_pandas(pruned, npartitions=1)
