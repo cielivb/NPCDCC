@@ -8,19 +8,36 @@ DDF: TypeAlias = ddf.DataFrame
 PDF: TypeAlias = pd.DataFrame
 
 
-def get_all_node_ids(df: DDF, node_cols=["pre","post"]) -> DDF:
-    """ Return a series of every unique node/neuron id in the dataframe """
-    node_cols = [df[col].rename("node_id") for col in node_cols]
-    all_nodes = ddf.concat(node_cols)
+def get_all_node_ids(df: DDF|PDF, node_cols=["pre","post"]) -> DDF:
+    """ Return a dataframe containing every unique node id in the dataframe """
+    node_cols = [df[col].rename("node_id").to_frame() for col in node_cols]
+    if isinstance(df, PDF):
+        all_nodes = pd.concat(node_cols)
+    else:
+        all_nodes = ddf.concat(node_cols)
     return all_nodes
 
 
 def undirect_df(df: DDF|PDF):
-    raise NotImplementedError
+    """ Add b->a for every a->b in df, and remove duplicates """
+    df_reversed = df.rename(columns={"pre": "post", "post": "pre"})
+    if isinstance(df, PDF):
+        undirected = pd.concat([df, df_reversed]).drop_duplicates()
+        undirected = undirected.set_index("pre", drop = False)
+    else:
+        undirected = ddf.concat([df, df_reversed]).drop_duplicates()
+        undirected = undirected.set_index("pre", drop = False).persist()    
+    return undirected
 
 
 def create_state_df(df: DDF|PDF):
-    raise NotImplementedError
+    """ Return either a dask or pandas state dataframe depending on input """
+    state = get_all_node_ids(df).drop_duplicates()
+    state["state"] = "U"
+    state = state.set_index("node_id")
+    if isinstance(df, DDF):
+        state = state.persist()
+    return state
 
 
 def get_components(df: DDF) -> list[DDF]:
