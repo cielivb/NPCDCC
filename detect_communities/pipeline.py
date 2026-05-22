@@ -15,18 +15,22 @@ type DDF = ddf.DataFrame
 
 
 def get_worker_df_size(client) -> float:
-    """ Return maximum pandas dataframe size based on worker RAM allowance """
+    """ Return maximum pandas dataframe size based on worker RAM allowance """  
     # Get the minimum worker RAM allocation
-    # Calculate safe dataframe size (0.25 x min RAM allocation)
-    # Return safe dataframe size
-    raise NotImplementedError
+    all_info, min_ram = client.scheduler_info(), None
+    for worker, info in all_info["workers"].items():
+        gb = info["memory_limit"] / (1024**3)
+        min_ram = gb if (not min_ram or gb < min_ram) else min_ram
+    
+    # Calculate and return safe dataframe size (0.25 x min RAM allocation)
+    safe_size = 0.25 * min_ram # in gigabytes
+    return safe_size
 
 
-def send_to_worker(component, max_worker_df_size):
-    """ Return True if worker can handle component size """
-    # Get component size
-    # True if component_size < max_worker_df_size else False
-    raise NotImplementedError
+def send_to_worker(component: DDF, max_worker_df_size: float):
+    """ Return True if worker can handle dask dataframe component size """
+    comp_gb = component.memory_usage(deep = False).sum().compute() / 1024**3
+    return comp_gb < max_worker_df_size
 
 
 def is_community(og_comp, proc_comp) -> bool:
@@ -37,41 +41,58 @@ def is_community(og_comp, proc_comp) -> bool:
     return True if num_edges_og == num_edges_proc else False
 
 
-def decide_fates(client, proc_comp, og_comp=None):
-    """ Inspect girvan newman results to decide component fates """
-    communities, small_comps, big_comps = set(), set(), set()
-    if og_comp and is_community(og_comp, proc_comp):
-        communities.append(og_comp)
-    else:
-        new_comps = graph_utils.get_components(proc_comp)
-        for comp in new_comps:
-            if send_to_worker(comp, max_worker_df_size):
-                f = client.submit(worker_gn, comp)
-                small_comps.add(f)
-            else:
-                big_comps.add(comp)    
-    return communities, small_comps, big_comps
+def decide_fates(client, awaiting_fates: set[tuple]):
+    """ Inspect girvan newman results to decide component fates. 
+    Each tuple in awaiting_fates set is (proc_comp, og_comp)
+    """
+    communities, needs_further_processing = set(), set()
+    for proc_comp, og_comp in awaiting_fates:
+        if og_comp and is_community(og_comp, proc_comp):
+            communities.add(og_comp)
+        else:
+            needs_further_processing.add(proc_comp)
+    
+    future_fates = set()
+    for comp in needs_further_processing:
+        f = client.submit(graph_utils.get_components, proc_comp)
+        future_fates.add(f)
+    
+    return communities, future_fates
+
+
+def process_fates(client, future_fates, max_worker_df_size):
+    """ Decide whether each component should be processed by a worker.
+    Each future in future_fates will be a list of component dataframes """
+    big_comp, small_comp = set(), set()
+    if future_fates:
+        done, future_fates = client.wait(future_fates, return_when="FIRST_COMPLETED")
+        for comp_list in done:
+            for comp in comp_list:
+                if should_send_to_worker(comp, max_worker_df_size):
+                    small_comp.update(comp)
+                else:
+                    big_comp.update(comp)
+    return future_fates, big_comp, small_comp
 
 
 def process_small_pipeline_results(client, chop_futures):
     """ Process small components that have reached the end of the pipeline """
-    communities, to_prune, big_comps = set(), set(), set()
+    results = set()
     if chop_futures:
         done, chop_futures = client.wait(chop_futures, return_when="FIRST_COMPLETED")
         for proc_comp, og_comp in done:
-            comms, tp, big = decide_fates(proc_comp, og_comp)
-            communities.update(comms), to_prune.update(tp), big_comps.update(big)
-    return chop_futures, communities, to_prune, big_comps
+            results.add((proc_comp, og_comp))
+    return chop_futures, results
 
 
-def process_agg_futures(client, agg_futures):
+def process_agg_futures(client, agg_futures, k):
     """ Process small components that are ready to be 'chopped' (i.e., have 
     final/aggregated edge scores available)"""
     chop_futures = set()
     if agg_futures:
         done, agg_futures = client.wait(agg_futures, return_when="FIRST_COMPLETED")
         for comp, score_df in done:
-            f = client.submit(chop, comp, score_df)
+            f = client.submit(chop, comp, score_df, k)
             chop_futures.add(f)    
     return agg_futures, chop_futures
 
@@ -136,6 +157,7 @@ def run(connectome: DDF, args) -> DDF:
     max_worker_df_size = get_worker_df_size(client)
     agg_futures, chop_futures = set(), set()
     esp = defaultdict(set) # edge score progress dictionary
+    awaiting_fates, future_fates = set(), set()
                     
     # Get and allocate initial components
     communities, to_prune, big_comps = decide_fates(client, connectome)
@@ -146,16 +168,28 @@ def run(connectome: DDF, args) -> DDF:
         
         # Process one big component
         if len(big_comps) > 0:
-            proc_comp = driver_gn(big_comps.pop())
-            decide_fates(client, proc_comp, big_comp)
+            big_comp = big_comps.pop()
+            proc_comp = driver_mgn(big_comp)
+            awaiting_fates.add((proc_comp, big_comp))
         
         # Process small components that have reached the end of the pipeline
-        cf, comms, tp, big = process_small_pipeline_results(client, chop_futures)
-        chopped_futures = cf
-        communities.update(comms), to_prune.update(tp), big_comps.update(big_comps)
+        chop_futures, results = process_end_of_pipeline(client, chop_futures)
+        for proc_comp, big_comp in results:
+            awaiting_fates.add((proc_comp, big_comp))
+        
+        # Process and assign new components to driver or workers
+        future_fates, big, small = process_fates(
+            client, future_fates, max_worker_df_size)
+        big_comps.update(big), to_prune.update(small)
+        
+        # Process results of big component processing and end of small pipeline
+        new_comms, new_future_fates = decide_fates(client, awaiting_fates)
+        communities.update(new_comms)
+        awaiting_fates = set()
 
         # Shuffle small and ready components one step forward through pipeline
-        agg_futures, new_chop_futures = process_agg_futures(client, agg_futures)
+        agg_futures, new_chop_futures = process_agg_futures(
+            client, agg_futures, args.madk)
         chop_futures.update(new_chop_futures)
         esp, new_agg_futures = process_esp_dict(client, esp)
         agg_futures.update(new_agg_futures)
@@ -187,29 +221,15 @@ def tag(connectome: DDF, communities: list[DDF]) -> DDF:
     return tagged
 
 
-def driver_mgn() -> DDF:
-    """ 
-    Return the processed dataframe after applying pure dask modified girvan 
-    newman. """
-    raise NotImplementedError
-
-
-def worker_mgn() -> tuple[DDF]:
-    """ 
-    Return the original component dataframe and the processed dataframe after 
-    applying pandas-supported girvan newman """
-    raise NotImplementedError
-
-
-#def mgn(component: DDF, k: float) -> tuple[DDF]:
-    #""" Remove bridge edges from component dataframe
+def driver_mgn(component: DDF, k: float) -> tuple[DDF]:
+    """ Remove bridge edges from component dataframe
     
-    #Modified Girvan Newman. k is used in get_upper_threshold() as a multiplier.
-    #Returns the original component and the 'chopped' dataframe.
+    Modified Girvan Newman. k is used in get_upper_threshold() as a multiplier.
+    Returns the original component and the 'chopped' dataframe.
     
-    #"""
-    #component = graph_utils.prune(component)
-    #edge_scores = edge_scoring.get_edge_scores(component)
-    #upper_score_threshold = edge_scoring.get_upper_threshold(edge_scores, k)
-    #new_df = edge_scoring.chop(component, edge_scores, upper_score_threshold)
-    #return (component, new_df)
+    """
+    component = graph_utils.prune(component)
+    edge_scores = edge_scoring.get_edge_scores(component)
+    upper_score_threshold = edge_scoring.get_upper_threshold(edge_scores, k)
+    new_df = edge_scoring.chop(component, edge_scores, upper_score_threshold)
+    return (component, new_df)
