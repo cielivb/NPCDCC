@@ -70,7 +70,8 @@ def process_fates(client, future_fates, max_worker_df_size):
         for comp_list in done:
             for comp in comp_list:
                 if should_send_to_worker(comp, max_worker_df_size):
-                    small_comp.add(comp)
+                    repartitioned = comp.repartition(npartitions=1) # CRITICAL
+                    small_comp.add(repartitioned)
                 else:
                     big_comp.add(comp)
     return future_fates, big_comp, small_comp
@@ -157,12 +158,15 @@ def run(connectome: DDF, args) -> DDF:
     are too large for workers.
     
     """    
-    # Set up controller variables
+    # Set up initial variables
     client, next_id = get_client(), 0
     max_worker_df_size = get_worker_df_size(client)
     agg_futures, chop_futures = set(), set()
     esp = dict() # edge score progress dictionary
-    to_prune, awaiting_fates = set(), set()    
+    to_prune, awaiting_fates = set(), set()
+    
+    # Set the pre column of connectome to be the index
+    connectome = connectome.set_index("pre", drop=False)
                     
     # Get and allocate initial components
     communities, future_fates = decide_fates(client, set((connectome, None)))

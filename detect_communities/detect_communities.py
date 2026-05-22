@@ -199,15 +199,15 @@ def prune(df: ddf.DataFrame) -> ddf.DataFrame:
     while deg1_nodes.count().compute() > 0:
         # Get edges where any involved node is in deg1_nodes
         merged1 = pruned.merge(deg1_nodes, left_index=True, 
-                               right_on="node", how="inner").persist()
+                               right_on="node", how="inner")
         merged2 = pruned.merge(deg1_nodes, left_on="post", 
-                               right_on="node", how="inner").persist()
-        to_prune = ddf.concat([merged1, merged2]).persist()
+                               right_on="node", how="inner")
+        to_prune = ddf.concat([merged1, merged2])
         
         # Remove edges and recompute degree 1 nodes
         merged = pruned.merge(to_prune, on=["pre","post"], how="left", indicator=True)
         pruned = merged[merged["_merge"] == "left_only"].persist()
-        deg1_nodes = get_degree_1_nodes(pruned).persist()
+        deg1_nodes = get_degree_1_nodes(pruned)
         
     return pruned
 
