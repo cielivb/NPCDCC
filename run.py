@@ -62,7 +62,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("-c", "--cores", "Number of cores to use", type=int, required=True)
     p.add_argument("-f", "--file", "Parquet file to run through pipeline", required=True)
-    p.add_argument("-m", "--min", "Minimum community size", type=int, default=30)
+    p.add_argument("-m", "--min", "Minimum number of edges", type=int, default=30)
     p.add_argument("-k", "--madk", "MAD outlier detection K", type=float, default=2.5)
     args = p.parse_args()
     return args
@@ -276,7 +276,7 @@ def main():
     graphs_f = CLIENT.submit(make_graphs, tagged, outdir)
     bm_f = CLIENT.submit(make_brain_maps, tagged, outdir)
     futures = [w1_f, w2_f, w3_f, stats_f, graphs_f, bm_f]
-    status = futures.gather() # Block until are tasks are done
+    status = CLIENT.gather(futures) # Block until are tasks are done
     
     # Stop timing and report duration
     end_time = datetime.now()
