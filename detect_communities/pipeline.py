@@ -7,11 +7,12 @@ down, then returns the tagged connectome
 
 """
 import dask
-from collections import defaultdict
+from dask.distributed import wait
 from dask import dataframe as ddf
 from dask.distributed import Client
+from typing import TypeAlias
 
-type DDF = ddf.DataFrame
+DDF: TypeAlias = ddf.DataFrame
 
 
 def get_worker_df_size(client) -> float:
@@ -27,7 +28,7 @@ def get_worker_df_size(client) -> float:
     return safe_size
 
 
-def send_to_worker(component: DDF, max_worker_df_size: float):
+def should_send_to_worker(component: DDF, max_worker_df_size: float):
     """ Return True if worker can handle dask dataframe component size """
     comp_gb = component.memory_usage(deep = False).sum().compute() / 1024**3
     return comp_gb < max_worker_df_size
@@ -69,13 +70,13 @@ def process_fates(client, future_fates, max_worker_df_size):
         for comp_list in done:
             for comp in comp_list:
                 if should_send_to_worker(comp, max_worker_df_size):
-                    small_comp.update(comp)
+                    small_comp.add(comp)
                 else:
-                    big_comp.update(comp)
+                    big_comp.add(comp)
     return future_fates, big_comp, small_comp
 
 
-def process_small_pipeline_results(client, chop_futures):
+def process_end_of_pipeline(client, chop_futures):
     """ Process small components that have reached the end of the pipeline """
     results = set()
     if chop_futures:
@@ -92,7 +93,7 @@ def process_agg_futures(client, agg_futures, k):
     if agg_futures:
         done, agg_futures = client.wait(agg_futures, return_when="FIRST_COMPLETED")
         for comp, score_df in done:
-            f = client.submit(chop, comp, score_df, k)
+            f = client.submit(edge_scoring.chop_pd, comp, score_df, k)
             chop_futures.add(f)    
     return agg_futures, chop_futures
 
@@ -100,10 +101,11 @@ def process_agg_futures(client, agg_futures, k):
 def process_esp_dict(client, esp):
     """ Process small components that have all initial edge scores available """
     agg_futures = set()
-    for comp_id, future_list in esp.items():
-        ready = map(lambda f: f.done(), future_list).all()
+    for comp_id, comp_tup in esp.items():
+        comp, future_list = comp_tup[0], comp_tup[1]
+        ready = all(f.done() for f in future_list)
         if ready:
-            f = client.submit(aggregate_scores, comp, future_list)
+            f = client.submit(edge_scoring.aggregate_scores_pd, comp, future_list)
             agg_futures.add(f)
             del esp[comp_id]
     return esp, agg_futures
@@ -118,8 +120,11 @@ def process_pruned_futures(client, pruned_futures, esp, next_id):
             next_id += 1
             start_nodes = get_start_nodes(comp).compute()
             for s in start_nodes:
-                f = client.submit(get_scores, comp, s)
-                esp[comp_id].add(f)
+                f = client.submit(edge_scoring.get_scores_pd, comp, s)
+                if comp_id in esp:
+                    esp[comp_id][1].add(f)
+                else:
+                    esp[comp_id] = (comp, {f})
     return pruned_futures, esp, next_id
 
 
@@ -128,7 +133,7 @@ def process_to_prune(client, to_prune):
     pruned_futures = set()
     if to_prune:
         for comp in to_prune:
-            f = client.submit(prune, comp)
+            f = client.submit(prune_pd, comp)
             pruned_futures.add(f)
     return pruned_futures
             
@@ -156,11 +161,15 @@ def run(connectome: DDF, args) -> DDF:
     client, next_id = get_client(), 0
     max_worker_df_size = get_worker_df_size(client)
     agg_futures, chop_futures = set(), set()
-    esp = defaultdict(set) # edge score progress dictionary
-    awaiting_fates, future_fates = set(), set()
+    esp = dict() # edge score progress dictionary
+    to_prune, awaiting_fates = set(), set()    
                     
     # Get and allocate initial components
-    communities, to_prune, big_comps = decide_fates(client, connectome)
+    communities, future_fates = decide_fates(client, set((connectome, None)))
+    connectome_future_fate = future_fates.pop()
+    wait(connectome_future_fate)
+    future_fates, big_comps, small_comps = process_fates(
+        client, future_fates, max_worker_df_size)
     
     # Enter control loop - continue breaking connectome components down into
     # communities until no more components remain to be processed
@@ -168,9 +177,8 @@ def run(connectome: DDF, args) -> DDF:
         
         # Process one big component
         if len(big_comps) > 0:
-            big_comp = big_comps.pop()
-            proc_comp = driver_mgn(big_comp)
-            awaiting_fates.add((proc_comp, big_comp))
+            proc_comp, og_comp = driver_mgn(big_comps.pop())
+            awaiting_fates.add((proc_comp, og_comp))
         
         # Process small components that have reached the end of the pipeline
         chop_futures, results = process_end_of_pipeline(client, chop_futures)
@@ -198,7 +206,7 @@ def run(connectome: DDF, args) -> DDF:
         pruned_futures.update(process_to_prune(client, to_prune))
         to_prune = set()
     
-    return tag(connectome, communities).persist()
+    return tag(connectome, communities)
 
 
 def tag(connectome: DDF, communities: list[DDF]) -> DDF:
@@ -210,15 +218,17 @@ def tag(connectome: DDF, communities: list[DDF]) -> DDF:
     if not communities:
         return None
     community_ids = range(1, len(communities) + 1)
+        
+    tagged_communities = []
     for community, community_id in zip(communities, community_ids):
-        community["community_id"] = community_id
+        tagged_communities.append(community.assign(community_id=community_id))
     
-    big_community_df = ddf.concat(communities).persist()
+    big_community_df = ddf.concat(tagged_communities).persist()
     tagged = connectome.merge(big_community_df, 
                               on = ["pre", "post"], 
                               how="left")
     tagged = tagged.sort_values(["neuropil", "community_id"]).persist()
-    return tagged
+    return tagged.persist()
 
 
 def driver_mgn(component: DDF, k: float) -> tuple[DDF]:
@@ -228,8 +238,8 @@ def driver_mgn(component: DDF, k: float) -> tuple[DDF]:
     Returns the original component and the 'chopped' dataframe.
     
     """
-    component = graph_utils.prune(component)
-    edge_scores = edge_scoring.get_edge_scores(component)
+    pruned_component = graph_utils.prune(component)
+    edge_scores = edge_scoring.get_edge_scores(pruned_component)
     upper_score_threshold = edge_scoring.get_upper_threshold(edge_scores, k)
-    new_df = edge_scoring.chop(component, edge_scores, upper_score_threshold)
-    return (component, new_df)
+    new_df = edge_scoring.chop(pruned_component, edge_scores, upper_score_threshold)
+    return (new_df, component)

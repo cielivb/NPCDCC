@@ -1,8 +1,9 @@
 """ Graph Utilities / Helper Functions """
 
 from dask import dataframe as ddf
+from typing import TypeAlias
 
-type DDF = ddf.DataFrame
+DDF: TypeAlias = ddf.DataFrame
 
 
 def get_all_node_ids(df: DDF, node_cols=["pre","post"]) -> DDF:
@@ -29,4 +30,8 @@ def get_components(df: DDF) -> list[DDF]:
 
 
 def prune(df: DDF) -> DDF:
+    raise NotImplementedError
+
+
+def prune_pd(df: DDF) -> DDF:
     raise NotImplementedError
