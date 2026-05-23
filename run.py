@@ -38,6 +38,7 @@ import dask
 import numpy as np
 import os
 import pandas as pd
+import pyvista as pv
 from dask import bag as db
 from dask import dataframe as ddf
 from dask import delayed
@@ -232,11 +233,6 @@ def make_graphs(tagged_connectome: ddf.DataFrame, outdir: str):
     raise NotImplementedError
 
 
-def make_brain_maps(tagged_connectome: ddf.DataFrame, outdir: str):
-    """ Use PyVista to generate before and after brain map images. """
-    raise NotImplementedError
-
-
 
 
 
@@ -267,6 +263,21 @@ def main():
     connectome = load_connectome(args.file)
     tagged = detect_communities.run(connectome, args.min, args.madk)
     
+    # Sum probabilities of neurotransmitters that are not inherently excitatory
+    # or regulatory together - only interested in excitatory-inhibitory dynamics
+    # in this analysis. The sums of neurotransmitter probabilities are sometimes
+    # just a few decimal places out from being exactly 1, so normalise as well.
+    other_nt = ["glut", "oct", "ser", "da"]
+    other_sum = tagged[other_nt].sum(axis=1)
+    tagged["other"] = other_sum
+    tagged = tagged.drop(columns = other_nt)
+    tagged["total_prob"] = tagged[["gaba", "ach", "other"]].sum(axis=1)
+    tagged["gaba"] = tagged["gaba"] / tagged["total_prob"]
+    tagged["ach"] = tagged["ach"] / tagged["total_prob"]
+    tagged["other"] = tagged["other"] / tagged["total_prob"]
+    
+    make_brain_map.make_brain_map(tagged, coord_dir, outdir)
+    
     # Write tagged data, perform analyses, and generate visuals. None of these
     # tasks depend on the completion of any other of these tasks.
     #w1_f = CLIENT.submit(write_tagged_connectome, tagged, outdir)
@@ -274,9 +285,9 @@ def main():
     #w3_f = CLIENT.submit(write_neuropil_data, tagged, outdir)
     #stats_f = CLIENT.submit(do_stats, tagged, outdir)
     #graphs_f = CLIENT.submit(make_graphs, tagged, outdir)
-    bm_f = CLIENT.submit(make_brain_maps, tagged, outdir)
-    futures = [w1_f, w2_f, w3_f, stats_f, graphs_f, bm_f]
-    status = CLIENT.gather(futures) # Block until are tasks are done
+    #bm_f = CLIENT.submit(make_brain_maps, tagged, outdir)
+    #futures = [w1_f, w2_f, w3_f, stats_f, graphs_f, bm_f]
+    #status = CLIENT.gather(futures) # Block until are tasks are done
     
     # Stop timing and report duration
     end_time = datetime.now()

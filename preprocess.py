@@ -49,7 +49,7 @@ def preprocess_coord_file(raw_path):
 def feather_to_parquet(file_to_convert, destination):
     """ Convert feather file to parquet file
     WARNING: brings the whole feather file into memory. In the worst case,
-    could hog about 8 GB memory """
+    this could hog about 8 GB memory """
     print(f"\nConverting {file_to_convert} to parquet file ...\n")
     table = feather.read_table(file_to_convert)
     pq.write_table(table, destination, compression=None, 
