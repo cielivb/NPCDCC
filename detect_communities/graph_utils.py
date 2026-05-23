@@ -8,7 +8,7 @@ DDF: TypeAlias = ddf.DataFrame
 PDF: TypeAlias = pd.DataFrame
 
 
-def get_all_node_ids(df: DDF|PDF, node_cols=["pre","post"]) -> DDF:
+def get_all_node_ids(df: DDF|PDF, node_cols=["pre","post"]) -> DDF|PDF:
     """ Return a dataframe containing every unique node id in the dataframe """
     node_cols = [df[col].rename("node_id").to_frame() for col in node_cols]
     if isinstance(df, PDF):
@@ -18,19 +18,20 @@ def get_all_node_ids(df: DDF|PDF, node_cols=["pre","post"]) -> DDF:
     return all_nodes
 
 
-def undirect_df(df: DDF|PDF):
-    """ Add b->a for every a->b in df """
+def undirect_df(df: DDF|PDF) -> DDF|PDF:
+    """ Add b->a for every a->b in df. duplicates are dropped in case the df
+    is already undirected """
     df_reversed = df.rename(columns={"pre": "post", "post": "pre"})
     if isinstance(df, PDF):
-        undirected = pd.concat([df, df_reversed])
+        undirected = pd.concat([df, df_reversed]).drop_duplicates()
         undirected = undirected.set_index("pre", drop = False)
     else:
-        undirected = ddf.concat([df, df_reversed])
+        undirected = ddf.concat([df, df_reversed]).drop_duplicates()
         undirected = undirected.set_index("pre", drop = False).persist()    
     return undirected
 
 
-def create_state_df(df: DDF|PDF):
+def create_state_df(df: DDF|PDF) -> DDF|PDF:
     """ Return either a dask or pandas state dataframe depending on input """
     state = get_all_node_ids(df).drop_duplicates()
     state["state"] = "U"
