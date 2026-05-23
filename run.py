@@ -14,7 +14,7 @@ Dataset Published By: Flywire Consortium
 
 Data Files used:
 - proofread_connections_783.feather
-- proofread_root_ids_783.npy
+- flywire_synapses_783.feather
 
 Dataset Citation (APA):
 FlyWire Consortium. (2024). FlyWire Whole-brain Connectome Connectivity Data 
@@ -35,10 +35,8 @@ TODO
 """
 import argparse
 import dask
-import numpy as np
 import os
 import pandas as pd
-import pyvista as pv
 from dask import bag as db
 from dask import dataframe as ddf
 from dask import delayed
