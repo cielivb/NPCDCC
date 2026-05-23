@@ -18,16 +18,11 @@ def get_all_node_ids(df: DDF|PDF, node_cols=["pre","post"]) -> DDF|PDF:
     return all_nodes
 
 
-def undirect_df(df: DDF|PDF) -> DDF|PDF:
-    """ Add b->a for every a->b in df. duplicates are dropped in case the df
-    is already undirected """
+def undirect_df(df: DDF) -> DDF:
+    """ Add b->a for every a->b in df """
     df_reversed = df.rename(columns={"pre": "post", "post": "pre"})
-    if isinstance(df, PDF):
-        undirected = pd.concat([df, df_reversed]).drop_duplicates()
-        undirected = undirected.set_index("pre", drop = False)
-    else:
-        undirected = ddf.concat([df, df_reversed]).drop_duplicates()
-        undirected = undirected.set_index("pre", drop = False).persist()    
+    undirected = ddf.concat([df, df_reversed])
+    undirected = undirected.set_index("pre", drop = False)
     return undirected
 
 
@@ -52,7 +47,6 @@ def get_components(df: DDF) -> list[DDF]:
     components. Only one component can be discovered at a time.
 
     """    
-    undirected_df = undirect_df(df)
     state = create_state_df(df)
     components = []
     

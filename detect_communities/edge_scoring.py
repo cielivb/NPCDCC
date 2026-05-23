@@ -8,7 +8,15 @@ DDF: TypeAlias = ddf.DataFrame
 PDF: TypeAlias = pd.DataFrame
 
 
-def get_scores(df: DDF, start_node: int):
+def get_start_nodes(df: PDF|DDF):
+    """ Get a list of random start nodes for MGN PBFS on dataframe """
+    # Get list of all nodes in dataframe
+    # Choose number of start nodes as a function of number of nodes
+    # Get random subset of start nodes
+    raise NotImplementedError
+
+
+def get_scores(df: DDF, start_node: int) -> DDF:
     """ Get and return edge scores dataframe starting at start node. 
     DRIVER version. Runs one PBFS and one PBFS backtrack.
     """
@@ -18,7 +26,7 @@ def get_scores(df: DDF, start_node: int):
     return scores.persist()
 
 
-def get_scores_pd(dask_df: DDF, start_node: int):
+def get_scores_pd(dask_df: DDF, start_node: int) -> DDF:
     """ Get and return edge scores dataframe starting at start node. 
     WORKER version. Run one PBFS and one PBFS backtrack."""
     df = dask_df.compute() # Convert to pandas
@@ -40,7 +48,7 @@ def normalise_edges(df_partition: PDF) -> PDF:
     return new_df
 
 
-def aggregate_scores(df: DDF, scores_list: list) -> DDF:
+def aggregate_scores(df: DDF, scores_list: list[DDF]) -> DDF:
     """ Return original dataframe with aggregated/final edge score column. 
     Each score dataframe in scores_list has columns parent, child, score.
     DRIVER and WORKER version - no computes.
@@ -56,8 +64,8 @@ def aggregate_scores(df: DDF, scores_list: list) -> DDF:
     # Merge dataframes and replace NA scores with 0
     merged = df.merge(scores, left_on=["pre", "post"], 
                       right_index = True, how = "left")
-    merged["score"] = merged["score"].fillna(0)
-    return merged.persist()
+    merged["score"] = merged["score"].fillna(0).persist()
+    return merged
 
 
 def get_upper_threshold(edge_scores: DDF|PDF, k: float) -> float:
@@ -81,11 +89,11 @@ def get_upper_threshold(edge_scores: DDF|PDF, k: float) -> float:
     return upper_thresh
 
 
-def chop(df_w_edge_scores: DDF, k: float) -> DDF:
+def chop(df_w_edge_scores: DDF, k: float) -> tuple[DDF]:
     """ Return dataframe with edges that exceeded thresh removed """
     upper_thresh = get_upper_threshold(df_w_edge_scores, k)
-    keep = df_w_edge_scores[df_w_edge_scores["score"] < upper_thresh]
-    return keep.persist()
+    keep = df_w_edge_scores[df_w_edge_scores["score"] < upper_thresh].persist()
+    return (keep, df_w_edge_scores)
 
 
 def chop_pd(dask_df_w_edge_scores: DDF, k: float) -> tuple[DDF]:
@@ -93,5 +101,5 @@ def chop_pd(dask_df_w_edge_scores: DDF, k: float) -> tuple[DDF]:
     df = dask_df_w_edge_scores.compute() # Convert to pandas
     upper_thresh = get_upper_threshold(df, k)
     keep = df_w_edge_scores[df_w_edge_scores["score"] < upper_thresh]
-    dask_keep = ddf.from_pandas(keep, npartitions=1)
-    return dask_keep.persist()
+    dask_keep = ddf.from_pandas(keep, npartitions=1).persist()
+    return (dask_keep, dask_df_w_edge_scores)

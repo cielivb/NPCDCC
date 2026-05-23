@@ -10,10 +10,37 @@ import dask
 from dask.distributed import wait
 from dask import dataframe as ddf
 from dask.distributed import Client
+from queue import Queue
+from threading import Lock
+from time import sleep
 from typing import TypeAlias
 
 DDF: TypeAlias = ddf.DataFrame
 
+BIG_COMPS = Queue()
+SMALL_COMPS = Queue()
+COMMUNITIES = Queue()
+MAX_WORKER_DF_SIZE = None
+ESP = dict() # Edge Scoring Progress
+NEXT_ID, LOCK = 1, Lock()
+NUM_SMALL_PROCESSED = 0
+
+
+def get_next_comp_id():
+    """ Thread-safe component ID retrieve and update """
+    global NEXT_ID, LOCK
+    with LOCK:
+        to_return = NEXT_ID
+        NEXT_ID += 1
+    return to_return
+
+
+def increment_num_small_processed():
+    """ Thread-safe increment of global number processed tracker """
+    global NUM_SMALL_PROCESSED, LOCK
+    with LOCK:
+        NUM_SMALL_PROCESSED += 1
+    
 
 def get_worker_df_size(client) -> float:
     """ Return maximum pandas dataframe size based on worker RAM allowance """  
@@ -23,122 +50,66 @@ def get_worker_df_size(client) -> float:
         gb = info["memory_limit"] / (1024**3)
         min_ram = gb if (not min_ram or gb < min_ram) else min_ram
     
-    # Calculate and return safe dataframe size (0.25 x min RAM allocation)
-    safe_size = 0.25 * min_ram # in gigabytes
+    # Calculate and return safe in-memory dataframe size (0.2 x min RAM allocation)
+    safe_size = 0.2 * min_ram # in gigabytes
     return safe_size
 
 
 def should_send_to_worker(component: DDF, max_worker_df_size: float):
     """ Return True if worker can handle dask dataframe component size """
+    global MAX_WORKER_DF_SIZE
     comp_gb = component.memory_usage(deep = False).sum().compute() / 1024**3
-    return comp_gb < max_worker_df_size
+    return comp_gb < MAX_WORKER_DF_SIZE
 
 
-def is_community(og_comp, proc_comp) -> bool:
+def is_community(proc_comp, og_comp) -> bool:
     """ True if both components have same number of rows """
+    if not og_comp or not proc_comp: return False
     num_edges_og = og_comp.map_partitions(len).sum()
     num_edges_proc = proc_comp.map_partitions(len).sum()
     num_edges_og, num_edges_proc = dask.compute(num_edges_og, num_edges_proc)
     return True if num_edges_og == num_edges_proc else False
 
 
-def decide_fates(client, awaiting_fates: set[tuple]):
+def decide_fate(result):
     """ Inspect girvan newman results to decide component fates. 
-    Each tuple in awaiting_fates set is (proc_comp, og_comp)
+    Each tuple is of form (proc_comp, og_comp)
     """
-    communities, needs_further_processing = set(), set()
-    for proc_comp, og_comp in awaiting_fates:
-        if og_comp and is_community(og_comp, proc_comp):
-            communities.add(og_comp)
-        else:
-            needs_further_processing.add(proc_comp)
-    
-    future_fates = set()
-    for comp in needs_further_processing:
-        f = client.submit(graph_utils.get_components, proc_comp)
-        future_fates.add(f)
-    
-    return communities, future_fates
+    global BIG_COMPS, SMALL_COMPS, COMMUNITIES
+    if isinstance(result, dask.distributed.Future):
+        proc_comp, og_comp = result.result()
+    else: # Special case with original connectome
+        proc_comp, og_comp = result
+    if is_community(proc_comp, og_comp):
+        COMMUNITIES.put(proc_comp)
+    else: # get_components involves computes -> driver only
+        new_comps = graph_utils.get_components(proc_comp) # Blocking
+        for comp in new_comps:
+            if should_send_to_worker(comp):
+                SMALL_COMPS.put(comp)
+            else:
+                BIG_COMPS.put(comp)
 
 
-def process_fates(client, future_fates, max_worker_df_size):
-    """ Decide whether each component should be processed by a worker.
-    Each future in future_fates will be a list of component dataframes """
-    big_comp, small_comp = set(), set()
-    if future_fates:
-        done, future_fates = client.wait(future_fates, return_when="FIRST_COMPLETED")
-        for comp_list in done:
-            for comp in comp_list:
-                if should_send_to_worker(comp, max_worker_df_size):
-                    repartitioned = comp.repartition(npartitions=1) # CRITICAL
-                    small_comp.add(repartitioned)
-                else:
-                    big_comp.add(comp)
-    return future_fates, big_comp, small_comp
+def process_pruned(pruned_future):
+    """ Get edge scores of pruned component """
+    global ESP
+    pruned = pruned_future.result()
+    start_nodes = edge_scoring.get_start_nodes(pruned)
+    comp_id = get_next_comp_id()
+    ESP[comp_id] = (pruned, set())
+    for s in start_nodes:
+        f = client.submit(edge_scoring.get_scores_pd, pruned, s)
+        ESP[comp_id][1].add(f)
 
 
-def process_end_of_pipeline(client, chop_futures):
-    """ Process small components that have reached the end of the pipeline """
-    results = set()
-    if chop_futures:
-        done, chop_futures = client.wait(chop_futures, return_when="FIRST_COMPLETED")
-        for proc_comp, og_comp in done:
-            results.add((proc_comp, og_comp))
-    return chop_futures, results
+def process_aggregated(aggregated_future):
+    """ Chop the dataframe based on edge scores then decide its fate """
+    comp_w_scores = aggregated_future.result()
+    f = client.submit(edge_scoring.chop_pd, comp_w_scores)
+    f.add_done_callback(decide_fate)
 
 
-def process_agg_futures(client, agg_futures, k):
-    """ Process small components that are ready to be 'chopped' (i.e., have 
-    final/aggregated edge scores available)"""
-    chop_futures = set()
-    if agg_futures:
-        done, agg_futures = client.wait(agg_futures, return_when="FIRST_COMPLETED")
-        for comp_w_scores in done:
-            f = client.submit(edge_scoring.chop_pd, comp_w_scores, k)
-            chop_futures.add(f)    
-    return agg_futures, chop_futures
-
-
-def process_esp_dict(client, esp):
-    """ Process small components that have all initial edge scores available """
-    agg_futures = set()
-    for comp_id, comp_tup in esp.items():
-        comp, future_list = comp_tup[0], comp_tup[1]
-        ready = all(f.done() for f in future_list)
-        if ready:
-            f = client.submit(edge_scoring.aggregate_scores, comp, future_list)
-            agg_futures.add(f)
-            del esp[comp_id]
-    return esp, agg_futures
-
-
-def process_pruned_futures(client, pruned_futures, esp, next_id):
-    """ Parallelise getting initial edge scores for each small pruned component """
-    if pruned_futures:
-        done, pruned_futures = client.wait(pruned_futures, return_when="FIRST_COMPLETED")
-        for comp in done:
-            comp_id = next_id
-            next_id += 1
-            start_nodes = get_start_nodes(comp).compute()
-            for s in start_nodes:
-                f = client.submit(edge_scoring.get_scores_pd, comp, s)
-                if comp_id in esp:
-                    esp[comp_id][1].add(f)
-                else:
-                    esp[comp_id] = (comp, {f})
-    return pruned_futures, esp, next_id
-
-
-def process_to_prune(client, to_prune):
-    """ Prune small components in to_prune """
-    pruned_futures = set()
-    if to_prune:
-        for comp in to_prune:
-            f = client.submit(prune_pd, comp)
-            pruned_futures.add(f)
-    return pruned_futures
-            
-    
 def run(connectome: DDF, args) -> DDF:
     """ Detect and label communities in connectome. 
     
@@ -158,74 +129,68 @@ def run(connectome: DDF, args) -> DDF:
     are too large for workers.
     
     """    
-    # Set up initial variables
-    client, next_id = get_client(), 0
-    max_worker_df_size = get_worker_df_size(client)
-    agg_futures, chop_futures = set(), set()
-    esp = dict() # edge score progress dictionary
-    to_prune, awaiting_fates = set(), set()
+    global CLIENT, BIG_COMPS, SMALL_COMPS, COMMUNITIES, MAX_WORKER_DF_SIZE
+    global NUM_SMALL_PROCESSED
     
-    # Set the pre column of connectome to be the index
-    connectome = connectome.set_index("pre", drop=False)
+    # Set up initial variables
+    CLIENT, MAX_WORKER_DF_SIZE = get_client(), get_worker_df_size(CLIENT)
+    num_small_submitted = 0    
+    
+    # Undirect connectome and set the pre column of connectome to be the index
+    undirected_connectome = graph_utils.undirect_df(connectome)
+    undirected_connectome = undirected_connectome.set_index("pre", drop = False)
                     
     # Get and allocate initial components
-    communities, future_fates = decide_fates(client, set((connectome, None)))
-    connectome_future_fate = future_fates.pop()
-    wait(connectome_future_fate)
-    future_fates, big_comps, small_comps = process_fates(
-        client, future_fates, max_worker_df_size)
+    decide_fate((undirected_connectome, None))
     
     # Enter control loop - continue breaking connectome components down into
     # communities until no more components remain to be processed
-    while len(big_comps) > 0 or len(small_comps) > 0:
+    while not (BIG_COMPS.empty and SMALL_COMPS.empty):
+        
+        # Submit new small components to start of small components pipeline
+        while not SMALL_COMPS.empty:
+            to_prune = SMALL_COMPS.get()
+            f = CLIENT.submit(graph_utils.prune_pd, to_prune)
+            f.add_done_callback(process_pruned)
+            num_small_submitted += 1
+
+        # Push small components that have completed the PBFS stage forward
+        # through pipeline past the artificial MGN PBFS synchronisation barrier
+        for comp_id, comp_tuple in ESP.items():
+            comp, future_list = comp_tup[0], comp_tup[1]
+            if all(f.done() for f in future_list): # if ready
+                scores_list = [f.result() for f in future_list] # list of DDF
+                f = client.submit(edge_scoring.aggregate_scores, comp, scores_list)
+                f.add_done_callback(process_aggregated)
         
         # Process one big component
-        if len(big_comps) > 0:
-            proc_comp, og_comp = driver_mgn(big_comps.pop())
-            awaiting_fates.add((proc_comp, og_comp))
-        
-        # Process small components that have reached the end of the pipeline
-        chop_futures, results = process_end_of_pipeline(client, chop_futures)
-        for proc_comp, big_comp in results:
-            awaiting_fates.add((proc_comp, big_comp))
-        
-        # Process and assign new components to driver or workers
-        future_fates, big, small = process_fates(
-            client, future_fates, max_worker_df_size)
-        big_comps.update(big), to_prune.update(small)
-        
-        # Process results of big component processing and end of small pipeline
-        new_comms, new_future_fates = decide_fates(client, awaiting_fates)
-        communities.update(new_comms)
-        awaiting_fates = set()
-
-        # Shuffle small and ready components one step forward through pipeline
-        agg_futures, new_chop_futures = process_agg_futures(
-            client, agg_futures, args.madk)
-        chop_futures.update(new_chop_futures)
-        esp, new_agg_futures = process_esp_dict(client, esp)
-        agg_futures.update(new_agg_futures)
-        pruned_futures, esp, next_id = process_pruned_futures(
-            client, pruned_futures, esp, next_id)
-        pruned_futures.update(process_to_prune(client, to_prune))
-        to_prune = set()
+        if not BIG_COMPS.empty:
+            proc_comp, og_comp = driver_mgn(BIG_COMPS.get()) # Blocks
+            decide_fate((proc_comp, og_comp)) # Blocks
+        else:
+            sleep(5) # Don't waste CPU cycles
     
-    return tag(connectome, communities)
+    # Wait for all components in small pipeline to finish being processed.
+    while num_small_submitted < NUM_SMALL_PROCESSED:
+        sleep(5)
+    
+    return tag(connectome, COMMUNITIES)
 
 
-def tag(connectome: DDF, communities: list[DDF]) -> DDF:
+def tag(connectome: DDF, communities_q: Queue) -> DDF:
     """ Return connectome sorted by neuropil and tagged with community IDs. 
     Community IDs are simple integers. Allocate each cluster dataframe in the
     list a community ID, concatenate the cluster dataframes, then left merge
     connectome_df onto cluster_dfs.
     """
-    if not communities:
-        return None
-    community_ids = range(1, len(communities) + 1)
-        
-    tagged_communities = []
-    for community, community_id in zip(communities, community_ids):
-        tagged_communities.append(community.assign(community_id=community_id))
+    if communities_q.empty: return None
+    
+    # Tag communities while draining communities_q
+    communities, community_id = [], 0
+    while not communities_q.empty():
+        community = communities_q.get()
+        community["community_id"] = community_id
+        community_id += 1
     
     big_community_df = ddf.concat(tagged_communities).persist()
     tagged = connectome.merge(big_community_df, 
@@ -242,8 +207,11 @@ def driver_mgn(component: DDF, k: float) -> tuple[DDF]:
     Returns the original component and the 'chopped' dataframe.
     
     """
-    pruned_component = graph_utils.prune(component)
-    edge_scores = edge_scoring.get_edge_scores(pruned_component) # TODO - update
-    upper_score_threshold = edge_scoring.get_upper_threshold(edge_scores, k)
-    new_df = edge_scoring.chop(pruned_component, edge_scores, upper_score_threshold)
-    return (new_df, component)
+    pruned = graph_utils.prune(component)
+    start_nodes = edge_scoring.get_start_nodes(pruned)
+    score_dfs = []
+    for s in start_nodes: # This may take a while!
+        score_dfs.append(edge_scoring.get_scores(pruned, s))
+    fully_scored = edge_scoring.aggregate_scores(pruned, score_dfs)
+    proc_comp, og_pruned_comp = edge_scoring.chop(fully_scored, k)
+    return (proc_comp, og_pruned_comp)

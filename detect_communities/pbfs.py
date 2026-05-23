@@ -234,7 +234,8 @@ def pbfs_backtrack(pc_df: PDF|DDF, cp_df: PDF|DDF, num_sps: PDF|DDF) -> PDF|DDF:
     and edge scores along the way. Return edge scores. """    
     # Set up PBFS backtrack
     depth = num_sps["depth"].max().compute() if is_dask else num_sps["depth"].max()
-    checkpoint_interval, is_dask = 50, isinstance(num_sps, DDF)    
+    checkpoint_interval, is_dask, e = 50, isinstance(num_sps, DDF), 1e-9
+    num_sps["log10_num_sps"] = num_sps["log10_num_sps"].astype(np.float64) + e    
     edge_score_df = seed_edge_score_df(is_dask)
     
     # Run PBFS backtrack, accumulating edge scores
