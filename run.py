@@ -55,22 +55,18 @@ ROOT_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 RESULT_DIR = os.path.join(ROOT_DIR, "results")
 
-
-def parse_args():
-    """ Process user input """
-    p = argparse.ArgumentParser()
-    p.add_argument("-c", "--cores", "Number of cores to use", type=int, required=True)
-    p.add_argument("-f", "--file", "Parquet file to run through pipeline", required=True)
-    p.add_argument("-m", "--min", "Minimum number of edges", type=int, default=30)
-    p.add_argument("-k", "--madk", "MAD outlier detection K", type=float, default=2.5)
-    args = p.parse_args()
-    return args
+p = argparse.ArgumentParser()
+p.add_argument("-c", "--cores", help="Number of cores to use", type=int, required=True)
+p.add_argument("-f", "--file", help="Parquet file to run through pipeline", required=True)
+p.add_argument("-m", "--min", help="Minimum number of edges", type=int, default=30)
+p.add_argument("-k", "--madk", help="MAD outlier detection K", type=float, default=2.5)
+ARGS = p.parse_args()
 
 
 def create_session_id(file, num_cores):
     """ Derive session id from filename, number of cores, and datetime """
     datetime_id = datetime.now().strftime("%Y%m%d%H%M")
-    filename = os.path.basename(file)
+    filename = os.path.basename(file.removesuffix(".parquet"))
     if "_" in filename:
         filename = "full"
     session_id = f"{datetime_id}_{num_cores}_{filename}"
@@ -247,19 +243,20 @@ def report_duration(session_id, duration):
 
 def main():
     """ Run the full statistical analysis pipeline from loading to reporting """
+    global ARGS
     # Set-up performance testing stuff
-    args = parse_args()
-    session_id = create_session_id(args.file, args.cores)
+    session_id = create_session_id(ARGS.file, ARGS.cores)
     outdir = os.path.join(RESULT_DIR, session_id)
-    os.mkdir(outdir)
+    print(outdir)
+    os.makedirs(outdir, exist_ok = True)
     
     # Start timing
     start_time = datetime.now()
     
     # Set up cluster, load data, and identify communities
-    start_cluster(args.cores)
-    connectome = load_connectome(args.file)
-    tagged = detect_communities.run(connectome, args.min, args.madk)
+    start_cluster(ARGS.cores)
+    connectome = load_connectome(ARGS.file)
+    tagged = detect_communities.run(connectome, ARGS.min, args.madk)
     
     # Sum probabilities of neurotransmitters that are not inherently excitatory
     # or regulatory together - only interested in excitatory-inhibitory dynamics

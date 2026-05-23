@@ -136,8 +136,11 @@ def run(connectome: DDF, args) -> DDF:
     CLIENT, MAX_WORKER_DF_SIZE = get_client(), get_worker_df_size(CLIENT)
     num_small_submitted = 0    
     
+    # Only need 3 columns for community detection
+    trimmed = connectome[["pre", "post", "syn_count"]]
+    
     # Undirect connectome and set the pre column of connectome to be the index
-    undirected_connectome = graph_utils.undirect_df(connectome)
+    undirected_connectome = graph_utils.undirect_df(trimmed)
     undirected_connectome = undirected_connectome.set_index("pre", drop = False)
                     
     # Get and allocate initial components

@@ -102,6 +102,20 @@ def get_components_pd(dask_df: DDF) -> list[DDF]:
         dask_comps.append(ddf.from_pandas(comp, npartitions=1).persist())
     return dask_comps
 
+
+#def union_find_components(df: DDF) -> list[DDF]:
+    #""" Return a list of component dataframes. This version of union find
+    #makes each node adopt the smallest representative possible among itself
+    #and its neighbours with each iteration. This continues until there is no
+    #change in labels or until the number of iterations reaches the graph 
+    #diameter. """
+    #node_ids = get_all_node_ids()
+    #node_ids["repr"] = node_ids["node_id"] # Each node starts as its own rep
+    #max_iterations = len(node_ids) # Infinite while bad
+    #for _ in range(max_iterations):
+        ## Join current rep of each node
+        #...
+    
     
 def prune(df: DDF) -> DDF:
     """ Iteratively remove degree 1 edges from a component dataframe 

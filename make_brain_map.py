@@ -89,7 +89,8 @@ def make_brain_map(tagged: ddf.DataFrame, coord_dir: str, outdir: str):
     tagged_c = attach_colour_groups(tagged_c)    
     
     # Take a sample of tagged_c - this will speed up the visualisation. 
-    # Using frac = 0.05 -> ~800,000 points will be plotted.
+    # Using frac = 0.05 -> ~800,000 points will be plotted for full drosophila
+    # connectome (~16 million edges)
     tagged_sample = tagged_c.sample(frac = 0.05)
     
     # Can't use map partitions here because creating an external effect
