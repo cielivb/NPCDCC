@@ -13,7 +13,7 @@ def get_scores(df: DDF, start_node: int):
     DRIVER version. Runs one PBFS and one PBFS backtrack.
     """
     state = graph_utils.create_state_df(df)
-    state, pc_df, cp_df, num_sps = pbfs.pbfs(start_node, df, state)
+    state, pc_df, cp_df, num_sps = pbfs.pbfs_hybrid(start_node, df, state)
     scores = pbfs.pbfs_backtrack(pc_df, cp_df, num_sps)
     return scores.persist()
 
@@ -23,7 +23,7 @@ def get_scores_pd(dask_df: DDF, start_node: int):
     WORKER version. Run one PBFS and one PBFS backtrack."""
     df = dask_df.compute() # Convert to pandas
     state = graph_utils.create_state_df(df)
-    state, pc_df, cp_df, num_sps = pbfs.pbfs_pd(start_node, df, state)
+    state, pc_df, cp_df, num_sps = pbfs.pbfs_hybrid(start_node, df, state)
     scores = pbfs.pbfs_backtrack_pd(pc_df, cp_df, num_sps)
     dask_scores = ddf.from_pandas(scores, npartitions=1)
     return dask_scores.persist()
