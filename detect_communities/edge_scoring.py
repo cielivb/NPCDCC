@@ -11,9 +11,34 @@ PDF: TypeAlias = pd.DataFrame
 def get_start_nodes(df: PDF|DDF):
     """ Get a list of random start nodes for MGN PBFS on dataframe """
     # Get list of all nodes in dataframe
-    # Choose number of start nodes as a function of number of nodes
-    # Get random subset of start nodes
-    raise NotImplementedError
+    node_ids = graph_utils.get_all_node_ids(df)
+    
+    # Choose number of start nodes as a function of number of nodes. I struggled
+    # to find much in the literature about an ideal function, so I am using an
+    # arbitrary function and hoping for the best.
+    num_nodes = len(df)
+    match num_nodes:
+        case n if n < 500:
+            k = 1
+        case n if n < 1000:
+            k = 0.75
+        case n if n < 2000:
+            k = 0.5
+        case n if n < 10000:
+            k = 0.3
+        case _:
+            k = 0.15
+    
+    # Get random subset of start nodes. Only need to sample 'pre' because df
+    # is undirected.
+    if isinstance(df, PDF):
+        num_start_nodes = int(num_nodes * k)
+        start_nodes = df["pre"].sample(
+            n = num_start_nodes).to_numpy(dtype=np.int32)
+    else:
+        start_nodes = df["pre"].sample(
+            frac = k).to_dask_array().astype(np.int32).compute()
+    return start_nodes
 
 
 def get_scores(df: DDF, start_node: int) -> DDF:

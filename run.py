@@ -269,11 +269,11 @@ def main():
     
     # Write tagged data, perform analyses, and generate visuals. None of these
     # tasks depend on the completion of any other of these tasks.
-    w1_f = CLIENT.submit(write_tagged_connectome, tagged, outdir)
-    w2_f = CLIENT.submit(write_community_data, tagged, outdir)
-    w3_f = CLIENT.submit(write_neuropil_data, tagged, outdir)
-    stats_f = CLIENT.submit(do_stats, tagged, outdir)
-    graphs_f = CLIENT.submit(make_graphs, tagged, outdir)
+    #w1_f = CLIENT.submit(write_tagged_connectome, tagged, outdir)
+    #w2_f = CLIENT.submit(write_community_data, tagged, outdir)
+    #w3_f = CLIENT.submit(write_neuropil_data, tagged, outdir)
+    #stats_f = CLIENT.submit(do_stats, tagged, outdir)
+    #graphs_f = CLIENT.submit(make_graphs, tagged, outdir)
     bm_f = CLIENT.submit(make_brain_maps, tagged, outdir)
     futures = [w1_f, w2_f, w3_f, stats_f, graphs_f, bm_f]
     status = CLIENT.gather(futures) # Block until are tasks are done
