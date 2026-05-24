@@ -14,7 +14,7 @@ Dataset Published By: Flywire Consortium
 
 Data Files used:
 - proofread_connections_783.feather
-- proofread_root_ids_783.npy
+- flywire_synapses_783.feather
 
 Dataset Citation (APA):
 FlyWire Consortium. (2024). FlyWire Whole-brain Connectome Connectivity Data 
@@ -35,7 +35,7 @@ TODO
 """
 import argparse
 import dask
-import numpy as np
+import logging
 import os
 import pandas as pd
 from dask import bag as db
@@ -47,40 +47,51 @@ from datetime import datetime
 from time import sleep
 
 import detect_communities
+import make_brain_map
 
 
 CLIENT = None # Assigned in start_cluster()
-dask.config.set({"dataframe.shuffle.method": "tasks"})
+dask.config.set({"dataframe.shuffle.method": "p2p"})
 
 ROOT_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 RESULT_DIR = os.path.join(ROOT_DIR, "results")
 
+p = argparse.ArgumentParser()
+p.add_argument("-c", "--cores", help="Number of cores to use", type=int, required=True)
+p.add_argument("-f", "--file", help="Parquet file to run through pipeline", required=True)
+p.add_argument("-m", "--min", help="Minimum number of edges", type=int, default=30)
+p.add_argument("-k", "--madk", help="MAD outlier detection K", type=float, default=2.5)
+ARGS = p.parse_args()
 
-def parse_args():
-    """ Process user input """
-    p = argparse.ArgumentParser()
-    p.add_argument("-c", "--cores", "Number of cores to use", type=int, required=True)
-    p.add_argument("-f", "--file", "Parquet file to run through pipeline", required=True)
-    p.add_argument("-m", "--min", "Minimum community size", type=int, default=30)
-    p.add_argument("-k", "--madk", "MAD outlier detection K", type=float, default=2.5)
-    args = p.parse_args()
-    return args
-
+logging.basicConfig(level = logging.DEBUG)
+LOGGER = logging.getLogger(__name__)
+logging.getLogger("distributed.shuffle").setLevel(logging.WARNING)
+logging.getLogger("fsspec").setLevel(logging.WARNING)
 
 def create_session_id(file, num_cores):
     """ Derive session id from filename, number of cores, and datetime """
     datetime_id = datetime.now().strftime("%Y%m%d%H%M")
-    filename = os.path.basename(file)
+    filename = os.path.basename(file.removesuffix(".parquet"))
     if "_" in filename:
         filename = "full"
     session_id = f"{datetime_id}_{num_cores}_{filename}"
+    LOGGER.info(f"Session ID: {session_id}")
     return session_id
 
+
+def initialise_log_file(outdir: str):
+    """ Add file handler that maps to log file in output directory to logger """
+    log_path = os.path.join(outdir, "log.log")
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(logging.Formatter("%(asctime)s: %(message)s"))
+    logging.getLogger().addHandler(fh)
+    
 
 def start_cluster(num_cores):
     """ Create dask client and start cluster with 1 worker per core """
     global CLIENT
+    LOGGER.info("Starting cluster ...")    
     cluster = LocalCluster(
         n_workers=num_cores,
         processes=True,
@@ -93,15 +104,17 @@ def start_cluster(num_cores):
 
 def load_connectome(file) -> ddf.DataFrame:
     """ Load parquet connectome file into dask dataframe """
+    LOGGER.info(f"Loading connectome ({file}) ...")
     connectome = ddf.read_parquet(file)
-    connectome = connectome.rename(columns = {"pre": "pre_pt_root_id",
-                                              "post": "post_pt_root_id"})
+    connectome = connectome.rename(columns = {"pre_pt_root_id": "pre",
+                                              "post_pt_root_id": "post"})
     return connectome
 
 
 def write_tagged_connectome(tagged_connectome: ddf.DataFrame, outdir: str):
-    """ Write tagged connectome to feather file/s """
-    outfile = os.path.join(outdir, "tagged.parquet")
+    """ Write tagged connectome to parquet file """
+    outfile = os.path.join(outdir, "tagged.parquet")    
+    LOGGER.info(f"Writing tagged connectome to {outfile}...")
     tagged_connectome.to_parquet(outfile)
 
 
@@ -232,11 +245,6 @@ def make_graphs(tagged_connectome: ddf.DataFrame, outdir: str):
     raise NotImplementedError
 
 
-def make_brain_maps(tagged_connectome: ddf.DataFrame, outdir: str):
-    """ Use PyVista to generate before and after brain map images. """
-    raise NotImplementedError
-
-
 
 
 
@@ -253,32 +261,49 @@ def report_duration(session_id, duration):
 
 def main():
     """ Run the full statistical analysis pipeline from loading to reporting """
-    # Set-up performance testing stuff
-    args = parse_args()
-    session_id = create_session_id(args.file, args.cores)
+    global ARGS
+    # Set-up testing / debugging stuff
+    session_id = create_session_id(ARGS.file, ARGS.cores)
     outdir = os.path.join(RESULT_DIR, session_id)
-    os.mkdir(outdir)
-    
-    # Start timing
-    start_time = datetime.now()
+    os.makedirs(outdir, exist_ok = True)
+    initialise_log_file(outdir)
+    start_time = datetime.now() # Start timing actual pipeline
     
     # Set up cluster, load data, and identify communities
-    start_cluster(args.cores)
-    connectome = load_connectome(args.file)
-    tagged = detect_communities.run(connectome, args.min, args.madk)
+    start_cluster(ARGS.cores)
+    connectome = load_connectome(ARGS.file)
+    tagged = detect_communities.run(connectome, ARGS)
+    
+    # Sum probabilities of neurotransmitters that are not inherently excitatory
+    # or regulatory together - only interested in excitatory-inhibitory dynamics
+    # in this analysis. The sums of neurotransmitter probabilities are sometimes
+    # just a few decimal places out from being exactly 1, so normalise as well.
+    LOGGER.info("Normalising neurotransmitter probabilities ...")
+    other_nt = ["glut", "oct", "ser", "da"]
+    other_sum = tagged[other_nt].sum(axis=1)
+    tagged["other"] = other_sum
+    tagged = tagged.drop(columns = other_nt)
+    tagged["total_prob"] = tagged[["gaba", "ach", "other"]].sum(axis=1)
+    tagged["gaba"] = tagged["gaba"] / tagged["total_prob"]
+    tagged["ach"] = tagged["ach"] / tagged["total_prob"]
+    tagged["other"] = tagged["other"] / tagged["total_prob"]
+    
+    LOGGER.info("Making brain map ...")
+    make_brain_map.make_brain_map(tagged, coord_dir, outdir)
     
     # Write tagged data, perform analyses, and generate visuals. None of these
     # tasks depend on the completion of any other of these tasks.
-    w1_f = CLIENT.submit(write_tagged_connectome, tagged, outdir)
-    w2_f = CLIENT.submit(write_community_data, tagged, outdir)
-    w3_f = CLIENT.submit(write_neuropil_data, tagged, outdir)
-    stats_f = CLIENT.submit(do_stats, tagged, outdir)
-    graphs_f = CLIENT.submit(make_graphs, tagged, outdir)
-    bm_f = CLIENT.submit(make_brain_maps, tagged, outdir)
-    futures = [w1_f, w2_f, w3_f, stats_f, graphs_f, bm_f]
-    status = futures.gather() # Block until are tasks are done
+    #w1_f = CLIENT.submit(write_tagged_connectome, tagged, outdir)
+    #w2_f = CLIENT.submit(write_community_data, tagged, outdir)
+    #w3_f = CLIENT.submit(write_neuropil_data, tagged, outdir)
+    #stats_f = CLIENT.submit(do_stats, tagged, outdir)
+    #graphs_f = CLIENT.submit(make_graphs, tagged, outdir)
+    #bm_f = CLIENT.submit(make_brain_maps, tagged, outdir)
+    #futures = [w1_f, w2_f, w3_f, stats_f, graphs_f, bm_f]
+    #status = CLIENT.gather(futures) # Block until are tasks are done
     
     # Stop timing and report duration
+    LOGGER.info(f"End of pipeline! Results available in {outdir}")
     end_time = datetime.now()
     duration = end_time - start_time
     report_duration(session_id, duration)
