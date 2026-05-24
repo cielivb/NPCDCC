@@ -69,6 +69,10 @@ LOGGER = logging.getLogger(__name__)
 logging.getLogger("distributed.shuffle").setLevel(logging.WARNING)
 logging.getLogger("fsspec").setLevel(logging.WARNING)
 
+
+
+### Admin -----------------------------------------------------------------
+
 def create_session_id(file, num_cores):
     """ Derive session id from filename, number of cores, and datetime """
     datetime_id = datetime.now().strftime("%Y%m%d%H%M")
@@ -102,6 +106,11 @@ def start_cluster(num_cores):
     CLIENT = Client(cluster)
 
 
+
+
+### File I/O --------------------------------------------------------------
+    
+
 def load_connectome(file) -> ddf.DataFrame:
     """ Load parquet connectome file into dask dataframe """
     LOGGER.info(f"Loading connectome ({file}) ...")
@@ -116,136 +125,95 @@ def write_tagged_connectome(tagged_connectome: ddf.DataFrame, outdir: str):
     outfile = os.path.join(outdir, "tagged.parquet")    
     LOGGER.info(f"Writing tagged connectome to {outfile}...")
     tagged_connectome.to_parquet(outfile)
+    
+    
+def load_coord_file():
+    """ Load in edge coordinate data from 12.7 GB parquet file """
+    global DATA_DIR
+    coord_file_path = os.path.join(DATA_DIR, "flywire_synapses_783.parquet")
+    edge_coords = ddf.read_parquet( # Don't read in neurotransmitter prob cols
+        file, columns=["pre_pt_root_id", "post_pt_root_id", 
+                       "pre_pt_position_x", "pre_pt_position_y", 
+                       "pre_pt_position_z", "post_pt_position_x", 
+                       "post_pt_position_y", "post_pt_position_z"])
+    edge_coords = edge_coords.rename(cols=["pre","post"])
+    return edge_coords
 
 
-def write_community_data(tagged_connectome: ddf.DataFrame, outdir: str):
-    """ Generate and write the following metrics for each community:
+### Get communities -------------------------------------------------------
     
-    Community ID, number of nodes, number of edges, number of synapses, 
-    dominant neuropil, neuropil purity (i.e., the largest proportion of edges in
-    a given neuropil), average GABA probabilities + variance, average acetylcholine 
-    probabilities + variance, average other neurotransmitter probabilities +
-    variance. 
+def attach_community_ids(connectome, minsize):
+    """ Use Leiden algorithm """
+    # Use a streaming approach instead of computing directly to avoid a sudden 
+    # RAM spike (probably not too big of a deal with my dataset but could be
+    # helpful for a larger dataset, especially considering parquet is compressed
+    # and loading it into pandas uncompresses it)
+    g = ig.Graph(directed=True)
+    for partition in connectome.to_delayed():
+        pdf = partition.compute()
+        pre, post = pdf["pre"].tolist(), pdf["post"].tolist()
+        syn_count = pdf["syn_count"].to_list()
+        
+        # Add nodes if required. This works because nodes/vertices must be and 
+        # are labelled 0, 1, ..., n.
+        max_node = max(max(pre), max(post))
+        if max_node >= g.vcount():
+            g.add_vertices(max_node + 1 - g.vcount())
+            
+        # Add edges then assign edge weights (=syn_count) to newly added edges
+        g.add_edges(list(zip(pre, post)))
+        g.es[-len(syn_count):]["weight"] = syn_count # es = 'edge sequence'
     
-    Tagged connectome has columns : pre, post, syn_count, neuropil, gaba_avg,
-    ach_avg, glut_avg, oct_avg, ser_avg, da_avg, community_id
+    # Run the Leiden community detection algorithm and extract communities
+    communities = algorithms.leiden(g, weights=g.es["weight"])
+    communities_list = communities.communities # List of lists
     
-    """
-    df = tagged_connectome
+    # Turn sufficiently large lists/communities into dask dataframes
+    community_dfs = []
+    for community in communities_list:
+        if len(community) >= minsize:
+            new_df = ddf.from_pandas(pd.DataFrame(community, columns=["node_id"]))
+            community_dfs.append(new_df)
     
-    easy_aggs = {"pre": "count", "syn_count": "sum",
-                 "gaba_avg": ["mean", "var", "min", "max"],
-                 "ach_avg": ["mean", "var", "min", "max"],
-                 "glut_avg": ["mean", "var", "min", "max"],
-                 "oct_avg": ["mean", "var", "min", "max"],
-                 "ser_avg": ["mean", "var", "min", "max"],
-                 "da_avg": ["mean", "var", "min", "max"]}
-    group1 = df.groupby("community_id").agg(easy_aggs).rename(
-        columns={"num_edges": "pre"})
+    # Create dataframe of node_ids and community_ids
+    comm_ids = range(0, len(community_dfs))
+    for comm_df, comm_id in zip(community_dfs, comm_ids):
+        comm_df["community_id"] = comm_id
+    community_df = ddf.concat(community_dfs)
     
-    # Calculate dominant neuropil - the neuropil that accounts for the largest
-    # proportion of edges in the community, and calculate neuropil purity, the 
-    # maximum proportion of the community's edges belonging to a single neuropil,
-    # i.e., the proportion of edges of the community belonging to the dominant 
-    # neuropil.
-    def get_dominant_neuropil(df: pd.DataFrame):
-        total_edges = df["num_edges"].sum()
-        max_edges_i = df["num_edges"].idxmax()
-        dominant_neuropil = df.loc[max_edges_i]["neuropil"]
-        prop = df.loc[max_edges_i]["num_edges"] / total_edges # purity
-        return pd.from_dict({"community_id": community_id, 
-                             "dominant": dominant_neuropil, 
-                             "purity": prop})
-    neuropil_counts = df.groupby(
-        ["community_id", "neuropil"])["pre"].count().rename("num_edges")
-    group2 = neuropil_counts.groupby("community_id").apply(get_dominant_neuropil)
+    # Merge community_df with connectome to tag edges with community IDs
+    tagged = connectome.merge(
+        community_df, left_index=True, right_on="node_id", how="left")
     
-    # Get number of nodes/neurons per community
-    communities = list(df["community_id"].drop_duplicates().compute())
-    @delayed
-    def get_num_nodes_by_community(community_id):
-        subset = df[df["community_id"] == community_id]
-        num_nodes = detect_communities.get_num_nodes(subset) # Returns computed int
-        return pd.from_dict({"community_id": community_id, "num_nodes": num_nodes})
-    tasks = [get_num_nodes_by_community(comm) for comm in communities]
-    group3 = ddf.from_delayed(tasks)
-    
-    # Merge the 3 groups then write to csv file
-    result = group1.merge(group2, on="community_id", how="inner")
-    result = result.merge(group3, on="community_id", how="inner")
-    outfile = os.path.join(outdir, "summary_stats_communities.csv")
-    result.to_csv(outfile, write_index=True)
+    return tagged
+        
 
 
-def write_neuropil_data(tagged_connectome: ddf.DataFrame, outdir: str):
-    """ Generate and write the following metrics for each neuropil: 
-    
-    Neuropil, number of communities, number of edges assigned to communities, number
-    of synapses assigned to communities, number of edges not assigned to communities,
-    number of synapses not assigned to communities, percentage of edges assigned
-    to communities, percentage of edges not assigned to communities, percentage of
-    synapses assigned to communities, percentage of synapses not assigned to
-    communities, average GABA probs + var for community edges vs other edges,
-    average acetylchole probs + var for community edges vs other edges, and
-    average other neurotransmitter probs + var for community vs other edges.
-    
-    Neuropils with L and R portions should have L and R portion summary stats
-    in addition to collated summary stats.
-    
-    Tagged connectome has columns : pre, post, syn_count, neuropil, gaba_avg,
-    ach_avg, glut_avg, oct_avg, ser_avg, da_avg, community_id
-    
-    """
-    df = tagged_connectome
-    df["assigned"] = df[df["community_id"].notna()]
-    df["base_neuropil"] = df["neuropil"].str.split("_").str[0]
-    df["hemisphere"] = df["neuropil"].str.split("_").str[1] # L or R
-    
-    # Get overall neuropil summary statistics
-    nt_cols = ["gaba_avg", "ach_avg", "glut_avg", "oct_avg", "ser_avg", "da_avg"]
-    easy_aggs = {"pre": "count", "syn_count": "sum", 
-                   **{nt: ["mean", "var"] for nt in nt_cols}}
-    overall_stats = df.groupby("neuropil").agg(easy_aggs)
-    
-    # Get community and bridge stats
-    comm_stats = df[df["assigned"]].groupby("neuropil").agg(
-        base_aggs).add_prefix("comm_")
-    bridge_stats = df[~df["assigned"]].groupby("neuropil").agg(
-        base_aggs).add_prefix("bridge_")
-    
-    # Merge overall stats, community stats, and bridge stats columnwise
-    stat_df = ddf.concat([overall_stats, comm_stats, bridge_stats], axis=1)
-    
-    # Compute proportion of edges and synapses assigned to communities
-    stat_df["prop_edges_comm"] = stat_df["comm_pre_count"] / stat_df["pre_count"]
-    stat_df["prop_synapses_comm"] = stat_df["comm_syn_count_sum"] / stat_df["syn_count_sum"]
+### Ops -------------------------------------------------------------------
 
-    # Aggregate left and right hemisphere neuropils into single neuropil summary
-    # and add to stat_df
-    combined = df.groupby("base_neuropil").agg(easy_aggs)
-    stat_df = ddf.concat([stat_df, combined])
 
-    # Write to file
-    outfile = os.path.join(outdir, "summary_stats_neuropils.csv")    
-    stat_df.to_csv(outfile, write_index=True)
+def attach_coords(connectome):
+    """ Merge connectome with coord dataframe and calculated midpoint coords """
+    coord_df = load_coord_file()
+    merged = connectome.merge(coord_df, on=["pre","post"])
+    pass
 
     
-
-
-def do_stats(tagged_connectome: ddf.DataFrame, outdir: str):
-    """ Run a statistical analysis on the communities and report the results. 
-    Only communities with neuropil purity >= 98% will be used in brain region
-    comparisons.
-    """
-    raise NotImplementedError
-
-
-def make_graphs(tagged_connectome: ddf.DataFrame, outdir: str):
-    """ Generate supporting bar charts """
-    raise NotImplementedError
-
-
-
+def normalise_neurotransmitter_probs(tagged):
+    # Sum probabilities of neurotransmitters that are not inherently excitatory
+    # or regulatory together - only interested in excitatory-inhibitory dynamics
+    # in this analysis. The sums of neurotransmitter probabilities are sometimes
+    # just a few decimal places out from being exactly 1, so normalise as well.
+    LOGGER.info("Normalising neurotransmitter probabilities ...")
+    other_nt = ["glut", "oct", "ser", "da"]
+    other_sum = tagged[other_nt].sum(axis=1)
+    tagged["other"] = other_sum
+    tagged = tagged.drop(columns = other_nt)
+    tagged["total_prob"] = tagged[["gaba", "ach", "other"]].sum(axis=1)
+    tagged["gaba"] = tagged["gaba"] / tagged["total_prob"]
+    tagged["ach"] = tagged["ach"] / tagged["total_prob"]
+    tagged["other"] = tagged["other"] / tagged["total_prob"]
+    return tagged
 
 
 
@@ -269,38 +237,15 @@ def main():
     initialise_log_file(outdir)
     start_time = datetime.now() # Start timing actual pipeline
     
-    # Set up cluster, load data, and identify communities
-    start_cluster(ARGS.cores)
-    connectome = load_connectome(ARGS.file)
-    tagged = detect_communities.run(connectome, ARGS)
+    # Start of pipeline
+    connectome = load_connectome(ARGS.file).set_index("pre", drop = False)
+    trimmed = connectome[["pre", "post", "syn_count"]]
+    tagged_connectome = attach_community_ids(trimmed)
+    # Probably another filtering step here?
+    connectome = attach_coords(tagged_connectome)
     
-    # Sum probabilities of neurotransmitters that are not inherently excitatory
-    # or regulatory together - only interested in excitatory-inhibitory dynamics
-    # in this analysis. The sums of neurotransmitter probabilities are sometimes
-    # just a few decimal places out from being exactly 1, so normalise as well.
-    LOGGER.info("Normalising neurotransmitter probabilities ...")
-    other_nt = ["glut", "oct", "ser", "da"]
-    other_sum = tagged[other_nt].sum(axis=1)
-    tagged["other"] = other_sum
-    tagged = tagged.drop(columns = other_nt)
-    tagged["total_prob"] = tagged[["gaba", "ach", "other"]].sum(axis=1)
-    tagged["gaba"] = tagged["gaba"] / tagged["total_prob"]
-    tagged["ach"] = tagged["ach"] / tagged["total_prob"]
-    tagged["other"] = tagged["other"] / tagged["total_prob"]
-    
-    LOGGER.info("Making brain map ...")
-    make_brain_map.make_brain_map(tagged, coord_dir, outdir)
-    
-    # Write tagged data, perform analyses, and generate visuals. None of these
-    # tasks depend on the completion of any other of these tasks.
-    #w1_f = CLIENT.submit(write_tagged_connectome, tagged, outdir)
-    #w2_f = CLIENT.submit(write_community_data, tagged, outdir)
-    #w3_f = CLIENT.submit(write_neuropil_data, tagged, outdir)
-    #stats_f = CLIENT.submit(do_stats, tagged, outdir)
-    #graphs_f = CLIENT.submit(make_graphs, tagged, outdir)
-    #bm_f = CLIENT.submit(make_brain_maps, tagged, outdir)
-    #futures = [w1_f, w2_f, w3_f, stats_f, graphs_f, bm_f]
-    #status = CLIENT.gather(futures) # Block until are tasks are done
+    # End of pipeline
+
     
     # Stop timing and report duration
     LOGGER.info(f"End of pipeline! Results available in {outdir}")
