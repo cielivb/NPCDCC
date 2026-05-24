@@ -1,5 +1,7 @@
 """ Parallel Breadth First Search Functions - Dask Implementation """
 
+import logging
+import numpy as np
 import pandas as pd
 from dask import dataframe as ddf
 from typing import TypeAlias
@@ -28,7 +30,7 @@ def seed_pbfs(df: PDF|DDF, start_node: int, full: bool):
         pc_df = ddf.from_dict({"parent": pd.Series(dtype=np.int64), 
                                "child": pd.Series(dtype=np.int64),
                                "syn_count": pd.Series(dtype=np.int64)}, 
-                              npartitions=1).set_index("depth", drop = False)        
+                              npartitions=1).set_index("parent", drop = False)        
     if full and isinstance(df, PDF):
         cp_df = pd.DataFrame({"child": pd.Series(dtype=np.int32), 
                               "parent": pd.Series(dtype=np.int32),
@@ -70,9 +72,11 @@ def pbfs_hybrid(start_node: int, df: DDF|PDF, state: DDF|PDF, full=True):
 
     """
     # Set up initial PBFS variables
+    LOGGER = logging.getLogger(__name__)
     depth, checkpoint_interval, is_dask = 0, 50, isinstance(df, DDF)
     level_nodes, pc_df, cp_df, num_sps_df = seed_pbfs(df, start_node, full)
     
+    LOGGER.debug("Entering pbfs_hybrid loop ...")
     while True:
         # Update child-parent and parent-children relationship dataframes
         state = update_state_df(state, level_nodes, "D")
@@ -107,6 +111,7 @@ def pbfs_hybrid(start_node: int, df: DDF|PDF, state: DDF|PDF, full=True):
         # Persist dask dataframes every checkpoint_interval iterations to 
         # prevent task graph explosions
         if is_dask and depth % checkpoint_interval == 0:
+            LOGGER.debug("Reached PBFS checkpoint interval")
             state, pc_df = state.persist(), pc_df.persist()
             if full:
                 cp_df, num_sps = cp_df.persist(), num_sps.persist()
@@ -115,14 +120,14 @@ def pbfs_hybrid(start_node: int, df: DDF|PDF, state: DDF|PDF, full=True):
 def get_level_data(level_nodes: PDF|DDF, df: PDF|DDF) -> DDF|PDF:
     """ Get edge data for edges involving any node in level_nodes """
     # df is undirected, so only need to look at 'pre' column
-    subset_full = level_nodes.merge(component, left_on="node_id", 
+    subset_full = level_nodes.merge(df, left_on="node_id", 
                                     right_index=True, how="inner")
     subset = subset_full[["pre", "post", "syn_count"]]
     subset = subset.set_index("pre", drop=False)
     return subset    
 
 
-def update_state_df(state: PDF|DDF, level_nodes: PDF|DDF, new_status: str) -> DDF|PDF:
+def update_state_df(state: PDF|DDF, nodes_to_update: PDF|DDF, new_status: str) -> DDF|PDF:
     """ Update states of level_nodes in state dataframe to either D or P """    
     merged = state.merge(nodes_to_update, left_index=True, right_on="node_id", 
                          how="left", indicator=True)

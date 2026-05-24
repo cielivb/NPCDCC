@@ -1,8 +1,11 @@
 """ Graph Utilities / Helper Functions """
 
+import logging
 import pandas as pd
 from dask import dataframe as ddf
 from typing import TypeAlias
+
+from . import pbfs
 
 DDF: TypeAlias = ddf.DataFrame
 PDF: TypeAlias = pd.DataFrame
@@ -36,6 +39,17 @@ def create_state_df(df: DDF|PDF) -> DDF|PDF:
     return state
 
 
+def get_start_node_for_get_components(state):
+    """ Scan partitions for index of first U in that partition. This feels hacky
+    but will be faster than original strategy that scanned entire dask dataframe """
+    def first_u(df: PDF):
+        first_i_w_u = pdf.loc[df["state"] == "U"]
+        return first_i_w_u.head(1)
+    candidates = state.map_partitions(first_u)
+    start_node = candidates.head(1).index.compute()
+    return start_node
+
+
 def get_components(df: DDF) -> list[DDF]:
     """ Return a list of component dataframes.
     
@@ -47,14 +61,19 @@ def get_components(df: DDF) -> list[DDF]:
     components. Only one component can be discovered at a time.
 
     """    
+    LOGGER = logging.getLogger(__name__)
+    LOGGER.debug("Creating state dataframe ...")
     state = create_state_df(df)
     components = []
     
+    LOGGER.debug("Entering while loop ...")
     while not (state["state"] == "P").all().compute():
-        
+        LOGGER.debug(f"Entered while loop")
         # Get nodes present in next component
-        start_node = state[state["state"] == "U"].head(1).index.compute()[0]
-        state, pc_df = pbfs(start_node, undirected_df, state, full=False)
+        LOGGER.debug(f"Getting start node ...")
+        start_node = get_start_node_for_get_components(state)
+        LOGGER.debug(f"Got start node = {start_node}, type = {type(start_node)}")
+        state, pc_df = pbfs.pbfs_hybrid(start_node, df, state, full=False)
         comp_nodes = get_all_nodes(
             pc_df, node_cols=["parent","child"]).to_frame(name="node")
         
@@ -63,7 +82,8 @@ def get_components(df: DDF) -> list[DDF]:
         merged2 = comp_nodes.merge(df, left_on="node", right_on="post", how="inner")
         component_df = ddf.concat([merged1, merged2]).drop_duplicates().persist()
         components.append(component_df)
-
+    
+    LOGGER.debug(f"Found {len(component_df)} components!")
     return components.persist()
 
 
@@ -79,7 +99,6 @@ def get_components_pd(dask_df: DDF) -> list[DDF]:
 
     """
     df = dask_df.compute() # Convert to pandas
-    undirected_df = undirect_df(df)
     state = create_state_df(df)
     components = []
     
@@ -87,7 +106,7 @@ def get_components_pd(dask_df: DDF) -> list[DDF]:
         
         # Get nodes present in next component
         start_node = state[state["state"] == "U"].head(1).index[0]
-        state, pc_df = pbfs_pd(start_node, undirected_df, state, full=False)
+        state, pc_df = pbfs.pbfs_hybrid(start_node, df, state, full=False)
         comp_nodes = get_all_nodes(
             pc_df, node_cols=["parent", "child"]).to_frame(name="node")
 

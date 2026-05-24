@@ -7,6 +7,7 @@ down, then returns the tagged connectome
 
 """
 import dask
+import logging
 import threading
 
 from dask.distributed import wait
@@ -27,10 +28,11 @@ CLIENT = None
 BIG_COMPS = Queue()
 SMALL_COMPS = Queue()
 COMMUNITIES = Queue()
+AWAITING_FATES = Queue()
 MAX_WORKER_DF_SIZE = None
 ESP = dict() # Edge Scoring Progress
 NEXT_ID, LOCK = 1, Lock()
-NUM_SMALL_PROCESSED = 0
+SMALL_IN_PROGRESS = set()
 
 
 def get_next_comp_id():
@@ -42,12 +44,17 @@ def get_next_comp_id():
     return to_return
 
 
-def increment_num_small_processed():
-    """ Thread-safe increment of global number processed tracker """
-    global NUM_SMALL_PROCESSED, LOCK
+def update_small_in_progress(comp_id: int, do: str):
+    """ Thread-safe in-progress component ID update """
+    global SMALL_IN_PROGRESS, LOCK
     with LOCK:
-        NUM_SMALL_PROCESSED += 1
-    
+        if do == "add":
+            SMALL_IN_PROGRESS.add(comp_id)
+        elif do == "remove":
+            SMALL_IN_PROGRESS.remove(comp_id)
+        else:
+            raise
+        
 
 def get_worker_df_size(client) -> float:
     """ Return maximum pandas dataframe size based on worker RAM allowance """  
@@ -80,30 +87,37 @@ def is_community(proc_comp, og_comp) -> bool:
 
 def decide_fate(result):
     """ Inspect girvan newman results to decide component fates. 
-    Each tuple is of form (proc_comp, og_comp)
+    Each tuple is of form (comp_id, proc_comp, og_comp)
     """
-    global BIG_COMPS, SMALL_COMPS, COMMUNITIES
+    global BIG_COMPS, SMALL_IN_PROGRESS, COMMUNITIES
+    LOGGER = logging.getLogger(__name__)
     if isinstance(result, dask.distributed.Future):
-        proc_comp, og_comp = result.result()
+        comp_id, proc_comp, og_comp = result.result()
     else: # Special case with original connectome
+        LOGGER.debug("Special case detected!")
         proc_comp, og_comp = result
     if is_community(proc_comp, og_comp):
         COMMUNITIES.put(proc_comp)
+        LOGGER.debug("New community found!")
     else: # get_components involves computes -> driver only
+        LOGGER.debug("Getting components ...")
         new_comps = graph_utils.get_components(proc_comp) # Blocking
         for comp in new_comps:
-            if should_send_to_worker(comp):
-                SMALL_COMPS.put(comp)
+            if should_send_to_worker(comp): # Send to small component / worker pipeline
+                comp_id = get_next_comp_id()
+                f = CLIENT.submit(graph_utils.prune_pd, comp_id, to_prune)
+                f.add_done_callback(process_pruned)
+                update_small_in_progress(comp_id, "add")              
             else:
                 BIG_COMPS.put(comp)
+    update_small_in_progress(comp_id, "remove")
 
 
 def process_pruned(pruned_future):
     """ Get edge scores of pruned component """
     global ESP, CLIENT
-    pruned = pruned_future.result()
+    comp_id, pruned = pruned_future.result()
     start_nodes = edge_scoring.get_start_nodes(pruned)
-    comp_id = get_next_comp_id()
     ESP[comp_id] = (pruned, set())
     for s in start_nodes:
         f = CLIENT.submit(edge_scoring.get_scores_pd, pruned, s)
@@ -113,22 +127,28 @@ def process_pruned(pruned_future):
 def process_aggregated(aggregated_future):
     """ Chop the dataframe based on edge scores then decide its fate """
     global CLIENT
-    comp_w_scores = aggregated_future.result()
-    f = CLIENT.submit(edge_scoring.chop_pd, comp_w_scores)
-    f.add_done_callback(decide_fate)
+    comp_id, comp_w_scores = aggregated_future.result()
+    f = CLIENT.submit(edge_scoring.chop_pd, comp_id, comp_w_scores)
+    f.add_done_callback(await_fate)
 
+
+def await_fate(processed_future):
+    """ Add (proc_comp, og_comp) pair to global AWAITING_FATES queue """
+    global AWAITING_FATES
+    AWAITING_FATES.put(processed_future)
+    
 
 def log_progress(detection_done: Event):
     """ Print number components remaining every 30 seconds """
     global BIG_COMPS, SMALL_COMPS, COMMUNITIES
     while True:
         curr_time = datetime.now().strftime("%H:%M:%S")
-        print(f"{curr_time}: big comps remaining = {BIG_COMPS.qsize}, "
+        LOGGER.info(f"{curr_time}: big comps remaining = {BIG_COMPS.qsize}, "
               f"small comps remaining = {SMALL_COMPS.qsize}, "
               f"communities found = {COMMUNITIES.qsize}")
         done = detection_done.wait(30)
         if done: break
-    print(f"Community detection complete - found {COMMUNITY.qsize} communities")
+    LOGGER.info(f"Community detection complete - found {COMMUNITY.qsize} communities")
 
 
 def run(connectome: DDF, args) -> DDF:
@@ -152,21 +172,27 @@ def run(connectome: DDF, args) -> DDF:
     """    
     global BIG_COMPS, SMALL_COMPS, COMMUNITIES, MAX_WORKER_DF_SIZE
     global CLIENT, NUM_SMALL_PROCESSED
+    LOGGER = logging.getLogger(__name__)
     
     # Set up initial variables
-    print("Initialising community detection algorithm ...")
+    LOGGER.info("Initialising community detection algorithm ...")
     CLIENT = get_client()
     MAX_WORKER_DF_SIZE = get_worker_df_size(CLIENT)
     num_small_submitted = 0    
     
     # Only need 3 columns for community detection
+    LOGGER.debug("Trimming ...")
     trimmed = connectome[["pre", "post", "syn_count"]]
+    LOGGER.debug("Repartitioning ...")
+    trimmed = trimmed.repartition(npartitions=200).persist()  
     
     # Undirect connectome and set the pre column of connectome to be the index
+    LOGGER.debug("Undirecting ...")
     undirected_connectome = graph_utils.undirect_df(trimmed)
     undirected_connectome = undirected_connectome.set_index("pre", drop = False)
                     
     # Get and allocate initial components
+    LOGGER.debug("Getting and allocating initial components ...")
     decide_fate((undirected_connectome, None))
     
     # Start progress logger thread
@@ -175,14 +201,11 @@ def run(connectome: DDF, args) -> DDF:
     prog_logger.start()
     # Enter control loop - continue breaking connectome components down into
     # communities until no more components remain to be processed
-    while not (BIG_COMPS.empty and SMALL_COMPS.empty):
+    while not (BIG_COMPS.empty and len(SMALL_IN_PROGRESS) == 0):
         
-        # Submit new small components to start of small components pipeline
-        while not SMALL_COMPS.empty:
-            to_prune = SMALL_COMPS.get()
-            f = CLIENT.submit(graph_utils.prune_pd, to_prune)
-            f.add_done_callback(process_pruned)
-            num_small_submitted += 1
+        # Decide fates for every component awaiting their fate
+        while not AWAITING_FATES.empty:
+            decide_fate(AWAITING_FATES.get()) # Blocks on get_components()
 
         # Push small components that have completed the PBFS stage forward
         # through pipeline past the artificial MGN PBFS synchronisation barrier
@@ -190,7 +213,8 @@ def run(connectome: DDF, args) -> DDF:
             comp, future_list = comp_tup[0], comp_tup[1]
             if all(f.done() for f in future_list): # if ready
                 scores_list = [f.result() for f in future_list] # list of DDF
-                f = CLIENT.submit(edge_scoring.aggregate_scores, comp, scores_list)
+                f = CLIENT.submit(
+                    edge_scoring.aggregate_scores, comp_id, comp, scores_list)
                 f.add_done_callback(process_aggregated)
         
         # Process one big component
@@ -214,7 +238,7 @@ def tag(connectome: DDF, communities_q: Queue) -> DDF:
     list a community ID, concatenate the cluster dataframes, then left merge
     connectome_df onto cluster_dfs.
     """
-    print("Tagging connectome with discovered communities ...")
+    LOGGER.info("Tagging connectome with discovered communities ...")
     if communities_q.empty: return None
     
     # Tag communities while draining communities_q

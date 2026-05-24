@@ -35,6 +35,7 @@ TODO
 """
 import argparse
 import dask
+import logging
 import os
 import pandas as pd
 from dask import bag as db
@@ -50,7 +51,7 @@ import make_brain_map
 
 
 CLIENT = None # Assigned in start_cluster()
-dask.config.set({"dataframe.shuffle.method": "tasks"})
+dask.config.set({"dataframe.shuffle.method": "p2p"})
 
 ROOT_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(ROOT_DIR, "data")
@@ -63,6 +64,10 @@ p.add_argument("-m", "--min", help="Minimum number of edges", type=int, default=
 p.add_argument("-k", "--madk", help="MAD outlier detection K", type=float, default=2.5)
 ARGS = p.parse_args()
 
+logging.basicConfig(level = logging.DEBUG)
+LOGGER = logging.getLogger(__name__)
+logging.getLogger("distributed.shuffle").setLevel(logging.WARNING)
+logging.getLogger("fsspec").setLevel(logging.WARNING)
 
 def create_session_id(file, num_cores):
     """ Derive session id from filename, number of cores, and datetime """
@@ -71,14 +76,22 @@ def create_session_id(file, num_cores):
     if "_" in filename:
         filename = "full"
     session_id = f"{datetime_id}_{num_cores}_{filename}"
-    print(f"Session ID: {session_id}")
+    LOGGER.info(f"Session ID: {session_id}")
     return session_id
 
+
+def initialise_log_file(outdir: str):
+    """ Add file handler that maps to log file in output directory to logger """
+    log_path = os.path.join(outdir, "log.log")
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(logging.Formatter("%(asctime)s: %(message)s"))
+    logging.getLogger().addHandler(fh)
+    
 
 def start_cluster(num_cores):
     """ Create dask client and start cluster with 1 worker per core """
     global CLIENT
-    print("Starting cluster ...")    
+    LOGGER.info("Starting cluster ...")    
     cluster = LocalCluster(
         n_workers=num_cores,
         processes=True,
@@ -91,7 +104,7 @@ def start_cluster(num_cores):
 
 def load_connectome(file) -> ddf.DataFrame:
     """ Load parquet connectome file into dask dataframe """
-    print(f"Loading connectome ({file}) ...")
+    LOGGER.info(f"Loading connectome ({file}) ...")
     connectome = ddf.read_parquet(file)
     connectome = connectome.rename(columns = {"pre_pt_root_id": "pre",
                                               "post_pt_root_id": "post"})
@@ -101,7 +114,7 @@ def load_connectome(file) -> ddf.DataFrame:
 def write_tagged_connectome(tagged_connectome: ddf.DataFrame, outdir: str):
     """ Write tagged connectome to parquet file """
     outfile = os.path.join(outdir, "tagged.parquet")    
-    print(f"Writing tagged connectome to {outfile}...")
+    LOGGER.info(f"Writing tagged connectome to {outfile}...")
     tagged_connectome.to_parquet(outfile)
 
 
@@ -249,13 +262,12 @@ def report_duration(session_id, duration):
 def main():
     """ Run the full statistical analysis pipeline from loading to reporting """
     global ARGS
-    # Set-up performance testing stuff
+    # Set-up testing / debugging stuff
     session_id = create_session_id(ARGS.file, ARGS.cores)
     outdir = os.path.join(RESULT_DIR, session_id)
     os.makedirs(outdir, exist_ok = True)
-    
-    # Start timing
-    start_time = datetime.now()
+    initialise_log_file(outdir)
+    start_time = datetime.now() # Start timing actual pipeline
     
     # Set up cluster, load data, and identify communities
     start_cluster(ARGS.cores)
@@ -266,7 +278,7 @@ def main():
     # or regulatory together - only interested in excitatory-inhibitory dynamics
     # in this analysis. The sums of neurotransmitter probabilities are sometimes
     # just a few decimal places out from being exactly 1, so normalise as well.
-    print("Normalising neurotransmitter probabilities ...")
+    LOGGER.info("Normalising neurotransmitter probabilities ...")
     other_nt = ["glut", "oct", "ser", "da"]
     other_sum = tagged[other_nt].sum(axis=1)
     tagged["other"] = other_sum
@@ -276,7 +288,7 @@ def main():
     tagged["ach"] = tagged["ach"] / tagged["total_prob"]
     tagged["other"] = tagged["other"] / tagged["total_prob"]
     
-    print("Making brain map ...")
+    LOGGER.info("Making brain map ...")
     make_brain_map.make_brain_map(tagged, coord_dir, outdir)
     
     # Write tagged data, perform analyses, and generate visuals. None of these
@@ -291,7 +303,7 @@ def main():
     #status = CLIENT.gather(futures) # Block until are tasks are done
     
     # Stop timing and report duration
-    print(f"End of pipeline! Results available in {outdir}")
+    LOGGER.info(f"End of pipeline! Results available in {outdir}")
     end_time = datetime.now()
     duration = end_time - start_time
     report_duration(session_id, duration)
