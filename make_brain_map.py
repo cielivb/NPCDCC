@@ -1,5 +1,6 @@
 """ PyVista Brain Map Creation """
 import numpy as np
+import pandas as pd
 import pyvista as pv
 from dask import dataframe as ddf
 

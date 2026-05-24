@@ -18,8 +18,8 @@ from threading import Lock
 from time import sleep
 from typing import TypeAlias
 
-import edge_scoring
-import graph_utils
+from . import edge_scoring
+from . import graph_utils
 
 DDF: TypeAlias = ddf.DataFrame
 
@@ -122,13 +122,12 @@ def log_progress(detection_done: Event):
     """ Print number components remaining every 30 seconds """
     global BIG_COMPS, SMALL_COMPS, COMMUNITIES
     while True:
-        if detection_done.is_set():
-            break
         curr_time = datetime.now().strftime("%H:%M:%S")
         print(f"{curr_time}: big comps remaining = {BIG_COMPS.qsize}, "
               f"small comps remaining = {SMALL_COMPS.qsize}, "
               f"communities found = {COMMUNITIES.qsize}")
-        sleep(30)
+        done = detection_done.wait(30)
+        if done: break
     print(f"Community detection complete - found {COMMUNITY.qsize} communities")
 
 
@@ -173,7 +172,7 @@ def run(connectome: DDF, args) -> DDF:
     # Start progress logger thread
     detection_done = Event()
     prog_logger = threading.Thread(target=log_progress, args=(detection_done,))
-    
+    prog_logger.start()
     # Enter control loop - continue breaking connectome components down into
     # communities until no more components remain to be processed
     while not (BIG_COMPS.empty and SMALL_COMPS.empty):
@@ -204,7 +203,7 @@ def run(connectome: DDF, args) -> DDF:
     # Wait for all components in small pipeline to finish being processed.
     while num_small_submitted < NUM_SMALL_PROCESSED:
         sleep(5)
-    detection_done.set()
+    detection_done.set() # Terminate prog_logger thread
     
     return tag(connectome, COMMUNITIES)
 
@@ -215,6 +214,7 @@ def tag(connectome: DDF, communities_q: Queue) -> DDF:
     list a community ID, concatenate the cluster dataframes, then left merge
     connectome_df onto cluster_dfs.
     """
+    print("Tagging connectome with discovered communities ...")
     if communities_q.empty: return None
     
     # Tag communities while draining communities_q

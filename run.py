@@ -266,6 +266,7 @@ def main():
     # or regulatory together - only interested in excitatory-inhibitory dynamics
     # in this analysis. The sums of neurotransmitter probabilities are sometimes
     # just a few decimal places out from being exactly 1, so normalise as well.
+    print("Normalising neurotransmitter probabilities ...")
     other_nt = ["glut", "oct", "ser", "da"]
     other_sum = tagged[other_nt].sum(axis=1)
     tagged["other"] = other_sum
@@ -275,6 +276,7 @@ def main():
     tagged["ach"] = tagged["ach"] / tagged["total_prob"]
     tagged["other"] = tagged["other"] / tagged["total_prob"]
     
+    print("Making brain map ...")
     make_brain_map.make_brain_map(tagged, coord_dir, outdir)
     
     # Write tagged data, perform analyses, and generate visuals. None of these
@@ -289,6 +291,7 @@ def main():
     #status = CLIENT.gather(futures) # Block until are tasks are done
     
     # Stop timing and report duration
+    print(f"End of pipeline! Results available in {outdir}")
     end_time = datetime.now()
     duration = end_time - start_time
     report_duration(session_id, duration)
