@@ -113,7 +113,6 @@ def start_cluster(num_cores):
 
 def load_connectome(file) -> ddf.DataFrame:
     """ Load parquet connectome file into dask dataframe """
-    LOGGER.info(f"Loading connectome ({file}) ...")
     connectome = ddf.read_parquet(file)
     connectome = connectome.rename(columns = {"pre_pt_root_id": "pre",
                                               "post_pt_root_id": "post"})
@@ -132,46 +131,48 @@ def load_coord_file():
     global DATA_DIR
     coord_file_path = os.path.join(DATA_DIR, "flywire_synapses_783.parquet")
     edge_coords = ddf.read_parquet( # Don't read in neurotransmitter prob cols
-        file, columns=["pre_pt_root_id", "post_pt_root_id", 
-                       "pre_pt_position_x", "pre_pt_position_y", 
-                       "pre_pt_position_z", "post_pt_position_x", 
-                       "post_pt_position_y", "post_pt_position_z"])
-    edge_coords = edge_coords.rename(cols=["pre","post"])
+        coord_file_path, columns=["pre_pt_root_id", "post_pt_root_id", 
+                                  "pre_pt_position_x", "pre_pt_position_y", 
+                                  "pre_pt_position_z", "post_pt_position_x", 
+                                  "post_pt_position_y", "post_pt_position_z"])
+    edge_coords = edge_coords.rename(
+        columns={"pre_pt_root_id":"pre", "post_pt_root_id": "post"})
     return edge_coords
 
 
 ### Get communities -------------------------------------------------------
     
-def attach_community_ids(connectome, minsize):
+def attach_community_ids(connectome, mapping, minsize):
     """ Use Leiden algorithm """
     # Use a streaming approach instead of computing directly to avoid a sudden 
     # RAM spike (probably not too big of a deal with my dataset but could be
     # helpful for a larger dataset, especially considering parquet is often
     # compressed and loading it into pandas uncompresses it)
+    num_nodes = mapping.count().compute()["node_id"].item()
+    print(connectome.count().compute())
     g = ig.Graph(directed=True)
+    g.add_vertices(num_nodes)
+    g.vs["name"] = list(range(num_nodes))  # let name = node id
+    
     for partition in connectome.to_delayed():
         pdf = partition.compute()
-        pre, post = pdf["pre"].tolist(), pdf["post"].tolist()
+        print(pdf)
+        pre, post = pdf["pre_key"].tolist(), pdf["post_key"].tolist()
         syn_count = pdf["syn_count"].to_list()
-        
-        # Add nodes if required. This works because nodes/vertices must be and 
-        # are labelled 0, 1, ..., n.
-        max_node = max(max(pre), max(post))
-        if max_node >= g.vcount():
-            g.add_vertices(max_node + 1 - g.vcount())
-            g.vs["name"] = list(range(g.vcount())) # let name = node id
             
         # Add edges then assign edge weights (=syn_count) to newly added edges
         g.add_edges(list(zip(pre, post)))
         g.es[-len(syn_count):]["weight"] = syn_count # es = 'edge sequence'
     
     # Run the Leiden community detection algorithm and extract communities
+    print(g.vcount(), g.ecount())
     communities = algorithms.leiden(g, weights=g.es["weight"])
     communities_list = communities.communities # List of lists
     
     # Turn sufficiently large lists/communities into dask dataframes
     community_dfs = []
     for community in communities_list:
+        print(community)
         if len(community) >= minsize:
             new_df = ddf.from_pandas(pd.DataFrame(community, columns=["node_id"]))
             community_dfs.append(new_df)
@@ -184,7 +185,8 @@ def attach_community_ids(connectome, minsize):
     
     # Merge community_df with connectome to tag edges with community IDs
     tagged = connectome.merge(
-        community_df, left_index=True, right_on="node_id", how="left")
+        community_df, left_index=True, right_on="node_id", how="left").drop(
+            columns=["pre_key", "post_key"])
     
     return tagged
         
@@ -207,25 +209,18 @@ def map_nodes(connectome):
     """
     # Get key-node_id mapping
     all_node_ids = get_all_node_ids(connectome)
-    mapping = all_node_ids.assign(key=all_node_ids.index)
+    num_nodes = all_node_ids.count().compute()["node_id"].item()
+    key = pd.DataFrame({"key": [_ for _ in range(num_nodes)]})
+    key = ddf.from_pandas(key)
+    mapping = ddf.concat([all_node_ids, key], axis=1).persist()
     
-    # Map connectome node ids to new node ids
-    merged1 = connectome.merge(mapping, left_index=True, right_on="node_id", how="inner")
-    merged1 = merged1.drop(columns=["node_id","pre"]).rename(columns={"key": "pre"})
-    merged2 = merged1.merge(mapping, left_on="post", right_on="node_id", how="inner")
-    merged2 = merged2.drop(columns=["node_id","post"]).rename(columns={"key": "post"})
-    
-    return merged2.reset_index(drop=True), mapping
+    merged = connectome.merge(mapping, left_on="pre", right_on="node_id", how="inner")
+    merged = merged.rename(columns={"key": "pre_key"}).drop(columns=["node_id"])
+    merged = merged.merge(mapping, left_on="post", right_on="node_id", how="inner")
+    merged = merged.rename(columns={"key": "post_key"}).drop(columns=["node_id"])
+    print(merged.count().compute())
+    return merged.reset_index(drop=True), mapping
 
-
-def unmap_nodes(connectome, mapping):
-    """ Restore original connectome node IDs based on mapping """
-    merged1 = connectome.merge(mapping, left_on="pre", right_on="key", how="inner")
-    merged1 = merged1.drop(columns=["key"]).rename(columns={"node_id": "pre"})
-    merged2 = merged1.merge(mapping, left_on="post", right_on="key", how="inner")
-    merged2 = merged2.drop(columns=["key"]).rename(columns={"node_id": "post"})
-    return merged2
-    
 
 def attach_coords(connectome):
     """ Merge connectome with coord dataframe and calculated midpoint coords 
@@ -238,9 +233,9 @@ def attach_coords(connectome):
     merged["x"] = merged["pre_pt_position_x"] + merged["post_pt_position_x"] / 2
     merged["y"] = merged["pre_pt_position_y"] + merged["post_pt_position_y"] / 2
     merged["z"] = merged["pre_pt_position_z"] + merged["post_pt_position_z"] / 2
-    merged = merged.drop(cols=["pre_pt_position_x", "post_pt_position_x",
-                               "pre_pt_position_y", "post_pt_position_y",
-                               "pre_pt_position_z", "post_pt_position_z"])
+    merged = merged.drop(columns=["pre_pt_position_x", "post_pt_position_x",
+                                  "pre_pt_position_y", "post_pt_position_y",
+                                  "pre_pt_position_z", "post_pt_position_z"])
     return merged
 
     
@@ -284,14 +279,22 @@ def main():
     
     # Start of pipeline
     start_cluster(ARGS.cores)
-    connectome = load_connectome(ARGS.file).set_index("pre", drop = False)
-    connectome = connectome.repartition(npartitions=10)    
+    LOGGER.info("Loading connectome ...")
+    connectome = load_connectome(ARGS.file)
+    LOGGER.info("Repartitioning connectome ...")
+    connectome = connectome.repartition(npartitions=10)
     trimmed = connectome[["pre", "post", "syn_count"]]
+    LOGGER.info("Mapping nodes ...")
     mapped_connectome, mapping = map_nodes(trimmed)
-    tagged_connectome = attach_community_ids(mapped_connectome, ARGS.min)
+    print(mapped_connectome.count().compute())    
+    LOGGER.info("Getting community IDs ...")
+    tagged_connectome = attach_community_ids(mapped_connectome, mapping.persist(), ARGS.min)
+    LOGGER.info("Unmapping nodes ...")
     connectome = unmap_nodes(tagged_connectome, mapping)
     # Probably another filtering step here?
+    LOGGER.info("Attaching coordinates ...")
     connectome = attach_coords(tagged_connectome)
+    LOGGER.info("Generating brain map ...")
     make_brain_map.make_brain_map(connectome)
     # End of pipeline
 
