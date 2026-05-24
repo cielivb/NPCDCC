@@ -7,16 +7,23 @@ down, then returns the tagged connectome
 
 """
 import dask
+import threading
+
 from dask.distributed import wait
 from dask import dataframe as ddf
-from dask.distributed import Client
+from dask.distributed import get_client
 from queue import Queue
+from threading import Event
 from threading import Lock
 from time import sleep
 from typing import TypeAlias
 
+import edge_scoring
+import graph_utils
+
 DDF: TypeAlias = ddf.DataFrame
 
+CLIENT = None
 BIG_COMPS = Queue()
 SMALL_COMPS = Queue()
 COMMUNITIES = Queue()
@@ -93,21 +100,36 @@ def decide_fate(result):
 
 def process_pruned(pruned_future):
     """ Get edge scores of pruned component """
-    global ESP
+    global ESP, CLIENT
     pruned = pruned_future.result()
     start_nodes = edge_scoring.get_start_nodes(pruned)
     comp_id = get_next_comp_id()
     ESP[comp_id] = (pruned, set())
     for s in start_nodes:
-        f = client.submit(edge_scoring.get_scores_pd, pruned, s)
+        f = CLIENT.submit(edge_scoring.get_scores_pd, pruned, s)
         ESP[comp_id][1].add(f)
 
 
 def process_aggregated(aggregated_future):
     """ Chop the dataframe based on edge scores then decide its fate """
+    global CLIENT
     comp_w_scores = aggregated_future.result()
-    f = client.submit(edge_scoring.chop_pd, comp_w_scores)
+    f = CLIENT.submit(edge_scoring.chop_pd, comp_w_scores)
     f.add_done_callback(decide_fate)
+
+
+def log_progress(detection_done: Event):
+    """ Print number components remaining every 30 seconds """
+    global BIG_COMPS, SMALL_COMPS, COMMUNITIES
+    while True:
+        if detection_done.is_set():
+            break
+        curr_time = datetime.now().strftime("%H:%M:%S")
+        print(f"{curr_time}: big comps remaining = {BIG_COMPS.qsize}, "
+              f"small comps remaining = {SMALL_COMPS.qsize}, "
+              f"communities found = {COMMUNITIES.qsize}")
+        sleep(30)
+    print(f"Community detection complete - found {COMMUNITY.qsize} communities")
 
 
 def run(connectome: DDF, args) -> DDF:
@@ -129,11 +151,13 @@ def run(connectome: DDF, args) -> DDF:
     are too large for workers.
     
     """    
-    global CLIENT, BIG_COMPS, SMALL_COMPS, COMMUNITIES, MAX_WORKER_DF_SIZE
-    global NUM_SMALL_PROCESSED
+    global BIG_COMPS, SMALL_COMPS, COMMUNITIES, MAX_WORKER_DF_SIZE
+    global CLIENT, NUM_SMALL_PROCESSED
     
     # Set up initial variables
-    CLIENT, MAX_WORKER_DF_SIZE = get_client(), get_worker_df_size(CLIENT)
+    print("Initialising community detection algorithm ...")
+    CLIENT = get_client()
+    MAX_WORKER_DF_SIZE = get_worker_df_size(CLIENT)
     num_small_submitted = 0    
     
     # Only need 3 columns for community detection
@@ -145,6 +169,10 @@ def run(connectome: DDF, args) -> DDF:
                     
     # Get and allocate initial components
     decide_fate((undirected_connectome, None))
+    
+    # Start progress logger thread
+    detection_done = Event()
+    prog_logger = threading.Thread(target=log_progress, args=(detection_done,))
     
     # Enter control loop - continue breaking connectome components down into
     # communities until no more components remain to be processed
@@ -163,7 +191,7 @@ def run(connectome: DDF, args) -> DDF:
             comp, future_list = comp_tup[0], comp_tup[1]
             if all(f.done() for f in future_list): # if ready
                 scores_list = [f.result() for f in future_list] # list of DDF
-                f = client.submit(edge_scoring.aggregate_scores, comp, scores_list)
+                f = CLIENT.submit(edge_scoring.aggregate_scores, comp, scores_list)
                 f.add_done_callback(process_aggregated)
         
         # Process one big component
@@ -176,6 +204,7 @@ def run(connectome: DDF, args) -> DDF:
     # Wait for all components in small pipeline to finish being processed.
     while num_small_submitted < NUM_SMALL_PROCESSED:
         sleep(5)
+    detection_done.set()
     
     return tag(connectome, COMMUNITIES)
 

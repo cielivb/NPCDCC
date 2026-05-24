@@ -46,6 +46,7 @@ from datetime import datetime
 from time import sleep
 
 import detect_communities
+import make_brain_map
 
 
 CLIENT = None # Assigned in start_cluster()
@@ -70,12 +71,14 @@ def create_session_id(file, num_cores):
     if "_" in filename:
         filename = "full"
     session_id = f"{datetime_id}_{num_cores}_{filename}"
+    print(f"Session ID: {session_id}")
     return session_id
 
 
 def start_cluster(num_cores):
     """ Create dask client and start cluster with 1 worker per core """
     global CLIENT
+    print("Starting cluster ...")    
     cluster = LocalCluster(
         n_workers=num_cores,
         processes=True,
@@ -88,15 +91,17 @@ def start_cluster(num_cores):
 
 def load_connectome(file) -> ddf.DataFrame:
     """ Load parquet connectome file into dask dataframe """
+    print(f"Loading connectome ({file}) ...")
     connectome = ddf.read_parquet(file)
-    connectome = connectome.rename(columns = {"pre": "pre_pt_root_id",
-                                              "post": "post_pt_root_id"})
+    connectome = connectome.rename(columns = {"pre_pt_root_id": "pre",
+                                              "post_pt_root_id": "post"})
     return connectome
 
 
 def write_tagged_connectome(tagged_connectome: ddf.DataFrame, outdir: str):
-    """ Write tagged connectome to feather file/s """
-    outfile = os.path.join(outdir, "tagged.parquet")
+    """ Write tagged connectome to parquet file """
+    outfile = os.path.join(outdir, "tagged.parquet")    
+    print(f"Writing tagged connectome to {outfile}...")
     tagged_connectome.to_parquet(outfile)
 
 
@@ -247,7 +252,6 @@ def main():
     # Set-up performance testing stuff
     session_id = create_session_id(ARGS.file, ARGS.cores)
     outdir = os.path.join(RESULT_DIR, session_id)
-    print(outdir)
     os.makedirs(outdir, exist_ok = True)
     
     # Start timing
@@ -256,7 +260,7 @@ def main():
     # Set up cluster, load data, and identify communities
     start_cluster(ARGS.cores)
     connectome = load_connectome(ARGS.file)
-    tagged = detect_communities.run(connectome, ARGS.min, args.madk)
+    tagged = detect_communities.run(connectome, ARGS)
     
     # Sum probabilities of neurotransmitters that are not inherently excitatory
     # or regulatory together - only interested in excitatory-inhibitory dynamics
