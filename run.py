@@ -36,6 +36,8 @@ TODO
 import argparse
 import dask
 import logging
+import igraph as ig
+from cdlib import algorithms
 import os
 import pandas as pd
 from dask import bag as db
@@ -46,7 +48,6 @@ from dask.distributed import LocalCluster
 from datetime import datetime
 from time import sleep
 
-import detect_communities
 import make_brain_map
 
 
@@ -65,8 +66,8 @@ ARGS = p.parse_args()
 
 logging.basicConfig(level = logging.DEBUG)
 LOGGER = logging.getLogger(__name__)
-logging.getLogger("distributed.shuffle").setLevel(logging.WARNING)
-logging.getLogger("fsspec").setLevel(logging.WARNING)
+logging.getLogger("distributed.shuffle").setLevel(logging.ERROR)
+logging.getLogger("fsspec").setLevel(logging.ERROR)
 
 
 
@@ -158,6 +159,7 @@ def attach_community_ids(connectome, minsize):
         max_node = max(max(pre), max(post))
         if max_node >= g.vcount():
             g.add_vertices(max_node + 1 - g.vcount())
+            g.vs["name"] = list(range(g.vcount())) # let name = node id
             
         # Add edges then assign edge weights (=syn_count) to newly added edges
         g.add_edges(list(zip(pre, post)))
@@ -190,6 +192,40 @@ def attach_community_ids(connectome, minsize):
 
 ### Ops -------------------------------------------------------------------
 
+def get_all_node_ids(df, node_cols=["pre","post"]):
+    """ Return a dataframe containing every unique node id in the dataframe """
+    node_cols = [df[col].rename("node_id").to_frame() for col in node_cols]
+    all_nodes = ddf.concat(node_cols).drop_duplicates().reset_index(drop=True)
+    return all_nodes
+
+
+def map_nodes(connectome):
+    """ Create a mapping from connectome node IDs to IDs of form 0, 1, 2, ... 
+    The Leiden algorithm requires node IDs to be in contiguous form
+    starting from node 0. The node IDs in the connectome dataset neither start
+    from zero nor are contiguous.
+    """
+    # Get key-node_id mapping
+    all_node_ids = get_all_node_ids(connectome)
+    mapping = all_node_ids.assign(key=all_node_ids.index)
+    
+    # Map connectome node ids to new node ids
+    merged1 = connectome.merge(mapping, left_index=True, right_on="node_id", how="inner")
+    merged1 = merged1.drop(columns=["node_id","pre"]).rename(columns={"key": "pre"})
+    merged2 = merged1.merge(mapping, left_on="post", right_on="node_id", how="inner")
+    merged2 = merged2.drop(columns=["node_id","post"]).rename(columns={"key": "post"})
+    
+    return merged2.reset_index(drop=True), mapping
+
+
+def unmap_nodes(connectome, mapping):
+    """ Restore original connectome node IDs based on mapping """
+    merged1 = connectome.merge(mapping, left_on="pre", right_on="key", how="inner")
+    merged1 = merged1.drop(columns=["key"]).rename(columns={"node_id": "pre"})
+    merged2 = merged1.merge(mapping, left_on="post", right_on="key", how="inner")
+    merged2 = merged2.drop(columns=["key"]).rename(columns={"node_id": "post"})
+    return merged2
+    
 
 def attach_coords(connectome):
     """ Merge connectome with coord dataframe and calculated midpoint coords 
@@ -247,10 +283,13 @@ def main():
     start_time = datetime.now() # Start timing actual pipeline
     
     # Start of pipeline
+    start_cluster(ARGS.cores)
     connectome = load_connectome(ARGS.file).set_index("pre", drop = False)
-    connectome = connectome.repartition(100)    
+    connectome = connectome.repartition(npartitions=10)    
     trimmed = connectome[["pre", "post", "syn_count"]]
-    tagged_connectome = attach_community_ids(trimmed, ARGS.min)
+    mapped_connectome, mapping = map_nodes(trimmed)
+    tagged_connectome = attach_community_ids(mapped_connectome, ARGS.min)
+    connectome = unmap_nodes(tagged_connectome, mapping)
     # Probably another filtering step here?
     connectome = attach_coords(tagged_connectome)
     make_brain_map.make_brain_map(connectome)
