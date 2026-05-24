@@ -4,30 +4,6 @@ import pandas as pd
 import pyvista as pv
 from dask import dataframe as ddf
 
-def attach_coords(tagged: ddf.DataFrame, coord_dir: str):
-    """ Attach xyz coordinates to each edge in tagged dataframe """
-    # Load coord dataframe then left merge tagged dataframe with coord df.
-    coord_path = os.path.join(coord_dir, "flywire_synapses_783.parquet")
-    coord_df = ddf.read_parquet(coord_path)
-    coord_df = coord_df.rename(columns = {"pre": "pre_pt_root_id",
-                                          "post": "post_pt_root_id",
-                                          "pre_pt_position_x": "pre_x",
-                                          "pre_pt_position_y": "pre_y",
-                                          "pre_pt_position_z": "pre_z",
-                                          "post_pt_position_x": "post_x",
-                                          "post_pt_position_y": "post_y",
-                                          "post_pt_position_z": "post_z"})
-    tagged_c = tagged.merge(coord_df, on = ["pre", "post"], how = "left")  
-    
-    # "synapses were identified with two points, one in each neuron" (Zenodo). 
-    # Take the mean of these two coordinates to use as true synapse coordinate.
-    tagged_c["coord_x"] = tagged_c["pre_x"] + tagged_c["post_x"] / 2
-    tagged_c["coord_y"] = tagged_c["pre_y"] + tagged_c["post_y"] / 2
-    tagged_c["coord_z"] = tagged_c["pre_z"] + tagged_c["post_z"] / 2
-    tagged_c = tagged_c.drop(columns = ["pre_x", "pre_y", "pre_z", 
-                                        "post_x", "post_y", "post_z"])    
-    return tagged_c
-
 
 def attach_colour_groups(tagged: ddf.DataFrame):
     """ Attach column with colour group assignment to tagged dataframe.
@@ -53,6 +29,7 @@ def attach_colour_groups(tagged: ddf.DataFrame):
     tagged["colour"] = tagged.map_partitions(assign_colour_group, 
                                              meta={"colour": "object"}) 
     return tagged
+
 
 def get_point_cloud(p: pd.DataFrame):
     """ Create a point cloud with appropriate colours based on coords in p """
@@ -86,7 +63,6 @@ def save(plotter, outdir):
 
 def make_brain_map(tagged: ddf.DataFrame, coord_dir: str, outdir: str):
     """ Use PyVista to generate before and after brain map images. """
-    tagged_c = attach_coords(tagged)
     tagged_c = attach_colour_groups(tagged_c)    
     
     # Take a sample of tagged_c - this will speed up the visualisation. 

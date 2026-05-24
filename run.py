@@ -60,8 +60,7 @@ RESULT_DIR = os.path.join(ROOT_DIR, "results")
 p = argparse.ArgumentParser()
 p.add_argument("-c", "--cores", help="Number of cores to use", type=int, required=True)
 p.add_argument("-f", "--file", help="Parquet file to run through pipeline", required=True)
-p.add_argument("-m", "--min", help="Minimum number of edges", type=int, default=30)
-p.add_argument("-k", "--madk", help="MAD outlier detection K", type=float, default=2.5)
+p.add_argument("-m", "--min", help="Minimum number of nodes", type=int, default=30)
 ARGS = p.parse_args()
 
 logging.basicConfig(level = logging.DEBUG)
@@ -146,8 +145,8 @@ def attach_community_ids(connectome, minsize):
     """ Use Leiden algorithm """
     # Use a streaming approach instead of computing directly to avoid a sudden 
     # RAM spike (probably not too big of a deal with my dataset but could be
-    # helpful for a larger dataset, especially considering parquet is compressed
-    # and loading it into pandas uncompresses it)
+    # helpful for a larger dataset, especially considering parquet is often
+    # compressed and loading it into pandas uncompresses it)
     g = ig.Graph(directed=True)
     for partition in connectome.to_delayed():
         pdf = partition.compute()
@@ -193,10 +192,20 @@ def attach_community_ids(connectome, minsize):
 
 
 def attach_coords(connectome):
-    """ Merge connectome with coord dataframe and calculated midpoint coords """
+    """ Merge connectome with coord dataframe and calculated midpoint coords 
+    
+    "synapses were identified with two points, one in each neuron" (Zenodo). 
+    Take the mean of these two coordinates to use as true synapse coordinate.
+    """
     coord_df = load_coord_file()
-    merged = connectome.merge(coord_df, on=["pre","post"])
-    pass
+    merged = connectome.merge(coord_df, on=["pre","post"], how="inner")
+    merged["x"] = merged["pre_pt_position_x"] + merged["post_pt_position_x"] / 2
+    merged["y"] = merged["pre_pt_position_y"] + merged["post_pt_position_y"] / 2
+    merged["z"] = merged["pre_pt_position_z"] + merged["post_pt_position_z"] / 2
+    merged = merged.drop(cols=["pre_pt_position_x", "post_pt_position_x",
+                               "pre_pt_position_y", "post_pt_position_y",
+                               "pre_pt_position_z", "post_pt_position_z"])
+    return merged
 
     
 def normalise_neurotransmitter_probs(tagged):
@@ -239,11 +248,12 @@ def main():
     
     # Start of pipeline
     connectome = load_connectome(ARGS.file).set_index("pre", drop = False)
+    connectome = connectome.repartition(100)    
     trimmed = connectome[["pre", "post", "syn_count"]]
-    tagged_connectome = attach_community_ids(trimmed)
+    tagged_connectome = attach_community_ids(trimmed, ARGS.min)
     # Probably another filtering step here?
     connectome = attach_coords(tagged_connectome)
-    
+    make_brain_map.make_brain_map(connectome)
     # End of pipeline
 
     

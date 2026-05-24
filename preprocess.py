@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dask import dataframe as ddf
 from dask.distributed import Client
 from dask.distributed import LocalCluster
-from detect_communities import get_all_nodes  
+from detect_communities import get_all_nodes
 
 CLIENT = None # Assigned at bottom of script
 dask.config.set({"dataframe.shuffle.method": "tasks"})
@@ -53,7 +53,7 @@ def feather_to_parquet(file_to_convert, destination):
     print(f"\nConverting {file_to_convert} to parquet file ...\n")
     table = feather.read_table(file_to_convert)
     pq.write_table(table, destination, compression=None, 
-                   row_group_size=1_000_000)
+                   row_group_size=500_000)
     print(f"\n{file_to_convert} converted\n")
     
 
