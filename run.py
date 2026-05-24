@@ -96,14 +96,8 @@ def start_cluster(num_cores):
     """ Create dask client and start cluster with 1 worker per core """
     global CLIENT
     LOGGER.info("Starting cluster ...")    
-    cluster = LocalCluster(
-        n_workers=num_cores,
-        processes=True,
-        threads_per_worker=1,
-        memory_limit = "2GB",
-        dashboard_address=":8787"
-    )
-    CLIENT = Client(cluster)
+    CLIENT = Client(processes=False, threads_per_worker=num_cores)
+    return CLIENT
 
 
 
@@ -137,6 +131,7 @@ def load_coord_file():
                                   "post_pt_position_y", "post_pt_position_z"])
     edge_coords = edge_coords.rename(
         columns={"pre_pt_root_id":"pre", "post_pt_root_id": "post"})
+    edge_coords = edge_coords.repartition(partition_size="150MB")
     return edge_coords
 
 
@@ -149,14 +144,12 @@ def attach_community_ids(connectome, mapping, minsize):
     # helpful for a larger dataset, especially considering parquet is often
     # compressed and loading it into pandas uncompresses it)
     num_nodes = mapping.count().compute()["node_id"].item()
-    print(connectome.count().compute())
     g = ig.Graph(directed=True)
     g.add_vertices(num_nodes)
     g.vs["name"] = list(range(num_nodes))  # let name = node id
     
     for partition in connectome.to_delayed():
         pdf = partition.compute()
-        print(pdf)
         pre, post = pdf["pre_key"].tolist(), pdf["post_key"].tolist()
         syn_count = pdf["syn_count"].to_list()
             
@@ -165,14 +158,12 @@ def attach_community_ids(connectome, mapping, minsize):
         g.es[-len(syn_count):]["weight"] = syn_count # es = 'edge sequence'
     
     # Run the Leiden community detection algorithm and extract communities
-    print(g.vcount(), g.ecount())
     communities = algorithms.leiden(g, weights=g.es["weight"])
     communities_list = communities.communities # List of lists
     
     # Turn sufficiently large lists/communities into dask dataframes
     community_dfs = []
     for community in communities_list:
-        print(community)
         if len(community) >= minsize:
             new_df = ddf.from_pandas(pd.DataFrame(community, columns=["node_id"]))
             community_dfs.append(new_df)
@@ -181,15 +172,16 @@ def attach_community_ids(connectome, mapping, minsize):
     comm_ids = range(0, len(community_dfs))
     for comm_df, comm_id in zip(community_dfs, comm_ids):
         comm_df["community_id"] = comm_id
-    community_df = ddf.concat(community_dfs)
+    community_df = ddf.concat(community_dfs).persist()
     
     # Merge community_df with connectome to tag edges with community IDs
     tagged = connectome.merge(
         community_df, left_index=True, right_on="node_id", how="left").drop(
             columns=["pre_key", "post_key"])
     
-    return tagged
+    return tagged.persist()
         
+
 
 
 ### Ops -------------------------------------------------------------------
@@ -197,7 +189,7 @@ def attach_community_ids(connectome, mapping, minsize):
 def get_all_node_ids(df, node_cols=["pre","post"]):
     """ Return a dataframe containing every unique node id in the dataframe """
     node_cols = [df[col].rename("node_id").to_frame() for col in node_cols]
-    all_nodes = ddf.concat(node_cols).drop_duplicates().reset_index(drop=True)
+    all_nodes = ddf.concat(node_cols).drop_duplicates().repartition(partition_size="150MB").reset_index(drop=True)
     return all_nodes
 
 
@@ -208,18 +200,15 @@ def map_nodes(connectome):
     from zero nor are contiguous.
     """
     # Get key-node_id mapping
-    all_node_ids = get_all_node_ids(connectome)
-    num_nodes = all_node_ids.count().compute()["node_id"].item()
-    key = pd.DataFrame({"key": [_ for _ in range(num_nodes)]})
-    key = ddf.from_pandas(key)
-    mapping = ddf.concat([all_node_ids, key], axis=1).persist()
+    pdf = get_all_node_ids(connectome).compute().reset_index(drop=True)
+    pdf["key"] = range(len(pdf))
+    mapping = ddf.from_pandas(pdf, npartitions=connectome.npartitions).persist()
     
-    merged = connectome.merge(mapping, left_on="pre", right_on="node_id", how="inner")
-    merged = merged.rename(columns={"key": "pre_key"}).drop(columns=["node_id"])
-    merged = merged.merge(mapping, left_on="post", right_on="node_id", how="inner")
-    merged = merged.rename(columns={"key": "post_key"}).drop(columns=["node_id"])
-    print(merged.count().compute())
-    return merged.reset_index(drop=True), mapping
+    merged = connectome.merge(mapping, left_on="pre", right_on="node_id", how="inner").persist()
+    merged = merged.rename(columns={"key": "pre_key"}).drop(columns=["node_id"]).persist()
+    merged = merged.merge(mapping, left_on="post", right_on="node_id", how="inner").persist()
+    merged = merged.rename(columns={"key": "post_key"}).drop(columns=["node_id"]).persist()
+    return merged.reset_index(drop=True).persist(), mapping
 
 
 def attach_coords(connectome):
@@ -229,14 +218,14 @@ def attach_coords(connectome):
     Take the mean of these two coordinates to use as true synapse coordinate.
     """
     coord_df = load_coord_file()
-    merged = connectome.merge(coord_df, on=["pre","post"], how="inner")
+    merged = connectome.merge(coord_df, on=["pre","post"], how="inner").persist()
     merged["x"] = merged["pre_pt_position_x"] + merged["post_pt_position_x"] / 2
     merged["y"] = merged["pre_pt_position_y"] + merged["post_pt_position_y"] / 2
     merged["z"] = merged["pre_pt_position_z"] + merged["post_pt_position_z"] / 2
     merged = merged.drop(columns=["pre_pt_position_x", "post_pt_position_x",
                                   "pre_pt_position_y", "post_pt_position_y",
                                   "pre_pt_position_z", "post_pt_position_z"])
-    return merged
+    return merged.persist()
 
     
 def normalise_neurotransmitter_probs(tagged):
@@ -244,7 +233,9 @@ def normalise_neurotransmitter_probs(tagged):
     # or regulatory together - only interested in excitatory-inhibitory dynamics
     # in this analysis. The sums of neurotransmitter probabilities are sometimes
     # just a few decimal places out from being exactly 1, so normalise as well.
-    LOGGER.info("Normalising neurotransmitter probabilities ...")
+    tagged = tagged.rename(
+        columns={"gaba_avg": "gaba", "ach_avg": "ach", "glut_avg": "glut", 
+                 "oct_avg": "oct", "ser_avg": "ser", "da_avg": "da"})
     other_nt = ["glut", "oct", "ser", "da"]
     other_sum = tagged[other_nt].sum(axis=1)
     tagged["other"] = other_sum
@@ -253,7 +244,7 @@ def normalise_neurotransmitter_probs(tagged):
     tagged["gaba"] = tagged["gaba"] / tagged["total_prob"]
     tagged["ach"] = tagged["ach"] / tagged["total_prob"]
     tagged["other"] = tagged["other"] / tagged["total_prob"]
-    return tagged
+    return tagged.persist()
 
 
 
@@ -278,24 +269,27 @@ def main():
     start_time = datetime.now() # Start timing actual pipeline
     
     # Start of pipeline
-    start_cluster(ARGS.cores)
+    client = start_cluster(ARGS.cores)
     LOGGER.info("Loading connectome ...")
     connectome = load_connectome(ARGS.file)
     LOGGER.info("Repartitioning connectome ...")
-    connectome = connectome.repartition(npartitions=10)
-    trimmed = connectome[["pre", "post", "syn_count"]]
+    connectome = connectome.repartition(partition_size="150MB")
     LOGGER.info("Mapping nodes ...")
-    mapped_connectome, mapping = map_nodes(trimmed)
-    print(mapped_connectome.count().compute())    
+    mapped_connectome, mapping = map_nodes(connectome)
     LOGGER.info("Getting community IDs ...")
-    tagged_connectome = attach_community_ids(mapped_connectome, mapping.persist(), ARGS.min)
-    LOGGER.info("Unmapping nodes ...")
-    connectome = unmap_nodes(tagged_connectome, mapping)
+    tagged_connectome = attach_community_ids(
+        mapped_connectome, mapping.persist(), ARGS.min)
     # Probably another filtering step here?
     LOGGER.info("Attaching coordinates ...")
     connectome = attach_coords(tagged_connectome)
-    LOGGER.info("Generating brain map ...")
-    make_brain_map.make_brain_map(connectome)
+    LOGGER.info("Normalising neurotransmitter probabilities ...")
+    connectome = normalise_neurotransmitter_probs(connectome)
+    LOGGER.info("Preparing brain map plotter ...")
+    plotter = make_brain_map.prepare_plotter(connectome)
+    LOGGER.info("Shutting down cluster ...")
+    client.close() # disconnect from client
+    LOGGER.info("Generating brain map ...")    
+    make_brain_map.save(plotter, outdir)
     # End of pipeline
 
     

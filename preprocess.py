@@ -6,16 +6,15 @@ test files of varying problem sizes.
 This script should only need to be ran once.
 
 """
+import dask
 import os
 import pyarrow
 import pyarrow.feather as feather
 import pyarrow.parquet as pq
-import dask
 from concurrent.futures import ThreadPoolExecutor
 from dask import dataframe as ddf
 from dask.distributed import Client
 from dask.distributed import LocalCluster
-from detect_communities import get_all_nodes
 
 CLIENT = None # Assigned at bottom of script
 dask.config.set({"dataframe.shuffle.method": "tasks"})
@@ -55,13 +54,20 @@ def feather_to_parquet(file_to_convert, destination):
     pq.write_table(table, destination, compression=None, 
                    row_group_size=500_000)
     print(f"\n{file_to_convert} converted\n")
-    
+
+
+def get_all_node_ids(df, node_cols=["pre","post"]):
+    """ Return a dataframe containing every unique node id in the dataframe """
+    node_cols = [df[col].rename("node_id").to_frame() for col in node_cols]
+    all_nodes = ddf.concat(node_cols).drop_duplicates().repartition(npartitions=1).reset_index(drop=True)
+    return all_nodes
+
 
 def write_test_metadata(sub_connectome, test_id):
     """ Write test connectome file metadata
     E.g., number of nodes, number of edges, node:edge ratio, neuropils """
     global METADATA_FILE    
-    num_nodes = get_all_nodes(sub_connectome, 
+    num_nodes = get_all_node_ids(sub_connectome, 
         node_cols=["pre_pt_root_id","post_pt_root_id"]).count()
     num_edges = sub_connectome["pre_pt_root_id"].count()
     neuropils = sub_connectome["neuropil"].unique()
