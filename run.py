@@ -93,11 +93,10 @@ def initialise_log_file(outdir: str):
     
 
 def start_cluster(num_cores):
-    """ Create dask client and start cluster with 1 worker per core """
+    """ Create dask CLIENT and start cluster with 1 worker per core """
     global CLIENT
     LOGGER.info("Starting cluster ...")    
     CLIENT = Client(processes=False, threads_per_worker=num_cores)
-    return CLIENT
 
 
 
@@ -143,7 +142,7 @@ def stream_into_graph(connectome, mapping):
     # helpful for a larger dataset, especially considering parquet is often
     # compressed and loading it into pandas uncompresses it)
     num_nodes = mapping.count().compute()["node_id"].item()
-    g = ig.Graph(directed=True)
+    g = ig.Graph(directed=False)
     g.add_vertices(num_nodes)
     g.vs["name"] = list(range(num_nodes))  # let name = node id
     
@@ -166,7 +165,7 @@ def get_communities_list(g, method):
     elif method == "louvain":
         # Typically favours larger communities at the expense of hiding legit
         # sub-communities by pulling them into one big agglomerated community
-        communities = algorithms.louvain(g, weights=g.es["weight"])
+        communities = algorithms.louvain(g, weight="weight")
     communities_list = communities.communities # List of lists
     return (method, communities_list)
 
@@ -190,26 +189,27 @@ def make_community_df(community_tup, minsize):
 
 def tag_connectome(connectome, communities, minsize):
     """ Attach community ID to each edge in connectome """
-    community_df_f = [client.submit(make_community_df, communities[0], minsize),
-                      client.submit(make_community_df, communities[1], minsize)]
-    community_dfs = client.gather(community_df_f)
+    global CLIENT
+    community_df_f = [CLIENT.submit(make_community_df, communities[0], minsize),
+                      CLIENT.submit(make_community_df, communities[1], minsize)]
+    community_dfs = CLIENT.gather(community_df_f)
     
     # Merge community_dfs with connectome to tag edges with community IDs
     tagged1 = connectome.merge(
-        community_dfs[0], left_index="pre", right_on="node_id", how="left").drop(
+        community_dfs[0], left_on="pre", right_on="node_id", how="left").drop(
             columns=["pre_key", "post_key"]).persist()
-    tagged2 = connectome.merge(
-        community_dfs[1], left_index="pre", right_on="node_id", how="left").drop(
-            columns=["pre_key", "post_key"]).persist()
-    return (method, tagged2)
+    tagged2 = tagged1.merge(
+        community_dfs[1], left_on="pre", right_on="node_id", how="left").drop(columns = ["node_id_x", "node_id_y"]).persist()
+    return tagged2
 
 
 def attach_community_ids(connectome, mapping, minsize):
     """ Use Louvain and Leiden algorithms - not sure which will be better """
+    global CLIENT
     g = stream_into_graph(connectome, mapping)
-    get_comms_f = [client.submit(get_communities_list, g, "louvain"),
-                   client.submit(get_communities_list, g, "leiden")]
-    communities_lists = client.gather(get_comms_f) # list of tuples (method, list of lists)
+    get_comms_f = [CLIENT.submit(get_communities_list, g, "louvain"),
+                   CLIENT.submit(get_communities_list, g, "leiden")]
+    communities_lists = CLIENT.gather(get_comms_f) # list of tuples (method, list of lists)
     tagged = tag_connectome(connectome, communities_lists, minsize)
     return tagged
 
@@ -260,10 +260,11 @@ def attach_coords(connectome):
 
     
 def normalise_neurotransmitter_probs(tagged):
-    # Sum probabilities of neurotransmitters that are not inherently excitatory
-    # or regulatory together - only interested in excitatory-inhibitory dynamics
-    # in this analysis. The sums of neurotransmitter probabilities are sometimes
-    # just a few decimal places out from being exactly 1, so normalise as well.
+    """ Sum probabilities of neurotransmitters that are not inherently excitatory
+    or regulatory together - only interested in excitatory-inhibitory dynamics
+    in this analysis. The sums of neurotransmitter probabilities are sometimes
+    just a few decimal places out from being exactly 1, so normalise as well.
+    Removes edges with all NaN neurotransmitter probabilities. """
     tagged = tagged.rename(
         columns={"gaba_avg": "gaba", "ach_avg": "ach", "glut_avg": "glut", 
                  "oct_avg": "oct", "ser_avg": "ser", "da_avg": "da"})
@@ -275,6 +276,8 @@ def normalise_neurotransmitter_probs(tagged):
     tagged["gaba"] = tagged["gaba"] / tagged["total_prob"]
     tagged["ach"] = tagged["ach"] / tagged["total_prob"]
     tagged["other"] = tagged["other"] / tagged["total_prob"]
+    tagged = tagged.drop(columns=["total_prob"])
+    tagged = tagged.dropna(subset=["gaba", "ach", "other"]) # Drop NaNs
     return tagged.persist()
 
 
@@ -291,7 +294,7 @@ def report(session_id, duration, minsize):
 
 def main():
     """ Run the full statistical analysis pipeline from loading to reporting """
-    global ARGS
+    global ARGS, CLIENT
     # Set-up testing / debugging stuff
     session_id = create_session_id(ARGS.file, ARGS.cores)
     outdir = os.path.join(RESULT_DIR, session_id)
@@ -300,7 +303,7 @@ def main():
     start_time = datetime.now() # Start timing actual pipeline
     
     # Start of pipeline
-    client = start_cluster(ARGS.cores)
+    start_cluster(ARGS.cores)
     LOGGER.info("Loading connectome ...")
     connectome = load_connectome(ARGS.file)
     LOGGER.info("Repartitioning connectome ...")
@@ -309,19 +312,23 @@ def main():
     mapped_connectome, mapping = map_nodes(connectome)
     
     LOGGER.info("Getting community IDs ...")
-    tagged_connectomes = attach_community_ids(
+    tagged_connectome = attach_community_ids(
         mapped_connectome, mapping.persist(), ARGS.min)
     LOGGER.info("Attaching coordinates ...")
     connectome = attach_coords(tagged_connectome)
     LOGGER.info("Normalising neurotransmitter probabilities ...")
     connectome = normalise_neurotransmitter_probs(connectome)
     
+    # Now that communities have been assigned, it would be nice to cluster
+    # communities together where they are topologically close to each other,
+    # but that is machine learning and thus outside the scope of this project.
+    
     # Brain mapping heavy on GPU, and pyvista rendering is not threadsafe
     LOGGER.info("Preparing brain map plotter ...")
     plotter_louvain = make_brain_map.prepare_plotter(connectome, "louvain")
     plotter_leiden = make_brain_map.prepare_plotter(connectome, "leiden")
     LOGGER.info("Shutting down cluster ...")
-    client.close() # disconnect from client
+    CLIENT.close() # disconnect from CLIENT
     LOGGER.info("Generating brain map ...")
     make_brain_map.save(plotter_louvain, "louvain", outdir)
     make_brain_map.save(plotter_leiden, "leiden", outdir)
