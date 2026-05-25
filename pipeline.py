@@ -70,7 +70,7 @@ def attach_coords(connectome):
     grouped = merged.groupby(["pre", "post"])[["x","y","z"]].mean()
     
     print("Coordinates attached")
-    return grouped.persist()    
+    return grouped.persist()
     
 
 def normalise_nt_probs(connectome):

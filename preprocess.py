@@ -51,8 +51,8 @@ def feather_to_parquet(file_to_convert, destination):
     print(f"\nConverting {file_to_convert} to parquet file ...\n")
     table = feather.read_table(file_to_convert)
     pq.write_table(table, destination, compression=None, 
-                   row_group_size=500_000)
-    print(f"\n{file_to_convert} converted\n")
+                   row_group_size=1_000_000)
+    print(f"\n{file_to_convert} converted to parquet\n")
 
 
 def get_all_node_ids(df, node_cols=["pre","post"]):
@@ -141,7 +141,7 @@ def all_tests_exist():
 def run():
     """ Convert raw data """
     global MAIN_FILE_RAW, COORD_FILE_RAW, CLIENT
-    print("Notice: this may take about 15 minutes if this is the first time "
+    print("Notice: this may take about 10 minutes if this is the first time "
           "running preprocess.py. ")
     if not is_downloaded(MAIN_FILE_RAW, COORD_FILE_RAW):
         raise Exception("Cannot find raw data files in the data directory")
