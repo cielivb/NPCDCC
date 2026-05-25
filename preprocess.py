@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dask import dataframe as ddf
 from dask.distributed import Client
 from dask.distributed import get_client
+from datetime import datetime
 
 CLIENT = None # Assigned in run()
 
@@ -30,43 +31,43 @@ METADATA_FILE = os.path.join(DATA_DIR, "metadata.txt")
 
 ############################### PREPROCESS #####################################
 
-def preprocess_main_file(raw_path):
+def _preprocess_main_file(raw_path):
     """ Convert to parquet and create scalability test files """
     global MAIN_FILE
     if not os.path.exists(MAIN_FILE):
-        feather_to_parquet(file_to_convert=raw_path, destination=MAIN_FILE)
+        _feather_to_parquet(file_to_convert=raw_path, destination=MAIN_FILE)
 
 
-def preprocess_coord_file(raw_path):
+def _preprocess_coord_file(raw_path):
     """ Convert coordinate file to parquet file """
     global COORD_FILE
     if not os.path.exists(COORD_FILE):
-        feather_to_parquet(file_to_convert=raw_path, destination=COORD_FILE)
+        _feather_to_parquet(file_to_convert=raw_path, destination=COORD_FILE)
 
 
-def feather_to_parquet(file_to_convert, destination):
+def _feather_to_parquet(file_to_convert, destination):
     """ Convert feather file to parquet file
-    WARNING: brings the whole feather file into memory. In the worst case,
-    this could hog about 8 GB memory """
-    print(f"\nConverting {file_to_convert} to parquet file ...\n")
+    WARNING: brings the whole feather file into memory. This hogs about 11 GB 
+    memory max (inspected via Dask Dashboard)"""
+    print(f"{datetime.now().strftime("%H:%M:%S")} Converting {file_to_convert} to parquet file ...")
     table = feather.read_table(file_to_convert)
     pq.write_table(table, destination, compression=None, 
-                   row_group_size=1_000_000)
-    print(f"\n{file_to_convert} converted to parquet\n")
+                   row_group_size=800_000)
+    print(f"{datetime.now().strftime("%H:%M:%S")} {file_to_convert} converted to parquet")
 
 
-def get_all_node_ids(df, node_cols=["pre","post"]):
+def _get_all_node_ids(df, node_cols=["pre","post"]):
     """ Return a dataframe containing every unique node id in the dataframe """
     node_cols = [df[col].rename("node_id").to_frame() for col in node_cols]
     all_nodes = ddf.concat(node_cols).drop_duplicates().repartition(npartitions=1).reset_index(drop=True)
     return all_nodes
 
 
-def write_test_metadata(sub_connectome, test_id):
+def _write_test_metadata(sub_connectome, test_id):
     """ Write test connectome file metadata
     E.g., number of nodes, number of edges, node:edge ratio, neuropils """
     global METADATA_FILE    
-    num_nodes = get_all_node_ids(sub_connectome, 
+    num_nodes = _get_all_node_ids(sub_connectome, 
         node_cols=["pre_pt_root_id","post_pt_root_id"]).count()
     num_edges = sub_connectome["pre_pt_root_id"].count()
     neuropils = sub_connectome["neuropil"].unique()
@@ -83,7 +84,7 @@ def write_test_metadata(sub_connectome, test_id):
         mfile.write(f"Neuropils: {list(neuropils)}\n\n")
 
 
-def write_subset_file(sub_connectome, test_id):
+def _write_subset_file(sub_connectome, test_id):
     """ Write parquet file containing sub-connectome. 
     These tests should fit in memory so will compute to pandas first to avoid
     saving them in their own directories """
@@ -93,10 +94,10 @@ def write_subset_file(sub_connectome, test_id):
     pd_sub_connectome.to_parquet(filename, index=False, compression=None)
     
     
-def make_tests():
+def _make_tests():
     """ Create subsets of main file of varying sizes for performance analysis """
     global MAIN_FILE
-    print(f"\nGenerating test parquet files ...\n")
+    print(f"{datetime.now().strftime("%H:%M:%S")} Generating test parquet files ...")
     connectome = ddf.read_parquet(MAIN_FILE)
     connectome = connectome.categorize(columns=["neuropil"]).persist()    
     
@@ -116,21 +117,21 @@ def make_tests():
     test_ids = ["tiny", "small", "medium", "large"]
     futures = []
     for sub_connectome, test_id in zip(subsets, test_ids):
-        futures.append(CLIENT.submit(write_subset_file, sub_connectome, test_id))
-        write_test_metadata(sub_connectome, test_id)
+        futures.append(CLIENT.submit(_write_subset_file, sub_connectome, test_id))
+        _write_test_metadata(sub_connectome, test_id)
     CLIENT.gather(futures)
-    print(f"\nGenerated test parquet files\n")
+    print(f"{datetime.now().strftime("%H:%M:%S")} Generated test parquet files")
 
 
 ################################### MAIN #######################################
 
-def is_downloaded(file1, file2):
+def _is_downloaded(file1, file2):
     if os.path.exists(file1) and os.path.exists(file2):
         return True
     return False
 
 
-def all_tests_exist():
+def _all_tests_exist():
     global DATA_DIR
     test_ids = ["tiny", "small", "medium", "large"]
     test_files = [os.path.join(DATA_DIR, f"{_id}.parquet") for _id in test_ids]
@@ -143,16 +144,16 @@ def run():
     global MAIN_FILE_RAW, COORD_FILE_RAW, CLIENT
     print("Notice: this may take about 10 minutes if this is the first time "
           "running preprocess.py. ")
-    if not is_downloaded(MAIN_FILE_RAW, COORD_FILE_RAW):
+    if not _is_downloaded(MAIN_FILE_RAW, COORD_FILE_RAW):
         raise Exception("Cannot find raw data files in the data directory")
     with ThreadPoolExecutor(max_workers=2) as pool:
-        f1 = pool.submit(preprocess_main_file, MAIN_FILE_RAW)
-        f2 = pool.submit(preprocess_coord_file, COORD_FILE_RAW)
+        f1 = pool.submit(_preprocess_main_file, MAIN_FILE_RAW)
+        f2 = pool.submit(_preprocess_coord_file, COORD_FILE_RAW)
         file_paths = f1.result()
         coord_path = f2.result()
         
     CLIENT = get_client()
-    if not all_tests_exist():
-        make_tests()
+    if not _all_tests_exist():
+        _make_tests()
     
-    print(f"\n\nPreprocessing complete!")
+    print(f"\n{datetime.now().strftime("%H:%M:%S")} Preprocessing complete!")
