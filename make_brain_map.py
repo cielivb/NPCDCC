@@ -71,6 +71,7 @@ def save(plotter, method, outdir):
 def restrict_method(tagged, method):
     """ Change community method column name and drop other community method 
     results """
+    print(tagged)
     keep_col = f"{method}_id"
     to_drop = [c for c in tagged.columns if c.endswith("_id") and c != keep_col]   
     trimmed = tagged.drop(columns = to_drop)
@@ -82,6 +83,7 @@ def prepare_plotter(tagged: ddf.DataFrame, method):
     """ Stream data points into plotter """
     tagged = restrict_method(tagged, method)
     tagged = attach_colour_groups(tagged)
+    print(tagged.head(25))
     
     # Take a sample of tagged_c - this will speed up the visualisation. 
     # Using frac = 0.05 -> ~800,000 points will be plotted for full drosophila

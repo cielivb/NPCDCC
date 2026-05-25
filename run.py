@@ -37,9 +37,11 @@ import argparse
 import dask
 import logging
 import igraph as ig
-from cdlib import algorithms
+import hdbscan
+import numpy as np
 import os
 import pandas as pd
+from cdlib import algorithms
 from dask import bag as db
 from dask import dataframe as ddf
 from dask import delayed
@@ -134,6 +136,26 @@ def load_coord_file():
     return edge_coords
 
 
+
+### Detect topological clusters -------------------------------------------
+
+def cluster(connectome):
+    """ Turn each neural connection into a coord then cluster """
+    # Extract coordinates as a NumPy array
+    coord_array = connectome[["x", "y", "z"]].to_dask_array(lengths=True).compute()
+
+    # Run HDBSCAN clustering
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=5, cluster_selection_epsilon=0.5)
+    labels = clusterer.fit_predict(coord_array)
+
+    # Attach cluster ids and replace noise (-1 labels) with NaN
+    id_df = ddf.from_array(labels, columns=["hdbscan_id"]).reset_index(drop=True)
+    connectome = connectome.assign(hdbscan_id=id_df["hdbscan_id"])
+    connectome["hdbscan_id"] = connectome["hdbscan_id"].replace(-1, np.nan)
+
+    return connectome.persist()
+
+
 ### Get communities -------------------------------------------------------
 
 def stream_into_graph(connectome, mapping):
@@ -142,7 +164,9 @@ def stream_into_graph(connectome, mapping):
     # helpful for a larger dataset, especially considering parquet is often
     # compressed and loading it into pandas uncompresses it)
     num_nodes = mapping.count().compute()["node_id"].item()
-    g = ig.Graph(directed=False)
+    # Safe to use undirected because interested in physical connections, 
+    # not information flow
+    g = ig.Graph(directed=False) 
     g.add_vertices(num_nodes)
     g.vs["name"] = list(range(num_nodes))  # let name = node id
     
@@ -265,6 +289,7 @@ def normalise_neurotransmitter_probs(tagged):
     in this analysis. The sums of neurotransmitter probabilities are sometimes
     just a few decimal places out from being exactly 1, so normalise as well.
     Removes edges with all NaN neurotransmitter probabilities. """
+    print(tagged)    
     tagged = tagged.rename(
         columns={"gaba_avg": "gaba", "ach_avg": "ach", "glut_avg": "glut", 
                  "oct_avg": "oct", "ser_avg": "ser", "da_avg": "da"})
@@ -278,6 +303,7 @@ def normalise_neurotransmitter_probs(tagged):
     tagged["other"] = tagged["other"] / tagged["total_prob"]
     tagged = tagged.drop(columns=["total_prob"])
     tagged = tagged.dropna(subset=["gaba", "ach", "other"]) # Drop NaNs
+    print(tagged)
     return tagged.persist()
 
 
@@ -308,14 +334,17 @@ def main():
     connectome = load_connectome(ARGS.file)
     LOGGER.info("Repartitioning connectome ...")
     connectome = connectome.repartition(partition_size="150MB")
-    LOGGER.info("Mapping nodes ...")
-    mapped_connectome, mapping = map_nodes(connectome)
-    
-    LOGGER.info("Getting community IDs ...")
-    tagged_connectome = attach_community_ids(
-        mapped_connectome, mapping.persist(), ARGS.min)
     LOGGER.info("Attaching coordinates ...")
-    connectome = attach_coords(tagged_connectome)
+    connectome = attach_coords(connectome)    
+    #LOGGER.info("Mapping nodes ...")
+    #mapped_connectome, mapping = map_nodes(connectome)
+    
+    LOGGER.info("Clustering  ...")
+    tagged_connectome = cluster(connectome)
+    #LOGGER.info("Getting community IDs ...")
+    #tagged_connectome = attach_community_ids(
+    #    mapped_connectome, mapping.persist(), ARGS.min)
+
     LOGGER.info("Normalising neurotransmitter probabilities ...")
     connectome = normalise_neurotransmitter_probs(connectome)
     
