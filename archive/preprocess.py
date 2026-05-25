@@ -14,9 +14,10 @@ import pyarrow.parquet as pq
 from concurrent.futures import ThreadPoolExecutor
 from dask import dataframe as ddf
 from dask.distributed import Client
-from dask.distributed import get_client
+from dask.distributed import LocalCluster
 
-CLIENT = None # Assigned in run()
+CLIENT = None # Assigned at bottom of script
+dask.config.set({"dataframe.shuffle.method": "tasks"})
 
 ROOT_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(ROOT_DIR, "data")
@@ -124,35 +125,33 @@ def make_tests():
 
 ################################### MAIN #######################################
 
-def is_downloaded(file1, file2):
-    if os.path.exists(file1) and os.path.exists(file2):
-        return True
-    return False
+def initialise_client():
+    global CLIENT
+    cluster = LocalCluster(
+        n_workers=4,
+        processes=True,
+        threads_per_worker=1,
+        memory_limit = "3GB",
+        dashboard_address=":8787"
+    )
+    CLIENT = Client(cluster)
 
 
-def all_tests_exist():
-    global DATA_DIR
-    test_ids = ["tiny", "small", "medium", "large"]
-    test_files = [os.path.join(DATA_DIR, f"{_id}.parquet") for _id in test_ids]
-    all_exist = all(os.path.exists(file) for file in test_files)
-    return True if all_exist else False
-
-
-def run():
+def main():
     """ Convert raw data """
     global MAIN_FILE_RAW, COORD_FILE_RAW, CLIENT
-    print("Notice: this may take about 15 minutes if this is the first time "
-          "running preprocess.py. ")
-    if not is_downloaded(MAIN_FILE_RAW, COORD_FILE_RAW):
-        raise Exception("Cannot find raw data files in the data directory")
+
     with ThreadPoolExecutor(max_workers=2) as pool:
         f1 = pool.submit(preprocess_main_file, MAIN_FILE_RAW)
         f2 = pool.submit(preprocess_coord_file, COORD_FILE_RAW)
         file_paths = f1.result()
         coord_path = f2.result()
-        
-    CLIENT = get_client()
-    if not all_tests_exist():
-        make_tests()
+    
+    initialise_client()
+    make_tests()
     
     print(f"\n\nPreprocessing complete!")
+    
+
+if __name__ == "__main__":
+    main()
