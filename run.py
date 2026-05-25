@@ -136,9 +136,8 @@ def load_coord_file():
 
 
 ### Get communities -------------------------------------------------------
-    
-def attach_community_ids(connectome, mapping, minsize):
-    """ Use Leiden algorithm """
+
+def stream_into_graph(connectome, mapping):
     # Use a streaming approach instead of computing directly to avoid a sudden 
     # RAM spike (probably not too big of a deal with my dataset but could be
     # helpful for a larger dataset, especially considering parquet is often
@@ -156,12 +155,25 @@ def attach_community_ids(connectome, mapping, minsize):
         # Add edges then assign edge weights (=syn_count) to newly added edges
         g.add_edges(list(zip(pre, post)))
         g.es[-len(syn_count):]["weight"] = syn_count # es = 'edge sequence'
-    
-    # Run the Leiden community detection algorithm and extract communities
-    communities = algorithms.leiden(g, weights=g.es["weight"])
+    return g
+
+
+def get_communities_list(g, method):
+    if method == "leiden":
+        # Considered a more 'robust' version of louvain, less prone to over-
+        # fitting and favours smaller communities
+        communities = algorithms.leiden(g, weights=g.es["weight"])
+    elif method == "louvain":
+        # Typically favours larger communities at the expense of hiding legit
+        # sub-communities by pulling them into one big agglomerated community
+        communities = algorithms.louvain(g, weights=g.es["weight"])
     communities_list = communities.communities # List of lists
-    
+    return (method, communities_list)
+
+
+def make_community_df(community_tup, minsize):
     # Turn sufficiently large lists/communities into dask dataframes
+    method, communities_list = community_tup[0], community_tup[1]
     community_dfs = []
     for community in communities_list:
         if len(community) >= minsize:
@@ -171,16 +183,35 @@ def attach_community_ids(connectome, mapping, minsize):
     # Create dataframe of node_ids and community_ids
     comm_ids = range(0, len(community_dfs))
     for comm_df, comm_id in zip(community_dfs, comm_ids):
-        comm_df["community_id"] = comm_id
+        comm_df[f"{method}_id"] = comm_id
     community_df = ddf.concat(community_dfs).persist()
+    return community_df
+
+
+def tag_connectome(connectome, communities, minsize):
+    """ Attach community ID to each edge in connectome """
+    community_df_f = [client.submit(make_community_df, communities[0], minsize),
+                      client.submit(make_community_df, communities[1], minsize)]
+    community_dfs = client.gather(community_df_f)
     
-    # Merge community_df with connectome to tag edges with community IDs
-    tagged = connectome.merge(
-        community_df, left_index=True, right_on="node_id", how="left").drop(
-            columns=["pre_key", "post_key"])
-    
-    return tagged.persist()
-        
+    # Merge community_dfs with connectome to tag edges with community IDs
+    tagged1 = connectome.merge(
+        community_dfs[0], left_index="pre", right_on="node_id", how="left").drop(
+            columns=["pre_key", "post_key"]).persist()
+    tagged2 = connectome.merge(
+        community_dfs[1], left_index="pre", right_on="node_id", how="left").drop(
+            columns=["pre_key", "post_key"]).persist()
+    return (method, tagged2)
+
+
+def attach_community_ids(connectome, mapping, minsize):
+    """ Use Louvain and Leiden algorithms - not sure which will be better """
+    g = stream_into_graph(connectome, mapping)
+    get_comms_f = [client.submit(get_communities_list, g, "louvain"),
+                   client.submit(get_communities_list, g, "leiden")]
+    communities_lists = client.gather(get_comms_f) # list of tuples (method, list of lists)
+    tagged = tag_connectome(connectome, communities_lists, minsize)
+    return tagged
 
 
 
@@ -250,12 +281,12 @@ def normalise_neurotransmitter_probs(tagged):
 
 ################################### MAIN #######################################
 
-def report_duration(session_id, duration):
-    """ Write duration to duration file """
+def report(session_id, duration, minsize):
+    """ Write performance data to performances file """
     global RESULT_DIR
-    duration_file = os.path.join(RESULT_DIR, "durations.txt")
-    with open(duration_file, 'a') as file:
-        file.write(f"{session_id}: {duration}\n")
+    perf_file = os.path.join(RESULT_DIR, "performances.txt")
+    with open(perf_file, 'a') as file:
+        file.write(f"{session_id}: time = {duration}, minsize = {minsize}\n")
 
 
 def main():
@@ -276,28 +307,32 @@ def main():
     connectome = connectome.repartition(partition_size="150MB")
     LOGGER.info("Mapping nodes ...")
     mapped_connectome, mapping = map_nodes(connectome)
+    
     LOGGER.info("Getting community IDs ...")
-    tagged_connectome = attach_community_ids(
+    tagged_connectomes = attach_community_ids(
         mapped_connectome, mapping.persist(), ARGS.min)
-    # Probably another filtering step here?
     LOGGER.info("Attaching coordinates ...")
     connectome = attach_coords(tagged_connectome)
     LOGGER.info("Normalising neurotransmitter probabilities ...")
     connectome = normalise_neurotransmitter_probs(connectome)
+    
+    # Brain mapping heavy on GPU, and pyvista rendering is not threadsafe
     LOGGER.info("Preparing brain map plotter ...")
-    plotter = make_brain_map.prepare_plotter(connectome)
+    plotter_louvain = make_brain_map.prepare_plotter(connectome, "louvain")
+    plotter_leiden = make_brain_map.prepare_plotter(connectome, "leiden")
     LOGGER.info("Shutting down cluster ...")
     client.close() # disconnect from client
-    LOGGER.info("Generating brain map ...")    
-    make_brain_map.save(plotter, outdir)
+    LOGGER.info("Generating brain map ...")
+    make_brain_map.save(plotter_louvain, "louvain", outdir)
+    make_brain_map.save(plotter_leiden, "leiden", outdir)
     # End of pipeline
 
-    
+
     # Stop timing and report duration
     LOGGER.info(f"End of pipeline! Results available in {outdir}")
     end_time = datetime.now()
     duration = end_time - start_time
-    report_duration(session_id, duration)
+    report(session_id, duration, ARGS.min)
 
 
 if __name__ == "__main__":
