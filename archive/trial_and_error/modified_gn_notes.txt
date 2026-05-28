@@ -1,0 +1,5 @@
+I was originally concerned that pruning would not be effective for removing linker nodes due to only pruning away degree 2 nodes. This would be true in isolation, however, combining prune() with the modified girvan newman algorithm will remove extra linker nodes that prune cannot remove alone.
+
+First prune() removes degree 1 nodes. The role of prune is not only removing linker nodes for their own sake, but also increasing the resolution for the modified girvan newman MAD analysis. It removes edges that are obviously not part of a cluster to increase the likelihood of detecting legitimate bridge edges later.
+
+The modified girvan newman will assign high edge scores to true linker nodes, regardless of their degree. Obviously a lower degree will increase the likelihood of that node being part of a true linker edge but that's beside the point.

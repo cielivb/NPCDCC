@@ -1,0 +1,26 @@
+The original MAD-mediated Girvan Newman algorithm ended up being a bust. It was very buggy, took far longer just to start than Leiden or Louvain would take to complete the whole community detection algorithm, the architecture was somewhat complex, and I quite frankly felt like I was shoving a triangle into a hole shaped like a circle by trying to implement it in dask.
+
+I instead decided to apply existing community detection algorithms to my connectome dataset (Leiden and Louvain) using igraph and cdlib. This won't scale to terabyte-level connectomes but it was sufficient for my ~915 MB parquet connectome. Scaling to that level would require apache spark's graphx, and given the time constraints I had on this project (gave up on MGN about 6 days before deadline), I decided to prioritise completing the project instead of learning a whole new distributed framework.
+
+Upon visual inspection of the separate Louvain and Leiden algorithm results, communities do not neatly map only to nodules. Nodes in bridge regions are occasionally also assigned to (sufficiently large) communities. I used a threshold of min 30 nodes per community to weed out noise. Remaining edge-edge connections in the visualisation represent neural connections where both nodes are part of a sufficiently large community. 
+
+Interestingly, filtered nodes within nodules are notably topologically close to each other, whereas filtered nodes outside of nodules (i.e., in bridge regions) are notably distant from each other. This could make a good case for applying topological clustering to isolate the nodules. Because there are communities less than 30 nodes large within nodules, the results of the topological clustering will need to be merged back onto the original edge dataframe to get the full set of edges within the nodule.
+
+
+Why this long-winded approach is better than pure topological clustering:
+If I tried to run a topological clustering algorithm on the entire connectome immediately, it could be difficult to distinguish bridges from nodules as the whole connectome is topologically connected. For one, the presence of node 'shores' between bridges and nodules may cause the clustering algorithm to cluster bridges and shores together into one big cluster. Additionally, we intuitively classify a nodule as a nodule by looking at its size relative to its area within the brain, but these absolute sizes can vary across the brain, meaning we can't just use a minimum threshold cutoff reliably. Consequently, the clusters would likely be non-meaningful within the context of the research question (nodule neurotransmitter ratio comparisons across brain regions).
+
+
+Choice of statistical model: I am using Dirichlet regression directly on the gaba, ach, and other columns. While this is fine for exploratory testing, a more statistically robust method would involve using the other column to calculate the ranges of gaba and ach probabilities for each neural connection, then running a statistical analysis that can handle comparing range values within a bounded interval, e.g., Bayesian Dirichlet regression with interval priors. The Dirichlet function I used can only operate on points, not ranges.
+
+
+
+docker build -t npcdcc_image .
+docker run -p 8888:8888 -v ${PWD}:/project --memory=16g npcdcc_image
+
+
+
+
+Improvements:
+- HDBSCAN requires in memory data. Would be better to use a distributed and C++ optimised algorithm instead of the python implementation, but that is outside the scope of this project.
+- My dataset had little need for nodule size analysis. However, extending this project to a dataset with annotations would benefit from analysing the influence of nodule size as well.
